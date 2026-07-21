@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Warm, calm theme */
+  --bg: #F5EFE6; /* varm beige bakgrund */
+  --panel: #ffffff; /* vit på kort och paneler */
+  --muted: #6b7280; /* dämpad neutral */
+  --accent: #4f6b8a; /* dämpat blått för knappar och markeringar */
+  --text-dark: #082036; /* mörk marinblå text för kontrast */
+  --border: #dfe7ea; /* ljus beige/gråblå border */
+  --positive: #3f8f5a; /* diskret grön */
+  --negative: #ab574f; /* diskret röd */
+}
+
+html,body,#root {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-dark);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+
+.panel { background: var(--panel); border: 1px solid rgba(16,24,32,0.06); border-radius: 12px; box-shadow: 0 1px 2px rgba(16,24,32,0.04); }
+
+/* Buttons, links and important markings use muted blue accent */
+.btn { background-color: var(--accent); color: #fff; }
+.btn:hover { background-color: color-mix(in srgb, var(--accent) 80%, #000 20%); }
+
+/* Map common Tailwind blue/green classes to the theme so existing classes keep layout */
+.bg-blue-600 { background-color: var(--accent) !important; }
+.text-green-600 { color: var(--positive) !important; }
+.text-red-600 { color: var(--negative) !important; }
+.text-yellow-500 { color: var(--muted) !important; }
+
+/* Common gray text utilities mapped to muted/darker theme */
+.text-gray-400 { color: var(--muted) !important; }
+.text-gray-500 { color: color-mix(in srgb, var(--muted) 85%, var(--text-dark) 15%) !important; }
+.text-gray-600 { color: color-mix(in srgb, var(--muted) 60%, var(--text-dark) 40%) !important; }
+
+/* Ensure text-white used in components maps to dark text on light panels */
+.text-white { color: var(--text-dark) !important; }
+
+/* Borders */
+.border-gray-800 { border-color: var(--border) !important; }
+.border-gray-700 { border-color: var(--border) !important; }
+
+/* Links */
+a { color: var(--accent); }
+
+/* Ensure panels and cards remain white */
+.panel h2, .panel h3, .panel p, .panel td, .panel th { color: var(--text-dark); }

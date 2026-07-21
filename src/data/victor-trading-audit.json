@@ -1,0 +1,62 @@
+[
+  {
+    "timestamp": "2026-07-21T14:00:52.178Z",
+    "executed": [
+      {
+        "proposal": {},
+        "result": {
+          "status": "EXECUTED",
+          "success": true
+        }
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-07-21T14:00:52.178Z",
+    "executed": [
+      {
+        "proposal": {},
+        "result": {
+          "status": "REJECTED",
+          "success": false
+        }
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-07-20T14:00:52.178Z",
+    "executed": [
+      {
+        "proposal": {},
+        "result": {
+          "status": "EXECUTED",
+          "success": true
+        }
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-07-22T14:00:52.178Z",
+    "executed": [
+      {
+        "proposal": {},
+        "result": {
+          "status": "EXECUTED",
+          "success": true
+        }
+      }
+    ]
+  },
+  {
+    "timestamp": "invalid-date",
+    "executed": [
+      {
+        "proposal": {},
+        "result": {
+          "status": "EXECUTED",
+          "success": true
+        }
+      }
+    ]
+  }
+]

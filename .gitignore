@@ -1,0 +1,10 @@
+node_modules
+.env.local
+.env
+.next/
+src/data/portfolio.json
+*.tsbuildinfo
+quotes_output.json
+HEAD
+*.log
+.env.*.local
