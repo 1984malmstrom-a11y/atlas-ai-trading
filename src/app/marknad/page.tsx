@@ -54,6 +54,7 @@ export default function MarketMonitorPage() {
   const POLL_SECONDS = Math.floor(POLL_MS / 1000);
   const [secondsLeft, setSecondsLeft] = useState(POLL_SECONDS);
   const [usingProvider, setUsingProvider] = useState(false);
+  const [usingMock, setUsingMock] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState<string | null>(null);
   const [flashMap, setFlashMap] = useState<Record<string, 'up'|'down'|undefined>>({});
   // Forex session history for sparklines (not persisted)
@@ -212,15 +213,70 @@ export default function MarketMonitorPage() {
         return out;
       });
       setUsingProvider(Boolean(d.usingProvider));
+      // determine if we are showing mock data
+      const isMock = Boolean(d.isMock) || ((!d.quotes || d.quotes.length === 0) && process.env.NODE_ENV !== 'production');
+      setUsingMock(Boolean(isMock));
       setLastFetchedAt(d.fetchedAt || new Date().toISOString());
+    }
+
+    // Internal fetch helper to request quotes from API and update UI.
+    const fetchInProgressRef = { current: false } as { current: boolean };
+    async function fetchAndUpdate(){
+      if (fetchInProgressRef.current) return;
+      fetchInProgressRef.current = true;
+      try{
+        const resp = await fetch('/api/market-data/quotes');
+        if (!resp.ok) throw new Error('fetch failed');
+        const data = await resp.json();
+        const quotesArr = data.quotes || [];
+        const isMock = Boolean(data.isMock) || (data.source === 'mock') || (Array.isArray(quotesArr) && quotesArr.length === 0 && process.env.NODE_ENV !== 'production');
+        const usingProviderVal = (data.source && data.source !== 'mock') || (Array.isArray(quotesArr) && quotesArr.length > 0);
+        const detail: any = { quotes: quotesArr, fetchedAt: data.fetchedAt || new Date().toISOString(), usingProvider: Boolean(usingProviderVal), isMock: Boolean(isMock), source: data.source || (isMock ? 'mock' : 'twelve-data') };
+        // Dispatch same event shape as the shared poller would
+        window.dispatchEvent(new CustomEvent('atlas:market-quotes', { detail }));
+      }catch(e){
+        // fallback to mock only in dev
+        const detail:any = { quotes: [], fetchedAt: new Date().toISOString(), usingProvider: false, isMock: process.env.NODE_ENV !== 'production', source: 'mock' };
+        window.dispatchEvent(new CustomEvent('atlas:market-quotes', { detail }));
+      }finally{
+        fetchInProgressRef.current = false;
+      }
     }
 
     function onTick(e:any){ if (!mounted) return; const rem = e?.detail?.secondsLeft; if (typeof rem === 'number') setSecondsLeft(rem); }
 
+    // internal per-second countdown and auto-fetch when reaching 0
+    let internalTimer: any = null;
+    const externalTickSeenRef = { current: false } as { current: boolean };
+    function startInternalTimer(){
+      // initialize
+      setSecondsLeft(POLL_SECONDS);
+      internalTimer = setInterval(() => {
+        setSecondsLeft(prev => {
+          const next = prev - 1;
+          if (next <= 0){
+            // trigger fetch and reset (fetch is internally locked)
+            void fetchAndUpdate();
+            return POLL_SECONDS;
+          }
+          return next;
+        });
+      }, 1000);
+    }
+
+    // Listen for shared poller ticks; if we see a tick quickly after mount
+    // we will prefer the shared poller and avoid starting our own interval.
+    function _tempTickListener(ev: any){ externalTickSeenRef.current = true; }
     window.addEventListener('atlas:market-quotes', onQuotes as EventListener);
     window.addEventListener('atlas:market-quotes-tick', onTick as EventListener);
+    window.addEventListener('atlas:market-quotes-tick', _tempTickListener as EventListener);
+    // start internal timer only if no external tick observed shortly after mount
+    setTimeout(() => {
+      window.removeEventListener('atlas:market-quotes-tick', _tempTickListener as EventListener);
+      if (!externalTickSeenRef.current) startInternalTimer();
+    }, 200);
 
-    return ()=>{ mounted = false; window.removeEventListener('atlas:market-quotes', onQuotes as EventListener); window.removeEventListener('atlas:market-quotes-tick', onTick as EventListener); };
+    return ()=>{ mounted = false; window.removeEventListener('atlas:market-quotes', onQuotes as EventListener); window.removeEventListener('atlas:market-quotes-tick', onTick as EventListener); if (internalTimer) clearInterval(internalTimer); };
   }, []);
 
   // Determine market status for the top card
@@ -281,8 +337,8 @@ export default function MarketMonitorPage() {
           <div className="mt-2 text-xs text-gray-500">Riktig marknadsdata där providerdata finns. Fördröjd eller otillgänglig data markeras tydligt.</div>
           <div className="mt-2">
             <div style={{ display:'inline-flex', alignItems:'center', gap:8 }}>
-              <div style={{ width:10, height:10, borderRadius:9999, background: usingProvider ? '#10B981' : '#9CA3AF' }} />
-              <div style={{ fontSize:12, fontWeight:600 }}>{usingProvider ? 'Live' : 'Senast'}</div>
+              <div style={{ width:10, height:10, borderRadius:9999, background: usingMock ? '#0EA5E9' : (usingProvider ? '#10B981' : '#9CA3AF') }} />
+              <div style={{ fontSize:12, fontWeight:600 }}>{usingMock ? 'Mock' : (usingProvider ? 'Live' : 'Senast')}</div>
               <div style={{ color:'#6B7280' }}>{lastFetchedAt ? new Date(lastFetchedAt).toLocaleTimeString() : '—'}</div>
             </div>
           </div>
