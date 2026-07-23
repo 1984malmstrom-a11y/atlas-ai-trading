@@ -15,6 +15,8 @@ export type BrokerOrderRequest = {
   orderType: 'MARKET' | 'LIMIT';
   limitPrice?: number;
   clientOrderId?: string;
+  // optional reference market price used for execution simulation
+  price?: number;
 };
 
 export type BrokerOrderResult = {
@@ -52,14 +54,22 @@ export class AtlasPaperBrokerProvider implements BrokerProvider {
   }
 
   async placeOrder(order: BrokerOrderRequest): Promise<BrokerOrderResult> {
+    // Early validation: reject invalid quantities before touching the engine
+    if (!Number.isFinite(order.quantity) || order.quantity <= 0) {
+      return { success: false, orderId: order.clientOrderId || `o_${Date.now()}`, status: 'REJECTED', reason: 'INVALID_QUANTITY' } as any;
+    }
     // Map to engine order
     const engOrder: EngineOrder = {
       id: order.clientOrderId || `o_${Date.now()}`,
       symbol: order.symbol,
       side: order.side === 'BUY' ? 'Köp' : 'Sälj',
       quantity: order.quantity,
-      price: order.orderType === 'LIMIT' ? order.limitPrice : undefined,
+      price: order.orderType === 'LIMIT' ? order.limitPrice : (typeof order.price === 'number' ? order.price : undefined),
     };
+    // If this is a MARKET order and we have no reference price, reject to avoid default=100 bug
+    if (order.orderType === 'MARKET' && (typeof engOrder.price !== 'number' || !isFinite(engOrder.price) || engOrder.price <= 0)){
+      return { success: false, orderId: engOrder.id, status: 'REJECTED', reason: 'MISSING_MARKET_PRICE' } as any;
+    }
     const res = this.engine.simulateExecution(engOrder);
     if (!res.success) return { success: false, orderId: engOrder.id, status: 'REJECTED', reason: res.code || res.message } as any;
     const tx = res.transaction;

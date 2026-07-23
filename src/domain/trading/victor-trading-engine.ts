@@ -68,12 +68,71 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
   const md = new TwelveDataMarketDataProvider();
   const broker = new AtlasPaperBrokerProvider();
 
+  // Auto-select market to analyze based on open markets.
+  // If caller provided an explicit mandate that differs from the default, respect it.
+  const shouldAutoSelect = (()=>{
+    if (!opts.mandate) return true;
+    try{
+      // If mandate appears to be the DEFAULT_PAPER_AUTO_MANDATE (same mode and same allowedInstrumentIds), treat it as implicit and allow auto-selection.
+      const sameMode = opts.mandate.mode === DEFAULT_PAPER_AUTO_MANDATE.mode;
+      const sameIds = Array.isArray(opts.mandate.allowedInstrumentIds) && Array.isArray(DEFAULT_PAPER_AUTO_MANDATE.allowedInstrumentIds) && opts.mandate.allowedInstrumentIds.length === DEFAULT_PAPER_AUTO_MANDATE.allowedInstrumentIds.length && opts.mandate.allowedInstrumentIds.every((v,i)=>v === DEFAULT_PAPER_AUTO_MANDATE.allowedInstrumentIds[i]);
+      return sameMode && sameIds;
+    }catch(e){ return false; }
+  })();
+  if (shouldAutoSelect){
+    try{
+    const now = new Date();
+    const etParts = (()=>{
+      try{
+        const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour12:false, hour: '2-digit', minute: '2-digit' });
+        const parts = f.formatToParts(now).reduce((acc: any,p:any)=>{ acc[p.type]=p.value; return acc; }, {});
+        return { hour: Number(parts.hour), minute: Number(parts.minute) };
+      }catch(e){ return null; }
+    })();
+
+    const isWeekday = (d:Date)=>{ const wd = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday:'short' }).format(d); return !['Sat','Sun'].includes(wd); };
+    const isUSOpen = (()=>{
+      if (!etParts || !isWeekday(now)) return false;
+      const minutes = etParts.hour*60 + etParts.minute; const open = 9*60+30; const close = 16*60;
+      return minutes >= open && minutes < close;
+    })();
+    const isForexOpen = (()=>{ const wk = isWeekday(now); return wk; })();
+
+    let selectedMarket = 'None';
+    if (isUSOpen){
+      selectedMarket = 'US Stocks';
+      // pick allowed instruments on US exchanges (NASDAQ/NYSE)
+      const usIds = TRADABLE_UNIVERSE.filter(i => i.enabled && (String(i.exchange).toUpperCase().includes('NASDAQ') || String(i.exchange).toUpperCase().includes('NYSE'))).map(i=>i.id);
+      if (usIds.length) mandate = { ...mandate, allowedInstrumentIds: usIds };
+    } else if (isForexOpen){
+      selectedMarket = 'Forex';
+      const fxIds = TRADABLE_UNIVERSE.filter(i => i.enabled && String(i.exchange).toUpperCase() === 'FOREX').map(i=>i.id);
+      if (fxIds.length) mandate = { ...mandate, allowedInstrumentIds: fxIds };
+    } else {
+      // try crypto if present
+      const cryptoIds = TRADABLE_UNIVERSE.filter(i => i.enabled && String(i.exchange).toUpperCase() === 'CRYPTO').map(i=>i.id);
+      if (cryptoIds.length){ selectedMarket = 'Crypto'; mandate = { ...mandate, allowedInstrumentIds: cryptoIds }; }
+      else {
+        console.log('[victor] No open market detected (US closed, Forex closed). Will skip this cycle.');
+        // create audit and exit early
+        const audit = { timestamp: nowIso(), mode: mandate.mode, mandate, account: await broker.getAccount(), positions: await broker.getPositions(), decisions: [], proposals: [], executed: [], note: 'No open market' };
+        await appendAudit(audit);
+        return { ok: true, report: { audit } };
+      }
+    }
+    console.log('[victor] Selected market:', selectedMarket, 'US open=', isUSOpen, 'Forex open=', isForexOpen);
+    }catch(e){ console.warn('[victor] market selection failed', e); }
+  }
+
   const account = await broker.getAccount();
   const positions = await broker.getPositions();
 
   // Fetch market data for allowed instruments
   const allowed = TRADABLE_UNIVERSE.filter(i => mandate.allowedInstrumentIds.includes(i.id) && i.enabled);
-  const symbols = allowed.map(i => i.providerSymbol || i.name);
+  // limit number of symbols to fetch to avoid large batch requests; prefer a small representative set
+  const allowedLimited = allowed.slice(0, 3);
+  const symbols = allowedLimited.map(i => i.providerSymbol || i.name);
+  console.log('[victor] Selected symbols for this cycle:', symbols.map(s=>String(s)).join(', '));
   const quotes = await md.getQuotes(symbols);
 
   // Map symbol->instrumentId
@@ -126,6 +185,7 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
       symbol: symbol,
       side: dec.action === 'BUY' ? 'BUY' : 'SELL',
       quantity: qty,
+      price: (q && typeof q.price === 'number') ? Number(q.price) : undefined,
       orderType: 'MARKET'
     };
     orderProposals.push({ decision: dec, request: req });
