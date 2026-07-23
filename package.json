@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "victor:preflight": "vite-node scripts/run-victor-paper-preflight-cli.ts"
+    ,"victor:autopilot": "vite-node src/scripts/run-victor-autopilot.ts"
   },
   "dependencies": {
     "next": "16.2.9",
