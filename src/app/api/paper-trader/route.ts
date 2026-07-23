@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import runtime, { executePaperTradeDecision } from '../../../lib/paper-trader/demo-runtime';
 import { getNormalizedQuotes } from '../../../lib/market-data/quotes-service';
 import { findInstrumentById } from '../../../lib/market-data/instruments';
+import type { PaperTradeDecision } from '../../../lib/paper-trader/types';
+import { getMarketDataProvider } from '../../../lib/market-data/index';
 
 export async function GET(){
   try{
@@ -37,7 +39,8 @@ export async function POST(req: Request){
 
     // New: accept minimal trade requests
     // { instrumentId, side: 'BUY'|'SELL', quantity }
-    const { instrumentId, side, quantity } = body as any;
+    type TradeReq = { instrumentId?: string; side?: string; quantity?: number };
+    const { instrumentId, side, quantity } = body as TradeReq;
     if (instrumentId && typeof side === 'string' && (side.toUpperCase() === 'BUY' || side.toUpperCase() === 'SELL')){
       if (typeof quantity !== 'number' || !isFinite(quantity) || quantity <= 0){
         return NextResponse.json({ ok: false, code: 'INVALID_ORDER', message: 'quantity must be a positive number' }, { status: 400 });
@@ -49,8 +52,16 @@ export async function POST(req: Request){
       if (!inst.enabled) return NextResponse.json({ ok: false, code: 'QUOTE_UNAVAILABLE', message: 'Instrument disabled for trading' }, { status: 422 });
 
       // fetch normalized quotes server-side
-      const quotesRes = await getNormalizedQuotes();
-      const quote = Array.isArray(quotesRes.quotes) ? quotesRes.quotes.find((q:any)=> q.instrumentId === inst.id) : null;
+      // attempt to inject a production FX rate getter when TWELVE_DATA_API_KEY is available
+      let fxGetter = undefined as undefined | ((from: string, to: 'SEK') => Promise<number | null>);
+      if (process.env.TWELVE_DATA_API_KEY){
+        try{
+          const provider = getMarketDataProvider();
+          if (provider && typeof (provider as any).getFxRate === 'function') fxGetter = (provider as any).getFxRate.bind(provider);
+        }catch(e){ /* provider unavailable, continue without FX injection */ }
+      }
+      const quotesRes = await getNormalizedQuotes(undefined, { getFxRate: fxGetter });
+      const quote = Array.isArray(quotesRes.quotes) ? quotesRes.quotes.find((q: { instrumentId: string })=> q.instrumentId === inst.id) : null as any;
       if (!quote) return NextResponse.json({ ok: false, code: 'QUOTE_UNAVAILABLE', message: 'Quote not available for instrument' }, { status: 404 });
 
       // validate quote integrity
@@ -58,27 +69,41 @@ export async function POST(req: Request){
       if (quote.isStale) return NextResponse.json({ ok: false, code: 'STALE_QUOTE', message: 'Quote is stale' }, { status: 422 });
       if (quote.dataStatus === 'UNAVAILABLE') return NextResponse.json({ ok: false, code: 'QUOTE_UNAVAILABLE', message: 'Quote data unavailable' }, { status: 422 });
 
-      // Build decision for engine: request notional = quantity * price
-      const requestedNotionalSek = Number(quantity) * Number(quote.price);
-      const decision = {
+      // Build decision for engine: prefer SEK-normalized price for notional calculation
+      let requestedNotionalSek: number;
+      const quoteCurrency = quote.currency || inst.currency || null;
+      if (quoteCurrency === 'SEK'){
+        requestedNotionalSek = Number(quantity) * Number(quote.price);
+      } else {
+        // require normalized SEK price for non-SEK instruments
+        if (quote.priceSek === undefined || !Number.isFinite(Number(quote.priceSek)) || Number(quote.priceSek) <= 0){
+          return NextResponse.json({ ok: false, code: 'FX_REQUIRED', message: 'SEK-normalized price required for non-SEK instrument' }, { status: 422 });
+        }
+        requestedNotionalSek = Number(quantity) * Number(quote.priceSek);
+      }
+
+      // compute referencePrice in SEK to send to engine
+      const referencePriceSek = quoteCurrency === 'SEK' ? Number(quote.price) : Number(quote.priceSek);
+
+      const decision: PaperTradeDecision = {
         id: `api_trade_${inst.id}_${Date.now()}`,
         symbol: (inst.providerSymbol || quote.symbol || '').toString().toUpperCase(),
-        action: side.toUpperCase(),
+        action: side.toUpperCase() as 'BUY' | 'SELL',
         confidence: 100,
-        referencePrice: Number(quote.price),
+        // referencePrice must be SEK-normalized for engine calculations
+        referencePrice: referencePriceSek,
         requestedNotionalSek,
         generatedAt: new Date().toISOString(),
-      } as any;
+      };
 
       // execute via runtime wrapper (keeps all engine/risk rules centralized)
       try{
-        const { result, state } = await executePaperTradeDecision(decision as any);
+        const { result, state } = await executePaperTradeDecision(decision);
         if (!result || !result.accepted){
           const code = result && result.code ? result.code : 'RISK_REJECTED';
           const message = result && result.message ? result.message : 'Order rejected by risk engine';
           return NextResponse.json({ ok: false, code, message }, { status: 409 });
         }
-
         const exec = result.execution as any;
         return NextResponse.json({ ok: true, trade: {
           instrumentId: inst.id,

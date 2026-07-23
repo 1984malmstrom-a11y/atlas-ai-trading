@@ -208,8 +208,9 @@ export default function MinPortfoljPage(){
   // Live quotes state and refresh logic (minimal, safe, client-side only)
   const [quotesById, setQuotesById] = useState<Record<string, any>>({});
   const [quoteStatus, setQuoteStatus] = useState<'idle'|'loading'|'success'|'error'>('idle');
+  const [flashMap, setFlashMap] = useState<Record<string, 'up'|'down'|undefined>>({});
   const isFetchingRef = React.useRef(false);
-  const REFRESH_MS = 60 * 1000; // at most once per 60s
+  const REFRESH_MS = 30 * 1000; // used for display only (30s)
 
   const formatPercent = (v: number | null | undefined) => {
     if (v === null || v === undefined || Number.isNaN(Number(v))) return '';
@@ -251,10 +252,45 @@ export default function MinPortfoljPage(){
   }
 
   useEffect(()=>{
-    // initial fetch and periodic refresh
+    // migrate to shared market polling: trigger local mapping and start shared poll
     fetchQuotesOnce();
-    const iv = setInterval(()=>{ fetchQuotesOnce(); }, REFRESH_MS);
-    return ()=>{ clearInterval(iv); };
+    function onQuotes(e:any){
+      const d = e.detail || {};
+      if (d && Array.isArray(d.quotes) && d.quotes.length){
+        const incoming: Record<string, any> = {};
+        d.quotes.forEach((q:any)=>{ if (q && q.instrumentId) incoming[q.instrumentId] = q; });
+        setQuotesById(prev => {
+          const newMap: Record<string, any> = { ...incoming };
+          // compute flashes for ids where price changed
+          const updates: Record<string, 'up'|'down'> = {};
+          for (const id of Object.keys(newMap)){
+            const prevQ = prev[id];
+            const newQ = newMap[id];
+            const prevPrice = prevQ && prevQ.price !== undefined && prevQ.price !== null ? Number(prevQ.price) : null;
+            const newPrice = newQ && newQ.price !== undefined && newQ.price !== null ? Number(newQ.price) : null;
+            if (prevPrice !== null && newPrice !== null && prevPrice !== newPrice){
+              updates[id] = newPrice > prevPrice ? 'up' : 'down';
+            }
+          }
+          if (Object.keys(updates).length){
+            setFlashMap(fm => ({ ...fm, ...updates }));
+            setTimeout(()=> setFlashMap(fm => {
+              const copy = { ...fm };
+              for (const k of Object.keys(updates)) delete copy[k];
+              return copy;
+            }), 900);
+          }
+          return newMap;
+        });
+        setQuoteStatus('success');
+      } else if (d && d.error){
+        setQuoteStatus('error');
+      }
+    }
+    function onTick(e:any){ const rem = e?.detail?.secondsLeft; /* could be used for UI */ }
+    window.addEventListener('atlas:market-quotes', onQuotes as EventListener);
+    window.addEventListener('atlas:market-quotes-tick', onTick as EventListener);
+    return ()=>{ window.removeEventListener('atlas:market-quotes', onQuotes as EventListener); window.removeEventListener('atlas:market-quotes-tick', onTick as EventListener); };
   }, []);
 
   function openFullAnalysis(holding: any){
@@ -639,7 +675,7 @@ export default function MinPortfoljPage(){
                             </div>
                           </div>
 
-                          <div style={{ textAlign:'right', fontSize:15, fontWeight:600, color:'#102A43', whiteSpace:'nowrap' }}>{displayMarketValue}</div>
+                          <div style={{ textAlign:'right', fontSize:15, fontWeight:600, color:'#102A43', whiteSpace:'nowrap', background: (flashMap[h.id] === 'up' ? 'rgba(16,185,129,0.12)' : flashMap[h.id] === 'down' ? 'rgba(239,68,68,0.08)' : 'transparent'), transition: 'background-color 700ms ease', padding: flashMap[h.id] ? '0 6px' : undefined, borderRadius: flashMap[h.id] ? 4 : undefined }}>{displayMarketValue}</div>
 
                           <div style={{ display:'flex', justifyContent:'center', alignItems:'center' }}>
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>

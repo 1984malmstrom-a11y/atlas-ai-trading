@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "victor:preflight": "vite-node scripts/run-victor-paper-preflight-cli.ts"
   },
   "dependencies": {
     "next": "16.2.9",

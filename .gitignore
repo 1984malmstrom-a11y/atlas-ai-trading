@@ -8,3 +8,6 @@ quotes_output.json
 HEAD
 *.log
 .env.*.local
+
+# Local recovery and verification artifacts
+/wt_verify_news_package/

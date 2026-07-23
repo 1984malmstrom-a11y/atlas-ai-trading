@@ -270,3 +270,24 @@ export function createPaperTrader(opts: {
 export type PaperTrader = ReturnType<typeof createPaperTrader>;
 
 export default createPaperTrader;
+
+// Pure helper: apply an execution deterministically to a portfolio snapshot.
+export function applyPaperExecutionToPortfolio(portfolio: Portfolio, exec: SimulatedExecution){
+  const state = JSON.parse(JSON.stringify(portfolio)) as any;
+  const sym = String(exec.symbol||'').toUpperCase();
+  if (exec.side === 'BUY'){
+    state.availableCash = Math.round((state.availableCash - exec.notional - exec.fee) * 100)/100;
+    const found = state.holdings.find((h:any)=> h.symbol === sym);
+    if (found){ found.quantity = Math.round((found.quantity + exec.quantity) * 100)/100; found.currentPrice = exec.executedPrice; found.marketValue = Math.round(found.quantity * found.currentPrice * 100)/100; }
+    else { state.holdings.push({ id: `h_${sym}`, symbol: sym, name: sym, quantity: exec.quantity, averagePrice: exec.executedPrice, currentPrice: exec.executedPrice, marketValue: Math.round(exec.quantity * exec.executedPrice * 100)/100 }); }
+  } else {
+    const found = state.holdings.find((h:any)=> h.symbol === sym);
+    const sellQty = Math.min(found ? found.quantity : 0, exec.quantity);
+    const proceeds = Math.round(sellQty * exec.executedPrice * 100)/100;
+    state.availableCash = Math.round((state.availableCash + proceeds - exec.fee) * 100)/100;
+    if (found){ found.quantity = Math.round((found.quantity - sellQty) * 100)/100; found.currentPrice = exec.executedPrice; found.marketValue = Math.round(found.quantity * found.currentPrice * 100)/100; if(found.quantity<=0) state.holdings = state.holdings.filter((h:any)=> h!==found); }
+  }
+  const mv = state.holdings.reduce((s:any,h:any)=> s + (h.marketValue||0), 0);
+  state.totalValue = Math.round((state.availableCash + mv) * 100)/100;
+  return state as Portfolio;
+}

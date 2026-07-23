@@ -3,6 +3,7 @@ import { getMockPortfolio } from '../../data/mock-portfolio';
 import dataHub from '../datahub/victor-data-hub';
 import { VictorEvidence } from '../datahub/types';
 import validator from '../datahub/victor-evidence-validator';
+import type { MarketQuote } from '../../lib/market-data/types';
 
 export type ResearchModuleResult = {
   title: string;
@@ -76,7 +77,7 @@ export type VictorResearchReport = {
   sourceCoverage?: number;
 };
 
-export async function runVictorResearch(opts?: { symbol?: string; portfolio?: any }): Promise<VictorResearchReport> {
+export async function runVictorResearch(opts?: { symbol?: string; portfolio?: any; normalizedQuotes?: Array<Partial<MarketQuote> & { marketTimestamp?: string; fetchedAt?: string; dataStatus?: 'LIVE'|'DELAYED'|'STALE'|'UNAVAILABLE'; isStale?: boolean; provider?: string; change?: number | null; changePercent?: number | null; currency?: string | null }>; getNormalizedQuotes?: () => Promise<any> }): Promise<VictorResearchReport> {
   const symbol = opts?.symbol;
   const portfolio = opts?.portfolio;
 
@@ -91,6 +92,44 @@ export async function runVictorResearch(opts?: { symbol?: string; portfolio?: an
   try{ validationResult = validator.validateEvidence(rawEvidence || []); }catch(e){ /* fallback */ }
 
   const evidence = validationResult.validatedEvidence as VictorEvidence[];
+
+  // If Data Hub returned no Market Data evidence, reuse provided normalizedQuotes
+  // so research doesn't report "Ingen data" when a valid LIVE quote exists.
+  try{
+    const hasMarket = (evidence || []).some((ev: VictorEvidence) => ev && ev.category === 'Market Data');
+    // Support legacy injectable `getNormalizedQuotes` for tests: call it and extract quotes
+    let injectedQuotes: any[] | undefined = undefined;
+    try{
+      if (opts && typeof (opts as any).getNormalizedQuotes === 'function'){
+        const got = await (opts as any).getNormalizedQuotes();
+        injectedQuotes = Array.isArray(got?.quotes) ? got.quotes : (Array.isArray(got) ? got : undefined);
+      }
+    }catch(e){ /* ignore injectable failure */ }
+
+    if (!hasMarket && opts && opts.symbol && (Array.isArray(opts.normalizedQuotes) || Array.isArray(injectedQuotes))){
+      const quotes = Array.isArray(opts.normalizedQuotes) ? opts.normalizedQuotes as any[] : injectedQuotes as any[];
+      const sym = String(opts.symbol).toUpperCase();
+      const q = quotes.find((x:any) => x && x.symbol && String(x.symbol).toUpperCase() === sym);
+      if (q && q.dataStatus === 'LIVE' && q.isStale === false && q.price !== null && q.price !== undefined){
+        const ve: VictorEvidence = {
+          evidenceId: `md-quote-${q.instrumentId || q.symbol}-${q.fetchedAt || new Date().toISOString()}`,
+          category: 'Market Data',
+          symbol: q.symbol,
+          title: `Live quote ${q.symbol}`,
+          summary: `Price ${q.price}${q.currency ? ' ' + q.currency : ''} at ${q.marketTimestamp || q.fetchedAt}`,
+          facts: [ `price:${q.price}`, `timestamp:${q.marketTimestamp || q.fetchedAt}` ],
+          provider: q.provider || 'market-data',
+          sourceName: 'market-data-normalized',
+          publishedAt: q.marketTimestamp || q.fetchedAt || new Date().toISOString(),
+          fetchedAt: q.fetchedAt || new Date().toISOString(),
+          freshnessStatus: q.isStale ? 'Stale' : 'Fresh',
+          reliabilityScore: 60,
+          confidence: 55,
+        } as VictorEvidence;
+        evidence.unshift(ve);
+      }
+    }
+  }catch(e){ /* non-fatal: keep original evidence */ }
 
   // build modules from evidence groups
   const group = (cat:string) => evidence.filter(e=> e.category === cat);

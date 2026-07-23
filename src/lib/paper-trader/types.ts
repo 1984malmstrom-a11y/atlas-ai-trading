@@ -25,6 +25,64 @@ export type PaperTraderConfig = {
   maxTradesPerCycle?: number;
 };
 
+export type VictorPaperTradingConfig = {
+  minimumConfidence: number;
+  maxPositionPercent: number;
+  maxTradesPerCycle: number;
+  maxTradesPerDay?: number;
+  marketOpenRequired: boolean;
+  maxQuoteAgeMs: number;
+  allowedActions: readonly ['BUY'];
+  allowedSymbols: readonly string[];
+};
+
+export const DEFAULT_VICTOR_PAPER_TRADING_CONFIG: VictorPaperTradingConfig = {
+  minimumConfidence: 70,
+  maxPositionPercent: 0.10,
+  maxTradesPerCycle: 1,
+  maxTradesPerDay: 1,
+  marketOpenRequired: true,
+  maxQuoteAgeMs: 15 * 60 * 1000,
+  allowedActions: ['BUY'],
+  allowedSymbols: ['NVDA','MSFT','AAPL'],
+};
+
+export type PersistentTrade = {
+  tradeId: string;
+  cycleId?: string | null;
+  symbol: string;
+  side: 'BUY' | 'SELL' | string;
+  quantity: number;
+  executionPrice: number;
+  createdAt: string; // ISO
+  // optional compatibility fields
+  result?: string;
+  status?: string;
+};
+
+export type VictorPaperTradingPreflightResult = {
+  status: 'READY_TO_EXECUTE' | 'HOLD' | 'BLOCKED' | 'ERROR';
+  cycleId: string;
+  checkedAt: string;
+  config: VictorPaperTradingConfig;
+  marketStatus?: string | null;
+  quotesFresh?: boolean;
+  tradesToday?: number;
+  candidate?: {
+    symbol: string;
+    action: string;
+    confidence: number;
+    quantity: number | null;
+    estimatedPrice: number | null;
+    estimatedNotional: number | null;
+    estimatedFee: number | null;
+    estimatedSlippage: number | null;
+    reasoning: readonly string[];
+  } | null;
+  reason?: string | null;
+  errors: readonly { code: string; message: string }[];
+};
+
 export interface PortfolioAdapter {
   getPortfolio(): Promise<Portfolio>;
   applyExecution(exec: SimulatedExecution): Promise<Portfolio>;

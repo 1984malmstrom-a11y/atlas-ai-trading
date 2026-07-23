@@ -31,6 +31,7 @@ export default function LeftSidebar(){
   return (
     <aside style={{ position: 'fixed', left: 0, top: 0, height: SIDEBAR_HEIGHT, minHeight: SIDEBAR_MIN_HEIGHT, width: SIDEBAR_WIDTH, boxSizing: 'border-box', overflow: 'hidden', alignSelf: 'stretch', background: SIDEBAR_BG }}>
       <div style={{ transform: 'translateY(-70px)' }}>
+        
         <div style={{ padding: '12px 12px 6px 12px' }}>
           <div aria-hidden style={{ width: 210, height: 210, overflow: 'hidden', display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
             <img src={(logo as any).src || logo} alt="ATLAS logo" style={{ height: '115%', width: 'auto', objectFit: 'contain', display: 'block', transform: 'translateY(-12px)' }} />

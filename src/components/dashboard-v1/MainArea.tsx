@@ -1,5 +1,6 @@
 import React from 'react';
 import VictorHero from './VictorHero';
+import LivePrice from './LivePrice';
 import DashboardV1Header from './DashboardV1Header';
 import CompanyLogo from '../CompanyLogo';
 import { RECOMMENDATION_LEFT, RECOMMENDATION_WIDTH, RECOMMENDATION_HEIGHT, RECOMMENDATION_TOP } from './layoutConstants';
@@ -195,6 +196,11 @@ export default function MainArea(){
                         <div style={{ width: '92%', height: '100%', background: STATUS_COLORS.green, borderRadius: 9999 }} />
                       </div>
                       <div style={{ marginTop: 4, fontSize: 14, color: STATUS_COLORS.green }}>▲</div>
+                      <div style={{ marginTop: 6 }}>
+                        <React.Suspense fallback={<div style={{ fontSize:12, color: 'rgba(0,0,0,0.6)' }}>—</div>}>
+                          <LivePrice symbol="INVE-B.ST" />
+                        </React.Suspense>
+                      </div>
                     </div>
                   </div>
                   <div style={{ height: 1, background: SEPARATOR_LIGHT }} />
@@ -209,12 +215,22 @@ export default function MainArea(){
                       </div>
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', minWidth: 72 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: 'rgba(0,0,0,0.85)' }}>89%</div>
-                      <div style={{ width: 56, height: 4, background: 'rgba(0,0,0,0.06)', borderRadius: 9999, marginTop: 4, overflow: 'hidden' }}>
-                        <div style={{ width: '89%', height: '100%', background: STATUS_COLORS.green, borderRadius: 9999 }} />
+                        {/* Live price for Microsoft via shared MarketPollingClient */}
+                        <div style={{ marginBottom: 6 }}>
+                          <div style={{ display: 'inline-flex', alignItems: 'center' }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: 'rgba(0,0,0,0.85)', marginRight: 8 }}>
+                              <span style={{ color: 'rgba(0,0,0,0.85)' }}><span style={{ display:'inline-block', width:0 }} /> </span>
+                            </div>
+                            {/* LivePrice is a client component that subscribes to the central event */}
+                            <div style={{ minWidth: 72, textAlign: 'right' }}>
+                              {/* @ts-ignore Server->Client import allowed */}
+                              <React.Suspense fallback={<div style={{ fontSize:13, fontWeight:700 }}>—</div>}>
+                                <LivePrice symbol="MSFT" />
+                              </React.Suspense>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <div style={{ marginTop: 4, fontSize: 14, color: STATUS_COLORS.green }}>▲</div>
-                    </div>
                   </div>
                   <div style={{ height: 1, background: SEPARATOR_LIGHT }} />
 
@@ -233,6 +249,11 @@ export default function MainArea(){
                         <div style={{ width: '84%', height: '100%', background: STATUS_COLORS.green, borderRadius: 9999 }} />
                       </div>
                       <div style={{ marginTop: 4, fontSize: 14, color: STATUS_COLORS.green }}>▲</div>
+                      <div style={{ marginTop: 6 }}>
+                        <React.Suspense fallback={<div style={{ fontSize:12, color: 'rgba(0,0,0,0.6)' }}>—</div>}>
+                          <LivePrice symbol="ATCO-A.ST" />
+                        </React.Suspense>
+                      </div>
                     </div>
                   </div>
                 </div>

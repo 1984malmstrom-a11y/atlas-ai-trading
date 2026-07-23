@@ -2,12 +2,7 @@
 const _so = 'server' + '-only';
 void import(_so).catch(()=>{});
 import { NextResponse } from 'next/server';
-import runVictorResearch from '../../../../domain/research/victor-research-engine';
-import runVictorIntelligence from '../../../../domain/intelligence/victor-intelligence-engine';
-import runVictorRecommendation from '../../../../domain/recommendation/victor-recommendation-engine';
-import runVictorReasoning from '../../../../domain/reasoning/victor-reasoning-engine';
-import runVictorScoring from '../../../../domain/scoring/victor-scoring-engine';
-import runVictorDecision from '../../../../domain/decision/victor-decision-engine';
+import { runVictorAnalysisPipeline, PipelineError } from '../../../../domain/analysis/victor-analysis-pipeline';
 import runVictorInvestmentReport from '../../../../domain/investment/victor-investment-report-engine';
 import type { VictorMemoryContext } from '../../../../domain/memory/victor-memory-engine';
 import {
@@ -33,16 +28,12 @@ export async function POST(req: Request){
     const memoryContext: VictorMemoryContext | undefined = body?.memoryContext;
     if (memoryContext && typeof memoryContext !== 'object') return new NextResponse(JSON.stringify({ error: 'invalid memoryContext' }), { status: 400 });
 
-    // Run the full pipeline server-side
+    // Run the full pipeline server-side via shared pipeline
     // test hook: allow forcing an internal error in test environment
     if (process.env.NODE_ENV === 'test' && symbol === '__TEST_FORCE_ERROR__') throw new Error('boom');
-    const research = await runVictorResearch({ symbol });
-    const intelligence = runVictorIntelligence(research);
-    const recommendation = runVictorRecommendation({ intelligence, memoryContext });
-    const reasoning = runVictorReasoning({ recommendation, intelligence, research, memoryContext });
-    const scoreReport = runVictorScoring({ research, intelligence, recommendation, reasoning, memoryContext });
-    const decision = runVictorDecision(scoreReport);
-    const investmentReport = runVictorInvestmentReport({ recommendation, reasoning, intelligence, scoreReport, research, memoryContext });
+    const pipelineResult = await runVictorAnalysisPipeline({ symbol, memoryContext });
+    const { research, intelligence, recommendation, reasoning, scoring, decision } = pipelineResult;
+    const investmentReport = runVictorInvestmentReport({ recommendation, reasoning, intelligence, scoreReport: scoring, research, memoryContext });
 
     // produce a memory update snapshot for client persistence (pure, no localStorage used)
     let memoryUpdate = null;

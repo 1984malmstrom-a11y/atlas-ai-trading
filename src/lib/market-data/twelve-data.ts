@@ -17,6 +17,15 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
   private ttlMs = 45_000;
   private cache = new Map<string, { expires: number; v: MarketQuote }>();
   private pending = new Map<string, Promise<MarketQuote>>();
+  // FX cache and pending promises for in-flight deduplication
+  private fxTtlMs = 5 * 60_000; // 5 minutes
+  // cache richer FX payloads: { rate, previous_close?, change?, percent_change?, open?, timestamp? }
+  private fxCache = new Map<string, { expires: number; v: any }>();
+  private fxPending = new Map<string, Promise<any | null>>();
+  // daily reference cache (time_series) to avoid fetching every poll — 6 hours TTL
+  private fxDailyTtlMs = 6 * 60 * 60_000; // 6 hours
+  private fxDailyCache = new Map<string, { expires: number; v: any }>();
+  private fxDailyPending = new Map<string, Promise<any | null>>();
 
   constructor(){
     const key = process.env.TWELVE_DATA_API_KEY;
@@ -68,24 +77,23 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
     const exchange = String(raw.exchange || raw.exchange_short || '').toUpperCase() || 'UNKNOWN';
     const name = String(raw.name || '');
     const currency = String(raw.currency || raw.currency_base || raw.currency_quote || '').toUpperCase() || 'UNKNOWN';
-    const tsRaw = raw.timestamp ?? raw.datetime ?? raw.updated_at ?? raw.status_time ?? raw.ts ?? raw.last_trade_time ?? raw.datetime_utc ?? null;
-    // Normalize timestamp: handle epoch seconds (common) and ISO strings
-    let tsDate: Date;
-    try{
-      if (tsRaw === null || tsRaw === undefined || tsRaw === '') {
-        tsDate = new Date();
-      } else if (typeof tsRaw === 'number') {
-        // If value looks like seconds (<= 1e12), multiply to ms
-        tsDate = new Date(tsRaw < 1e12 ? Math.floor(tsRaw * 1000) : tsRaw);
-      } else if (/^[0-9]+$/.test(String(tsRaw))) {
-        // numeric string
-        const n = Number(tsRaw);
-        tsDate = new Date(n < 1e12 ? Math.floor(n * 1000) : n);
-      } else {
-        tsDate = new Date(String(tsRaw));
-      }
-      if (!isFinite(tsDate.getTime())) tsDate = new Date();
-    }catch(e){ tsDate = new Date(); }
+    // Prefer the freshest timestamp candidates from Twelve Data:
+    // 1) last_quote_at, 2) last_trade_time, 3) updated_at, 4) timestamp, then other fallbacks
+    const tsRaw = raw.last_quote_at ?? raw.last_trade_time ?? raw.updated_at ?? raw.timestamp ?? raw.datetime ?? raw.status_time ?? raw.ts ?? raw.datetime_utc ?? null;
+    // Normalize timestamp: try candidates in priority order and fall through invalid values
+    const tsCandidates = [raw.last_quote_at, raw.last_trade_time, raw.updated_at, raw.timestamp, raw.datetime, raw.status_time, raw.ts, raw.datetime_utc];
+    let tsDate: Date | null = null;
+    for (const cand of tsCandidates){
+      if (cand === null || cand === undefined || cand === '') continue;
+      try{
+        let candidateDate: Date;
+        if (typeof cand === 'number') candidateDate = new Date(cand < 1e12 ? Math.floor(cand * 1000) : cand);
+        else if (/^[0-9]+$/.test(String(cand))) { const n = Number(cand); candidateDate = new Date(n < 1e12 ? Math.floor(n * 1000) : n); }
+        else candidateDate = new Date(String(cand));
+        if (isFinite(candidateDate.getTime())){ tsDate = candidateDate; break; }
+      }catch(e){ /* try next candidate */ }
+    }
+    if (!tsDate) tsDate = new Date();
     const timestamp = tsDate.toISOString();
     const isStale = (()=>{
       try{ const ageSec = (Date.now() - tsDate.getTime())/1000; return ageSec > 120; }catch(e){ return true; }
@@ -228,5 +236,123 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
     }}
 
     return out;
+  }
+
+  // Get FX rate from `fromCurrency` to SEK. Returns positive finite number or null on failure.
+  async getFxRate(fromCurrency: string, toCurrency: 'SEK'): Promise<any | null> {
+    try{
+      const from = String(fromCurrency || '').toUpperCase();
+      const to = String(toCurrency || '').toUpperCase();
+      if (to !== 'SEK') return null;
+      if (!from) return null;
+      if (from === 'SEK') return 1;
+
+      const key = `${from}->${to}`;
+      // check cache
+      const cached = this.fxCache.get(key);
+      if (cached && cached.expires > Date.now()) return cached.v;
+
+      // dedupe pending
+      const pending = this.fxPending.get(key);
+      if (pending) return pending;
+
+      const p = (async ()=>{
+        try{
+          // Use the dedicated exchange_rate endpoint and parse only the `rate` field
+          const sym = `${from}/${to}`;
+          const url = `https://api.twelvedata.com/exchange_rate?symbol=${encodeURIComponent(sym)}&apikey=${this.apiKey}`;
+          const res = await this.fetchWithTimeout(url);
+          if (!res.ok) return null;
+          const data = await res.json();
+          if (data && data.status === 'error') return null;
+          const rate = Number(data?.rate);
+          if (!this.isValidNumber(rate) || rate <= 0) return null;
+          // assemble richer payload if provider returned fields like previous_close/percent_change/change/open
+          const payload: any = { rate: Number(rate) };
+          if (data?.previous_close !== undefined) payload.previous_close = Number(data.previous_close);
+          if (data?.prev_close !== undefined) payload.previous_close = Number(data.prev_close);
+          if (data?.change !== undefined) payload.change = Number(data.change);
+          if (data?.percent_change !== undefined) payload.percent_change = Number(data.percent_change);
+          if (data?.open !== undefined) payload.open = Number(data.open);
+          if (data?.timestamp !== undefined) payload.timestamp = String(data.timestamp);
+          // Do NOT fallback to `quote` here — keep exchange_rate as the authoritative current rate.
+          // Use a separate cached `time_series` lookup to obtain the previous close for daily percent calculation.
+          try{
+            const daily = await this.getFxDailyReference(from, to).catch(()=>null);
+            if (daily && typeof daily.previous_close === 'number'){
+              payload.previous_close = Number(daily.previous_close);
+              // compute change and percent based on current rate and previous_close
+              try{
+                const prev = Number(daily.previous_close);
+                if (Number.isFinite(prev) && prev !== 0){
+                  payload.change = Number(payload.rate - prev);
+                  payload.percent_change = Number(((payload.rate - prev) / Math.abs(prev)) * 100);
+                }
+              }catch(e){}
+            }
+          }catch(e){ /* non-fatal */ }
+          // cache positive rates
+          this.fxCache.set(key, { expires: Date.now() + this.fxTtlMs, v: payload });
+          return payload;
+        }catch(e){ return null; }
+        finally { this.fxPending.delete(key); }
+      })();
+
+      this.fxPending.set(key, p);
+      return p;
+    }catch(e){ return null; }
+  }
+
+  // Obtain a cached daily reference (previous close) using Twelve Data time_series endpoint.
+  // Returns { previous_close, timestamp } or null.
+  private async getFxDailyReference(fromCurrency: string, toCurrency: 'SEK'): Promise<any | null> {
+    try{
+      const from = String(fromCurrency || '').toUpperCase();
+      const to = String(toCurrency || '').toUpperCase();
+      if (to !== 'SEK') return null;
+      if (!from) return null;
+      if (from === 'SEK') return { previous_close: 1, timestamp: new Date().toISOString() };
+
+      const key = `${from}->${to}`;
+      const cached = this.fxDailyCache.get(key);
+      if (cached && cached.expires > Date.now()) return cached.v;
+
+      const pending = this.fxDailyPending.get(key);
+      if (pending) return pending;
+
+      const p = (async ()=>{
+        try{
+          const sym = `${from}/${to}`;
+          const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=1day&outputsize=2&timezone=UTC&apikey=${this.apiKey}`;
+          const res = await this.fetchWithTimeout(url, 10_000);
+          if (!res.ok) return null;
+          const data = await res.json();
+          if (!data) return null;
+          if (data.status === 'error') return null;
+          const values = Array.isArray(data.values) ? data.values : (Array.isArray(data.data) ? data.data : []);
+          if (!values || values.length === 0) return null;
+          // values[0] is newest; avoid using today's incomplete candle. Compare date part in UTC.
+          const first = values[0];
+          let ref = null;
+          try{
+            const now = new Date();
+            const todayUTC = now.toISOString().slice(0,10);
+            const firstDate = (first.datetime || first.date || '').toString().slice(0,10);
+            if (firstDate === todayUTC && values.length > 1){ ref = values[1]; }
+            else { ref = first; }
+          }catch(e){ ref = values[0]; }
+          if (!ref || ref.close === undefined) return null;
+          const prevClose = Number(ref.close);
+          if (!this.isValidNumber(prevClose)) return null;
+          const out = { previous_close: prevClose, timestamp: ref.datetime || ref.date || null };
+          this.fxDailyCache.set(key, { expires: Date.now() + this.fxDailyTtlMs, v: out });
+          return out;
+        }catch(e){ return null; }
+        finally { this.fxDailyPending.delete(key); }
+      })();
+
+      this.fxDailyPending.set(key, p);
+      return p;
+    }catch(e){ return null; }
   }
 }
