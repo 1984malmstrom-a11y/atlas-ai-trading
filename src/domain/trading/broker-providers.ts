@@ -2,7 +2,7 @@ const _so = 'server' + '-only';
 void import(_so).catch(()=>{});
 
 import { PaperTradingEngine, Order as EngineOrder } from './paper-trading-engine';
-import { getPortfolio } from '../portfolio/portfolio-service';
+import { getPortfolio, savePortfolio } from '../portfolio/portfolio-service';
 
 export type BrokerAccount = { id: string; cash: number; currency: string };
 export type BrokerPosition = { instrumentId: string; symbol: string; quantity: number; marketValue: number; currency: string };
@@ -38,7 +38,7 @@ export class AtlasPaperBrokerProvider implements BrokerProvider {
   private engine: PaperTradingEngine;
   constructor(){
     const portfolio = getPortfolio();
-    this.engine = new PaperTradingEngine(portfolio as any);
+    this.engine = new PaperTradingEngine(portfolio);
   }
 
   async getAccount(): Promise<BrokerAccount> {
@@ -63,7 +63,16 @@ export class AtlasPaperBrokerProvider implements BrokerProvider {
     const res = this.engine.simulateExecution(engOrder);
     if (!res.success) return { success: false, orderId: engOrder.id, status: 'REJECTED', reason: res.code || res.message } as any;
     const tx = res.transaction;
-    // update engine portfolio is already done by simulateExecution since we passed reference
+    const newPortfolio = res.portfolio;
+    try{
+      // Persist updated portfolio atomically; only persist on successful execution
+      await savePortfolio(newPortfolio);
+      // Recreate engine with updated portfolio so subsequent calls see latest state
+      this.engine = new PaperTradingEngine(newPortfolio);
+    }catch(e){
+      // If persistence fails, report rejection to avoid inconsistent state
+      return { success: false, orderId: engOrder.id, status: 'REJECTED', reason: 'PERSISTENCE_FAILED' } as any;
+    }
     return { success: true, orderId: engOrder.id, executedPrice: tx.executedPrice, quantity: tx.quantity, fee: tx.fee, status: 'EXECUTED' };
   }
 }
