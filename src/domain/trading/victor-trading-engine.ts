@@ -64,6 +64,9 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
   // Block live modes
   if (mandate.mode === 'LIVE_MANUAL' || mandate.mode === 'LIVE_AUTO') throw new Error('Live trading is not enabled');
 
+  // Freshness threshold for quotes (ms) — shared for all markets
+  const FRESH_MS = 2 * 60 * 1000; // 2 minutes
+
   // Prepare providers
   const md = new TwelveDataMarketDataProvider();
   const broker = new AtlasPaperBrokerProvider();
@@ -82,6 +85,17 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
   if (shouldAutoSelect){
     try{
     const now = new Date();
+
+    // Helper: Stockholm-local time parts
+    const stockholmParts = (()=>{
+      try{
+        const f = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Stockholm', hour12:false, hour: '2-digit', minute: '2-digit', weekday: 'short' });
+        const parts = f.formatToParts(now).reduce((acc: any,p:any)=>{ acc[p.type]=p.value; return acc; }, {});
+        return { hour: Number(parts.hour), minute: Number(parts.minute), weekday: String(parts.weekday) };
+      }catch(e){ return null; }
+    })();
+
+    // US open logic (unchanged): New York hours
     const etParts = (()=>{
       try{
         const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour12:false, hour: '2-digit', minute: '2-digit' });
@@ -89,38 +103,95 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
         return { hour: Number(parts.hour), minute: Number(parts.minute) };
       }catch(e){ return null; }
     })();
-
-    const isWeekday = (d:Date)=>{ const wd = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday:'short' }).format(d); return !['Sat','Sun'].includes(wd); };
+    const isWeekdayInNY = (d:Date)=>{ const wd = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday:'short' }).format(d); return !['Sat','Sun'].includes(wd); };
     const isUSOpen = (()=>{
-      if (!etParts || !isWeekday(now)) return false;
+      if (!etParts || !isWeekdayInNY(now)) return false;
       const minutes = etParts.hour*60 + etParts.minute; const open = 9*60+30; const close = 16*60;
       return minutes >= open && minutes < close;
     })();
-    const isForexOpen = (()=>{ const wk = isWeekday(now); return wk; })();
+
+    // Determine Stockholm weekend/rollover for Forex
+    const isStockholmWeekend = (()=>{ if (!stockholmParts) return false; return ['Sat','Sun'].includes(String(stockholmParts.weekday)); })();
+    const isForexLocalRollover = (()=>{ if (!stockholmParts) return false; return Number(stockholmParts.hour) === 23; })();
 
     let selectedMarket = 'None';
     if (isUSOpen){
       selectedMarket = 'US Stocks';
-      // pick allowed instruments on US exchanges (NASDAQ/NYSE)
       const usIds = TRADABLE_UNIVERSE.filter(i => i.enabled && (String(i.exchange).toUpperCase().includes('NASDAQ') || String(i.exchange).toUpperCase().includes('NYSE'))).map(i=>i.id);
       if (usIds.length) mandate = { ...mandate, allowedInstrumentIds: usIds };
-    } else if (isForexOpen){
-      selectedMarket = 'Forex';
-      const fxIds = TRADABLE_UNIVERSE.filter(i => i.enabled && String(i.exchange).toUpperCase() === 'FOREX').map(i=>i.id);
-      if (fxIds.length) mandate = { ...mandate, allowedInstrumentIds: fxIds };
     } else {
-      // try crypto if present
-      const cryptoIds = TRADABLE_UNIVERSE.filter(i => i.enabled && String(i.exchange).toUpperCase() === 'CRYPTO').map(i=>i.id);
-      if (cryptoIds.length){ selectedMarket = 'Crypto'; mandate = { ...mandate, allowedInstrumentIds: cryptoIds }; }
-      else {
-        console.log('[victor] No open market detected (US closed, Forex closed). Will skip this cycle.');
-        // create audit and exit early
-        const audit = { timestamp: nowIso(), mode: mandate.mode, mandate, account: await broker.getAccount(), positions: await broker.getPositions(), decisions: [], proposals: [], executed: [], note: 'No open market' };
-        await appendAudit(audit);
-        return { ok: true, report: { audit } };
+      // Consider Forex only if not weekend and not during the 23:00-00:00 Stockholm rollover
+      const considerForex = !isStockholmWeekend && !isForexLocalRollover;
+      if (considerForex){
+        // Fetch FX quotes and require at least one fresh quote to consider FX as active market
+        const fxInstruments = TRADABLE_UNIVERSE.filter(i => i.enabled && String(i.exchange).toUpperCase() === 'FOREX');
+        const fxIds = fxInstruments.map(i=>i.id);
+        if (fxIds.length){
+          const fxSymbols = fxInstruments.map(i => i.providerSymbol || i.name);
+          try{
+            const fxQuotes = await md.getQuotes(fxSymbols);
+            const freshFx = fxQuotes.filter(q => {
+              if (!q || q.isStale || !q.timestamp) return false;
+              const ts = new Date(q.timestamp).getTime();
+              if (isNaN(ts)) return false;
+              const ageMs = Date.now() - ts;
+              return ageMs >= 0 && ageMs <= FRESH_MS;
+            });
+            if (freshFx.length > 0){
+              selectedMarket = 'Forex';
+              // map fresh symbols back to ids
+              const symToId = new Map<string,string>();
+              for (const inst of fxInstruments) symToId.set((inst.providerSymbol||inst.name).toUpperCase(), inst.id);
+              const freshIds = freshFx.map(fq => symToId.get(fq.symbol.toUpperCase())).filter(Boolean) as string[];
+              if (freshIds.length) mandate = { ...mandate, allowedInstrumentIds: freshIds };
+            }
+          }catch(e){ /* ignore and fall through to crypto */ }
+        }
+      }
+
+      // If no market chosen yet, fall back to Crypto
+      if (selectedMarket === 'None'){
+        const cryptoInstruments = TRADABLE_UNIVERSE.filter(i => i.enabled && String(i.exchange).toUpperCase() === 'CRYPTO');
+        const cryptoIds = cryptoInstruments.map(i=>i.id);
+        if (cryptoIds.length){
+          // Fetch crypto quotes and only keep instruments with fresh, non-stale quotes
+          const cryptoSymbols = cryptoInstruments.map(i => i.providerSymbol || i.name);
+          try{
+            const cryptoQuotes = await md.getQuotes(cryptoSymbols);
+            const freshCrypto = cryptoQuotes.filter(q => {
+              if (!q || q.isStale || !q.timestamp) return false;
+              const ts = new Date(q.timestamp).getTime();
+              if (isNaN(ts)) return false;
+              const ageMs = Date.now() - ts;
+              return ageMs >= 0 && ageMs <= FRESH_MS;
+            });
+            if (freshCrypto.length > 0){
+              selectedMarket = 'Crypto';
+              const symToId = new Map<string,string>();
+              for (const inst of cryptoInstruments) symToId.set((inst.providerSymbol||inst.name).toUpperCase(), inst.id);
+              const freshIds = freshCrypto.map(fq => symToId.get(fq.symbol.toUpperCase())).filter(Boolean) as string[];
+              if (freshIds.length) mandate = { ...mandate, allowedInstrumentIds: freshIds };
+            } else {
+              // No valid crypto quotes — end cycle with HOLD/no_market_data
+              console.log('[victor] Crypto selected but no fresh crypto quotes available. Ending cycle.');
+              const audit = { timestamp: nowIso(), mode: mandate.mode, mandate, account: await broker.getAccount(), positions: await broker.getPositions(), decisions: [], proposals: [], executed: [], reason: { code: 'NO_MARKET_DATA', message: 'No fresh crypto quotes' } };
+              await appendAudit(audit);
+              return { ok: true, report: { audit } };
+            }
+          }catch(e){
+            const audit = { timestamp: nowIso(), mode: mandate.mode, mandate, account: await broker.getAccount(), positions: await broker.getPositions(), decisions: [], proposals: [], executed: [], reason: { code: 'MARKET_DATA_ERROR', message: String(e) } };
+            await appendAudit(audit);
+            return { ok: true, report: { audit } };
+          }
+        } else {
+          console.log('[victor] No crypto market configured. Skipping cycle.');
+          const audit = { timestamp: nowIso(), mode: mandate.mode, mandate, account: await broker.getAccount(), positions: await broker.getPositions(), decisions: [], proposals: [], executed: [], note: 'No open market' };
+          await appendAudit(audit);
+          return { ok: true, report: { audit } };
+        }
       }
     }
-    console.log('[victor] Selected market:', selectedMarket, 'US open=', isUSOpen, 'Forex open=', isForexOpen);
+    console.log('[victor] Selected market:', selectedMarket);
     }catch(e){ console.warn('[victor] market selection failed', e); }
   }
 
@@ -144,11 +215,22 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
   for (const inst of allowed){
     const symbol = (inst.providerSymbol || inst.name).toUpperCase();
     const q = quoteMap.get(symbol);
-    if (!q){
-      // mark as stale
+    // Freshness guard: require a valid, non-stale timestamp within FRESH_MS and not in the future
+    if (!q || q.isStale || !q.timestamp){
       decisions.push({ instrumentId: inst.id, action: 'HOLD', confidence: 0, thesis: 'No quote', signals: [], risks: ['stale_data'], timeHorizon: 'SWING', generatedAt: nowIso() });
       continue;
     }
+    const ts = new Date(q.timestamp).getTime();
+    if (isNaN(ts)){
+      decisions.push({ instrumentId: inst.id, action: 'HOLD', confidence: 0, thesis: 'Invalid timestamp', signals: [], risks: ['stale_data'], timeHorizon: 'SWING', generatedAt: nowIso() });
+      continue;
+    }
+    const ageMs = Date.now() - ts;
+    if (ageMs < 0 || ageMs > FRESH_MS){
+      decisions.push({ instrumentId: inst.id, action: 'HOLD', confidence: 0, thesis: 'Stale/future timestamp', signals: [], risks: ['stale_data'], timeHorizon: 'SWING', generatedAt: nowIso() });
+      continue;
+    }
+
     const d = deterministicDecisionForQuote(inst.id, q);
     decisions.push(d);
   }

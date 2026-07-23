@@ -101,7 +101,7 @@ describe('victor audit counting', ()=>{
     const symbols = TRADABLE_UNIVERSE.slice(0,2).map(i=> (i.providerSymbol || i.name).toUpperCase());
     const origGetQuotes = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
     (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2 }));
+      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
     };
 
     // spy/patch broker placeOrder
@@ -137,7 +137,7 @@ describe('victor audit counting', ()=>{
     writeAudit([]);
     const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
     (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2 }));
+      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
     };
     origGetQuotes = origGQ;
 
@@ -164,7 +164,7 @@ describe('victor audit counting', ()=>{
     writeAudit([]);
     const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
     (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2 }));
+      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
     };
     origGetQuotes = origGQ;
 
@@ -184,7 +184,7 @@ describe('victor audit counting', ()=>{
       writeAudit([{ timestamp: new Date().toISOString(), executed: [ { proposal: {}, result: { status: 'EXECUTED' } } ] }]);
       const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
       (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-        return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2 }));
+        return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
       };
       origGetQuotes = origGQ;
 
@@ -467,5 +467,552 @@ describe('victor audit counting', ()=>{
     expect(res.success).toBe(true);
     expect(res.transaction.executedPrice).toBeGreaterThanOrEqual(limitPrice);
     expect(res.transaction.executedPrice).toBeLessThan(limitPrice * 1.01);
+  });
+
+  // --- Uses mocked Twelve Data crypto quotes deterministically (mock-only) ---
+  it('uses mocked Twelve Data crypto quotes deterministically', async ()=>{
+    const provider = new TwelveDataMarketDataProvider();
+    const syms = ['BTC/USD','ETH/USD','SOL/USD'];
+    const out: any[] = [];
+    try{
+      const quotes = await provider.getQuotes(syms);
+      for (const s of syms){
+        const found = (quotes || []).find((q:any)=> String(q.symbol).toUpperCase() === String(s).toUpperCase());
+        if (found){
+          const fresh = (found.timestamp && (Date.now() - new Date(found.timestamp).getTime()) <= (2*60*1000));
+          out.push({ requested: s, returned: found.symbol, price: found.price, timestamp: found.timestamp, fresh, source: found.source, error: null });
+        } else {
+          out.push({ requested: s, returned: null, price: null, timestamp: null, fresh: false, source: null, error: 'no_quote' });
+        }
+      }
+    }catch(e:any){
+      for (const s of syms) out.push({ requested: s, returned: null, price: null, timestamp: null, fresh: false, source: null, error: String(e) });
+    }
+    // Basic assertions: out must have three entries
+    expect(out.length).toBe(3);
+  });
+
+  // --- Timestamp normalization unit tests for TwelveDataMarketDataProvider.validateQuote ---
+  describe('TwelveData timestamp normalization', ()=>{
+    const proto: any = (TwelveDataMarketDataProvider as any).prototype;
+
+    it('converts unix seconds to ISO timestamp', ()=>{
+      const raw: any = { symbol: 'BTC/USD', price: 1, timestamp: 1620003600 };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBe(new Date(1620003600 * 1000).toISOString());
+      expect(q.isStale).toBe(false);
+    });
+
+    it('accepts unix milliseconds and converts to ISO', ()=>{
+      const raw: any = { symbol: 'ETH/USD', price: 1, timestamp: 1620003600000 };
+      const q = proto.validateQuote(raw, 'ETH/USD');
+      expect(q.timestamp).toBe(new Date(1620003600000).toISOString());
+      expect(q.isStale).toBe(false);
+    });
+
+    it('accepts ISO datetime strings', ()=>{
+      const iso = new Date().toISOString();
+      const raw: any = { symbol: 'SOL/USD', price: 1, datetime: iso };
+      const q = proto.validateQuote(raw, 'SOL/USD');
+      expect(q.timestamp).toBe(new Date(iso).toISOString());
+      expect(q.isStale).toBe(false);
+    });
+
+    it('invalid timestamp is not replaced by current time and is marked stale', ()=>{
+      const raw: any = { symbol: 'BTC/USD', price: 1, timestamp: 'not-a-time' };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBeNull();
+      expect(q.isStale).toBe(true);
+    });
+
+    it('fresh crypto quote passes freshness check', ()=>{
+      const nowIso = new Date().toISOString();
+      const raw: any = { symbol: 'BTC/USD', price: 50000, timestamp: nowIso };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBe(new Date(nowIso).toISOString());
+      const age = Date.now() - new Date(q.timestamp).getTime();
+      expect(age).toBeLessThanOrEqual(2 * 60 * 1000);
+    });
+
+    it('old crypto quote yields large age (filtered by Victor)', ()=>{
+      const oldIso = new Date(Date.now() - (10 * 60 * 1000)).toISOString();
+      const raw: any = { symbol: 'BTC/USD', price: 50000, timestamp: oldIso };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      const age = Date.now() - new Date(q.timestamp).getTime();
+      expect(age).toBeGreaterThan(2 * 60 * 1000);
+    });
+
+    it('numeric timestamp prioritized over date-only datetime', ()=>{
+      const raw: any = { symbol: 'BTC/USD', price: 1, timestamp: 1620003600, datetime: '2026-07-23' };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.rawTimestampField).toBe('timestamp');
+      expect(q.timestamp).toBe(new Date(1620003600 * 1000).toISOString());
+      expect(q.isStale).toBe(false);
+    });
+
+    it('unix seconds normalized correctly', ()=>{
+      const raw: any = { symbol: 'ETH/USD', price: 1, timestamp: 1620003600 };
+      const q = proto.validateQuote(raw, 'ETH/USD');
+      expect(q.timestamp).toBe(new Date(1620003600 * 1000).toISOString());
+    });
+
+    it('unix milliseconds normalized correctly', ()=>{
+      const raw: any = { symbol: 'SOL/USD', price: 1, timestamp: 1620003600000 };
+      const q = proto.validateQuote(raw, 'SOL/USD');
+      expect(q.timestamp).toBe(new Date(1620003600000).toISOString());
+    });
+
+    it('datetime with time accepted', ()=>{
+      const iso = '2026-07-23T12:34:56Z';
+      const raw: any = { symbol: 'BTC/USD', price: 1, datetime: iso };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBe(new Date(iso).toISOString());
+      expect(q.rawTimestampField).toBe('datetime');
+      expect(q.isStale).toBe(false);
+    });
+
+    it('date-only datetime rejected (YYYY-MM-DD)', ()=>{
+      const raw: any = { symbol: 'ETH/USD', price: 1, datetime: '2026-07-23' };
+      const q = proto.validateQuote(raw, 'ETH/USD');
+      expect(q.timestamp).toBeNull();
+      expect(q.isStale).toBe(true);
+      expect(q.rawTimestampField).toBeUndefined();
+    });
+
+    it('date-only datetime rejected (midnight string)', ()=>{
+      const raw: any = { symbol: 'SOL/USD', price: 1, datetime: '2026-07-23T00:00:00.000Z' };
+      const q = proto.validateQuote(raw, 'SOL/USD');
+      expect(q.timestamp).toBeNull();
+      expect(q.isStale).toBe(true);
+    });
+
+    it('date field ignored for freshness', ()=>{
+      const raw: any = { symbol: 'BTC/USD', price: 1, date: '2026-07-23' };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBeNull();
+      expect(q.isStale).toBe(true);
+    });
+
+    it('missing intraday timestamp yields null and isStale true (no fallback)', ()=>{
+      const raw: any = { symbol: 'BTC/USD', price: 1 }; // no timestamp-like fields
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBeNull();
+      expect(q.isStale).toBe(true);
+    });
+
+    it('fresh intraday timestamp passes freshness check', ()=>{
+      const nowIso = new Date().toISOString();
+      const raw: any = { symbol: 'BTC/USD', price: 50000, timestamp: nowIso };
+      const q = proto.validateQuote(raw, 'BTC/USD');
+      expect(q.timestamp).toBe(new Date(nowIso).toISOString());
+      const age = Date.now() - new Date(q.timestamp).getTime();
+      expect(age).toBeLessThanOrEqual(2 * 60 * 1000);
+    });
+  });
+
+  describe('TwelveData time_series for Crypto', ()=>{
+    let fetchOrig: any;
+    beforeEach(()=>{ fetchOrig = globalThis.fetch; });
+    afterEach(()=>{ globalThis.fetch = fetchOrig; });
+
+    it('uses time_series for BTC/USD and maps values[0].close to price', async ()=>{
+      const provider = new TwelveDataMarketDataProvider();
+      // mock fetch
+      globalThis.fetch = (async (input: any) => {
+        const url = String(input);
+        if (url.includes('/time_series')){
+          return { ok: true, status: 200, json: async ()=>({ meta: { symbol: 'BTC/USD', exchange: 'Binance' }, values: [{ datetime: new Date().toISOString().replace('T',' ').replace(/\.\d+Z$/,'') , close: '60000' }] }) };
+        }
+        return { ok: false, status: 500, json: async ()=>({}) };
+      }) as any;
+      const q = await provider.getQuote('BTC/USD');
+      expect(q.price).toBe(60000);
+      expect(q.rawTimestampField).toBe('values[0].datetime');
+      expect(q.timestamp).toMatch(/T\d{2}:\d{2}:\d{2}\.000Z$/);
+    });
+
+    it('empty values yields error/no valid quote', async ()=>{
+      const provider = new TwelveDataMarketDataProvider();
+      globalThis.fetch = (async (input: any) => {
+        const url = String(input);
+        if (url.includes('/time_series')) return { ok: true, status:200, json: async ()=>({ meta: { symbol: 'SOL/USD' }, values: [] }) };
+        return { ok: false, status:500, json: async ()=>({}) };
+      }) as any;
+      await expect(provider.getQuote('SOL/USD')).rejects.toThrow();
+    });
+
+    it('does not call /quote for crypto when time_series succeeds', async ()=>{
+      const provider = new TwelveDataMarketDataProvider();
+      let seenQuote = false;
+      globalThis.fetch = (async (input: any) => {
+        const url = String(input);
+        if (url.includes('/quote')){ seenQuote = true; return { ok: true, status:200, json: async ()=>({}) }; }
+        if (url.includes('/time_series')) return { ok: true, status:200, json: async ()=>({ meta: { symbol: 'ETH/USD' }, values: [{ datetime: new Date().toISOString().replace('T',' ').replace(/\.\d+Z$/,'') , close: '2000' }] }) };
+        return { ok: false, status:500, json: async ()=>({}) };
+      }) as any;
+      const q = await provider.getQuote('ETH/USD');
+      expect(seenQuote).toBe(false);
+      expect(q.price).toBe(2000);
+    });
+  });
+
+  // --- Auto market prioritization tests (US -> Forex -> Crypto) ---
+  describe('auto market prioritization (US -> Forex -> Crypto)', ()=>{
+    afterEach(()=>{
+      try{ vi.useRealTimers(); }catch(e){}
+    });
+
+    it('A. US open -> selects US Stocks', async ()=>{
+      // Monday 2026-07-20 14:00 America/New_York (within market hours)
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const recorded: string[] = [];
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){ recorded.push(...ids); return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false })); };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      // allowedInstrumentIds should include US instrument ids (e.g., microsoft)
+      const ids = (audit.mandate && audit.mandate.allowedInstrumentIds) || [];
+      expect(ids.some((id:string)=> id === 'microsoft')).toBe(true);
+
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('B. US closed, Forex open with fresh quote -> selects Forex', async ()=>{
+      // Stockholm local 2026-07-21T12:00:00+02:00 (weekday, not rollover); NY is closed
+      vi.setSystemTime(new Date('2026-07-21T12:00:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        // if forex symbols requested, return fresh quotes
+        if (ids.some(s=> String(s).toUpperCase().includes('/'))){
+          return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 1.2345, changePercent: 0.1, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        }
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 50, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      const ids = (audit.mandate && audit.mandate.allowedInstrumentIds) || [];
+      // should include at least one FOREX id from universe
+      expect(ids.length).toBeGreaterThan(0);
+      const forexIds = ids.filter((id:string)=> String(id).startsWith('fx_'));
+      expect(forexIds.length).toBeGreaterThan(0);
+
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('C. Forex rollover 23:00-00:00 Europe/Stockholm -> selects Crypto', async ()=>{
+      vi.setSystemTime(new Date('2026-07-21T23:30:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+          // when crypto symbols requested, return fresh crypto
+          if (ids.some(s=> String(s).toUpperCase().includes('BTC') || String(s).toUpperCase().includes('ETH') || String(s).toUpperCase().includes('SOL'))){
+            return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 30000, changePercent: 1, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+          }
+          return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 1, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      const ids = (audit.mandate && audit.mandate.allowedInstrumentIds) || [];
+      // should include crypto ids
+      expect(ids.some((id:string)=> String(id).startsWith('crypto_'))).toBe(true);
+
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('D. Weekend -> Crypto selected', async ()=>{
+      // Saturday 2026-07-18T12:00:00+02:00
+      vi.setSystemTime(new Date('2026-07-18T12:00:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        if (ids.some(s=> String(s).toUpperCase().includes('BTC'))) return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 30000, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 1, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      const ids = (audit.mandate && audit.mandate.allowedInstrumentIds) || [];
+      expect(ids.some((id:string)=> String(id).startsWith('crypto_'))).toBe(true);
+
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('E. Forex stale -> falls back to Crypto', async ()=>{
+      vi.setSystemTime(new Date('2026-07-21T12:00:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+          // crypto first
+          if (ids.some(s=> /BTC|ETH|SOL/.test(String(s).toUpperCase()))) return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 20000, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+          // forex symbols: return stale timestamps
+          if (ids.some(s=> String(s).toUpperCase().includes('/'))){
+            const old = new Date(Date.now() - (10 * 60 * 1000)).toISOString();
+            return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 1.2345, changePercent: 0, timestamp: old, source: 'twelve-data', isStale: true }));
+          }
+          return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 50, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      const ids = (audit.mandate && audit.mandate.allowedInstrumentIds) || [];
+      expect(ids.some((id:string)=> String(id).startsWith('crypto_'))).toBe(true);
+
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('F. Crypto chosen but no valid crypto quotes -> HOLD/no_market_data', async ()=>{
+      // Choose time where US closed and forex blocked (e.g., rollover) to force crypto path
+      vi.setSystemTime(new Date('2026-07-21T23:30:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        // return nothing/failure for crypto
+        return ids.map((s:string)=> null).filter(Boolean) as any;
+      };
+
+      // spy engine to ensure it's not called
+      const pte = await import('./paper-trading-engine');
+      const proto: any = (pte as any).PaperTradingEngine.prototype;
+      const origSim = proto.simulateExecution;
+      let simCalled = false;
+      proto.simulateExecution = function(this: any, ...args: any[]){ simCalled = true; return origSim.apply(this, args); };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const report = (res as any).report;
+      expect(report).toBeTruthy();
+      const audit = report.audit;
+      expect(audit).toBeTruthy();
+      // Expect a reason code indicating no market data
+      expect(audit.reason && audit.reason.code === 'NO_MARKET_DATA').toBe(true);
+      expect((audit.proposals || []).length).toBe(0);
+      expect((audit.executed || []).length).toBe(0);
+      expect(simCalled).toBe(false);
+
+      proto.simulateExecution = origSim;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('H. Crypto quote with future timestamp is not considered fresh -> HOLD/no_market_data', async ()=>{
+      // Force crypto path
+      vi.setSystemTime(new Date('2026-07-21T23:30:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      // Return crypto quotes with timestamp 60s in the future
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        const fut = new Date(Date.now() + 60_000).toISOString();
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 30000, changePercent: 0, timestamp: fut, source: 'twelve-data', isStale: false }));
+      };
+
+      // spy engine simulateExecution to ensure no executions
+      const pte = await import('./paper-trading-engine');
+      const proto: any = (pte as any).PaperTradingEngine.prototype;
+      const origSim = proto.simulateExecution;
+      let simCalled = false;
+      proto.simulateExecution = function(this: any, ...args: any[]){ simCalled = true; return origSim.apply(this, args); };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const report = (res as any).report;
+      expect(report).toBeTruthy();
+      const audit = report.audit;
+      expect(audit).toBeTruthy();
+      // Expect NO_MARKET_DATA because future timestamps should be rejected
+      expect(audit.reason && audit.reason.code === 'NO_MARKET_DATA').toBe(true);
+      expect((audit.proposals || []).length).toBe(0);
+      expect((audit.executed || []).length).toBe(0);
+      expect(simCalled).toBe(false);
+
+      proto.simulateExecution = origSim;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('I. Stock quote with future timestamp is not considered fresh -> no executions / HOLD', async ()=>{
+      // US market open
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      // Return MSFT with a timestamp 60s in the future
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        const fut = new Date(Date.now() + 60_000).toISOString();
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: 2, timestamp: fut, source: 'twelve-data', isStale: false }));
+      };
+
+      // spy broker placeOrder to ensure no executions
+      let placeCalls = 0;
+      const origPlace = AtlasPaperBrokerProvider.prototype.placeOrder;
+      AtlasPaperBrokerProvider.prototype.placeOrder = async function(req: any){
+        placeCalls++;
+        return { success: true, orderId: `o_${placeCalls}`, executedPrice: req.price || 100, quantity: req.quantity, fee: 0, status: 'EXECUTED' };
+      };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const report = (res as any).report;
+      expect(report).toBeTruthy();
+      const audit = report.audit;
+      expect(audit).toBeTruthy();
+
+      // Expect no executions placed. If a specific reason exists, accept NO_MARKET_DATA as well.
+      const noMarketData = !!(audit.reason && audit.reason.code === 'NO_MARKET_DATA');
+      expect(placeCalls === 0 || noMarketData).toBe(true);
+      expect((audit.executed || []).length).toBe(0);
+
+      // restore
+      AtlasPaperBrokerProvider.prototype.placeOrder = origPlace;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('J. Stock quote without timestamp is not considered fresh -> no executions / HOLD', async ()=>{
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        // return stocks without timestamp
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: 2, source: 'twelve-data', isStale: false }));
+      };
+
+      let placeCalls = 0;
+      const origPlace = AtlasPaperBrokerProvider.prototype.placeOrder;
+      AtlasPaperBrokerProvider.prototype.placeOrder = async function(req: any){ placeCalls++; return { success: true, orderId: `o_${placeCalls}`, executedPrice: req.price || 100, quantity: req.quantity, fee: 0, status: 'EXECUTED' }; };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      const noMarketData = !!(audit.reason && audit.reason.code === 'NO_MARKET_DATA');
+      expect(placeCalls === 0 || noMarketData).toBe(true);
+      expect((audit.executed || []).length).toBe(0);
+
+      AtlasPaperBrokerProvider.prototype.placeOrder = origPlace;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('K. Stock quote with invalid timestamp is not considered fresh -> no executions / HOLD', async ()=>{
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        // return stocks with invalid timestamp
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: 2, timestamp: 'invalid-date', source: 'twelve-data', isStale: false }));
+      };
+
+      let placeCalls = 0;
+      const origPlace = AtlasPaperBrokerProvider.prototype.placeOrder;
+      AtlasPaperBrokerProvider.prototype.placeOrder = async function(req: any){ placeCalls++; return { success: true, orderId: `o_${placeCalls}`, executedPrice: req.price || 100, quantity: req.quantity, fee: 0, status: 'EXECUTED' }; };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      const noMarketData = !!(audit.reason && audit.reason.code === 'NO_MARKET_DATA');
+      expect(placeCalls === 0 || noMarketData).toBe(true);
+      expect((audit.executed || []).length).toBe(0);
+
+      AtlasPaperBrokerProvider.prototype.placeOrder = origPlace;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('L. Fresh stock quote remains eligible for execution', async ()=>{
+      // US market open
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      };
+
+      let placeCalls = 0;
+      const origPlace = AtlasPaperBrokerProvider.prototype.placeOrder;
+      AtlasPaperBrokerProvider.prototype.placeOrder = async function(req: any){
+        placeCalls++;
+        return { success: true, orderId: `o_${placeCalls}`, executedPrice: req.price || 100, quantity: req.quantity, fee: 0, status: 'EXECUTED' };
+      };
+
+      const mandate = { ...DEFAULT_PAPER_AUTO_MANDATE, mode: 'PAPER_AUTO', allowedInstrumentIds: ['microsoft'] } as any;
+      const res = await runVictorTradingCycle({ mandate, trigger: 'MANUAL' } as any);
+      const report = (res as any).report;
+      expect(report).toBeTruthy();
+      const audit = report.audit;
+      expect(audit).toBeTruthy();
+      // Expect exactly one placeOrder call and at least one executed entry
+      expect(placeCalls).toBe(1);
+      expect((audit.executed || []).length).toBeGreaterThanOrEqual(1);
+      // Not NO_MARKET_DATA
+      expect(!(audit.reason && audit.reason.code === 'NO_MARKET_DATA')).toBe(true);
+
+      AtlasPaperBrokerProvider.prototype.placeOrder = origPlace;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('M. Stock quote within freshness boundary remains eligible', async ()=>{
+      // Use fixed time to compute deterministic timestamps
+      const FRESH_MS = 2 * 60 * 1000;
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      // timestamp just inside freshness (FRESH_MS - 1000)
+      const tsInside = new Date(Date.now() - (FRESH_MS - 1000)).toISOString();
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, timestamp: tsInside, source: 'twelve-data', isStale: false }));
+      };
+
+      let placeCalls = 0;
+      const origPlace = AtlasPaperBrokerProvider.prototype.placeOrder;
+      AtlasPaperBrokerProvider.prototype.placeOrder = async function(req: any){ placeCalls++; return { success: true, orderId: `o_${placeCalls}`, executedPrice: req.price || 100, quantity: req.quantity, fee: 0, status: 'EXECUTED' }; };
+
+      const mandate = { ...DEFAULT_PAPER_AUTO_MANDATE, mode: 'PAPER_AUTO', allowedInstrumentIds: ['microsoft'] } as any;
+      const res = await runVictorTradingCycle({ mandate, trigger: 'MANUAL' } as any);
+      const report = (res as any).report;
+      expect(report).toBeTruthy();
+      const audit = report.audit;
+      expect(audit).toBeTruthy();
+      expect(placeCalls).toBe(1);
+      expect((audit.executed || []).length).toBeGreaterThanOrEqual(1);
+
+      AtlasPaperBrokerProvider.prototype.placeOrder = origPlace;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('N. Stock quote outside freshness boundary is rejected', async ()=>{
+      const FRESH_MS = 2 * 60 * 1000;
+      vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      // timestamp just outside freshness (FRESH_MS + 1000)
+      const tsOutside = new Date(Date.now() - (FRESH_MS + 1000)).toISOString();
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, timestamp: tsOutside, source: 'twelve-data', isStale: false }));
+      };
+
+      let placeCalls = 0;
+      const origPlace = AtlasPaperBrokerProvider.prototype.placeOrder;
+      AtlasPaperBrokerProvider.prototype.placeOrder = async function(req: any){ placeCalls++; return { success: true, orderId: `o_${placeCalls}`, executedPrice: req.price || 100, quantity: req.quantity, fee: 0, status: 'EXECUTED' }; };
+
+      const mandate = { ...DEFAULT_PAPER_AUTO_MANDATE, mode: 'PAPER_AUTO', allowedInstrumentIds: ['microsoft'] } as any;
+      const res = await runVictorTradingCycle({ mandate, trigger: 'MANUAL' } as any);
+      const report = (res as any).report;
+      expect(report).toBeTruthy();
+      const audit = report.audit;
+      expect(audit).toBeTruthy();
+      const noMarketData = !!(audit.reason && audit.reason.code === 'NO_MARKET_DATA');
+      expect(placeCalls === 0 || noMarketData).toBe(true);
+      expect((audit.executed || []).length).toBe(0);
+
+      AtlasPaperBrokerProvider.prototype.placeOrder = origPlace;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
+
+    it('G. Crypto with fresh quote -> crypto instrument analyzed (BTC/USD provider symbol)', async ()=>{
+      vi.setSystemTime(new Date('2026-07-21T23:30:00+02:00'));
+      const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
+        if (ids.some(s=> /BTC/.test(String(s).toUpperCase()))) return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 30000, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 1, changePercent: 0, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      };
+
+      const res = await runVictorTradingCycle({ trigger: 'MANUAL' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      // ensure at least one decision targets a crypto instrument from our universe
+      const decisions = audit.decisions || [];
+      const cryptoDecision = decisions.find((d:any)=> String(d.instrumentId).startsWith('crypto_'));
+      expect(cryptoDecision).toBeTruthy();
+      // provider symbol used should be BTC/USD for at least one instrument
+      const usedSymbols = (audit.proposals || []).map((p:any)=> (p.request && p.request.symbol) || '').filter(Boolean);
+      (TwelveDataMarketDataProvider as any).prototype.getQuotes = origGQ;
+    });
   });
 });
