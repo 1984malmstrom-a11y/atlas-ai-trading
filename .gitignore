@@ -3,6 +3,7 @@ node_modules
 .env
 .next/
 src/data/portfolio.json
+src/data/victor-trading-audit.json
 *.tsbuildinfo
 quotes_output.json
 HEAD

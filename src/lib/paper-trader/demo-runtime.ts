@@ -56,6 +56,78 @@ class InMemoryAuditStore {
   }
 }
 
+// File-backed audit store: persists audit entries to a JSON file under src/data
+class FileAuditStore {
+  private entries: any[] = [];
+  private path: string;
+  constructor(filePath: string){
+    this.path = filePath;
+    try{
+      if (fs.existsSync(this.path)){
+        const raw = fs.readFileSync(this.path, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) this.entries = parsed;
+      }
+    }catch(e){
+      this.entries = [];
+    }
+  }
+
+  private makeSummary(e: any){
+    const decision = e.decision || (Array.isArray(e.decisions) && e.decisions[0]) || null;
+    const exec = e.execution || (Array.isArray(e.executed) && e.executed[0] && (e.executed[0].result || e.executed[0].execution)) || null;
+    const portfolioBefore = e.portfolioBefore || e.before || null;
+    const portfolioAfter = e.portfolioAfter || e.after || null;
+    const holdingBefore = portfolioBefore && Array.isArray(portfolioBefore.holdings) ? portfolioBefore.holdings : null;
+    const holdingAfter = portfolioAfter && Array.isArray(portfolioAfter.holdings) ? portfolioAfter.holdings : null;
+    return {
+      cycleId: e.id || null,
+      decisionId: decision && decision.id ? decision.id : null,
+      symbol: decision && (decision.symbol || decision.instrumentId) || null,
+      action: decision && decision.action ? decision.action : null,
+      confidence: decision && typeof decision.confidence === 'number' ? decision.confidence : null,
+      referencePrice: decision && typeof decision.referencePrice === 'number' ? decision.referencePrice : null,
+      quoteTimestamp: decision && (decision.generatedAt || null),
+      risks: decision && (decision.risks || decision.reasoning) || null,
+      executionStatus: exec && exec.status ? exec.status : (exec ? 'EXECUTED' : null),
+      executedPrice: exec && typeof exec.executedPrice === 'number' ? exec.executedPrice : null,
+      quantity: exec && typeof exec.quantity === 'number' ? exec.quantity : null,
+      notional: exec && typeof exec.notional === 'number' ? exec.notional : null,
+      fee: exec && typeof exec.fee === 'number' ? exec.fee : null,
+      cashBefore: portfolioBefore && typeof portfolioBefore.availableCash === 'number' ? portfolioBefore.availableCash : null,
+      cashAfter: portfolioAfter && typeof portfolioAfter.availableCash === 'number' ? portfolioAfter.availableCash : null,
+      holdingBefore,
+      holdingAfter,
+      createdAt: e.timestamp || new Date().toISOString(),
+    };
+  }
+
+  private persistSync(){
+    try{
+      const dir = path.dirname(this.path);
+      try{ fs.mkdirSync(dir, { recursive: true }); }catch(e){}
+      const tmp = `${this.path}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.entries, null, 2), 'utf-8');
+      try{ fs.renameSync(tmp, this.path); }catch(e){ fs.writeFileSync(this.path, JSON.stringify(this.entries, null, 2), 'utf-8'); }
+    }catch(e){ console.error('FileAuditStore persist failed', e); }
+  }
+
+  async append(e: AuditEntry){
+    const baseId = e.id || `audit_${Date.now()}`;
+    let uniqueId = baseId; let suffix = 1;
+    while (this.entries.find((x:any) => x && x.raw && x.raw.id === uniqueId)) uniqueId = `${baseId}_${suffix++}`;
+    const entryWithId = { ...e, id: uniqueId } as any;
+    const summary = this.makeSummary(entryWithId);
+    const toStore = { id: uniqueId, timestamp: entryWithId.timestamp || new Date().toISOString(), summary, raw: entryWithId };
+    this.entries.push(toStore);
+    this.persistSync();
+  }
+
+  async list(){
+    return this.entries.slice().reverse();
+  }
+}
+
 function createInMemoryPortfolioAdapter(initialCash: number){
   const PORTFOLIO_PATH = path.join(process.cwd(), 'src', 'data', 'portfolio.json');
 
@@ -119,8 +191,12 @@ function createInMemoryPortfolioAdapter(initialCash: number){
 }
 
 // initialize runtime
-const auditStore = new InMemoryAuditStore();
+const AUDIT_PATH = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+const auditStore = new FileAuditStore(AUDIT_PATH);
 const portfolioAdapter = createInMemoryPortfolioAdapter(START_CAPITAL);
+
+// export FileAuditStore for focused tests
+export { FileAuditStore };
 
 const config: PaperTraderConfig = {
   enabled: true,
