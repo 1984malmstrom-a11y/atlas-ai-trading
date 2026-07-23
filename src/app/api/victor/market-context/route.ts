@@ -8,8 +8,19 @@ import { getMarketSnapshot, refreshMarketSnapshot, getMarketSnapshotStatus } fro
 async function buildVictorMarketContext(){
   // build the same response as previous implementation
   const { quotes, errors, disabledInstruments, fetchedAt } = await getNormalizedQuotes();
+  type Instrument = {
+    instrumentId: string;
+    symbol?: string;
+    name?: string;
+    price: number | null;
+    change?: number | null;
+    changePercent?: number | null;
+    dataStatus?: string | null;
+    isStale?: boolean;
+    marketTimestamp?: string | number | null;
+  };
 
-  const instruments = (quotes || []).map((q:any) => ({
+  const instruments: Instrument[] = (quotes || []).map((q:any) => ({
     instrumentId: q.instrumentId,
     symbol: q.symbol,
     name: q.name,
@@ -30,9 +41,9 @@ async function buildVictorMarketContext(){
   const validInstruments = instruments.filter(i => i.price !== null && i.changePercent !== null && i.dataStatus !== 'UNAVAILABLE');
 
   const instrumentCount = instruments.length;
-  const advancing = instruments.filter(i => i.changePercent !== null && i.changePercent > 0).length;
-  const declining = instruments.filter(i => i.changePercent !== null && i.changePercent < 0).length;
-  const unchanged = instruments.filter(i => i.changePercent === 0).length;
+  const advancing = instruments.filter(i => typeof i.changePercent === 'number' && i.changePercent > 0).length;
+  const declining = instruments.filter(i => typeof i.changePercent === 'number' && i.changePercent < 0).length;
+  const unchanged = instruments.filter(i => typeof i.changePercent === 'number' && i.changePercent === 0).length;
   const unavailable = instruments.filter(i => i.price === null || i.changePercent === null).length;
 
   const avg = validInstruments.length > 0 ? Number((validInstruments.reduce((s,n)=>s + (Number(n.changePercent)||0),0)/validInstruments.length).toFixed(2)) : 0;
