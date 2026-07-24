@@ -720,6 +720,7 @@ describe('paper-trader scheduler', ()=>{
     expect(dc.technicalConfidence).toBe(82);
     expect(dc.recommendationStrength).toBe('HIGH');
     expect(dc.overallDecisionConfidence).toBe(82);
+    expect(dc.executiveSummary).toBe('Strong technical setup with no conflicting signals.');
     analyzeSpy.mockRestore();
   });
 
@@ -747,6 +748,7 @@ describe('paper-trader scheduler', ()=>{
     expect(msEval).toBeDefined();
     const dc = msEval.raw.meta.decisionContext;
     expect(dc.overallDecisionConfidence).toBe(52);
+    expect(dc.executiveSummary).toBe('Technical outlook is positive, but conflicting signals reduce confidence.');
     analyzeSpy.mockRestore();
   });
 
@@ -768,5 +770,6 @@ describe('paper-trader scheduler', ()=>{
     expect(msEval).toBeDefined();
     const dc = msEval.raw.meta.decisionContext;
     expect(dc.overallDecisionConfidence).toBe(0);
+    expect(dc.executiveSummary).toBe('Technical analysis unavailable.');
   });
 });

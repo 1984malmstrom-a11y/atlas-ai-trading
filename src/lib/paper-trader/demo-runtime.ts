@@ -909,6 +909,22 @@ async function appendEvaluation(entry: any){
           recommendationStrength,
           overallDecisionConfidence,
         };
+        // executiveSummary: one-sentence summary built from existing fields
+        try{
+          let executiveSummary = 'Technical analysis unavailable.';
+          if (status === 'success'){
+            if (signalsConflict){
+              if (recommendationStrength === 'HIGH') executiveSummary = 'Strong technical setup, but conflicting signals reduce confidence.';
+              else if (recommendationStrength === 'MEDIUM') executiveSummary = 'Technical outlook is positive, but conflicting signals reduce confidence.';
+              else executiveSummary = 'Technical outlook is weak and conflicting signals reduce confidence.';
+            } else {
+              if (recommendationStrength === 'HIGH') executiveSummary = 'Strong technical setup with no conflicting signals.';
+              else if (recommendationStrength === 'MEDIUM') executiveSummary = 'Technical outlook is positive with moderate confidence.';
+              else executiveSummary = 'Technical outlook is weak.';
+            }
+          }
+          entry.meta.decisionContext.executiveSummary = executiveSummary;
+        }catch(_){ /* ignore executiveSummary errors */ }
       }
     }catch(_){ /* ignore */ }
   }catch(_){ /* ignore normalization errors */ }
