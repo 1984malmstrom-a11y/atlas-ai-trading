@@ -1,5 +1,6 @@
 import createPaperTrader from './engine';
 import { PaperTraderConfig, PaperTradeDecision, SimulatedExecution, AuditEntry } from './types';
+import analyzePriceSeries from './technical';
 import fs from 'fs';
 import path from 'path';
 
@@ -267,7 +268,7 @@ const runtime: RuntimeState = {
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
-// Scheduler singleton stored on globalThis to survive hot reloads in dev
+// Scheduler singleton stored at module scope to survive hot reloads in dev
 type SchedulerState = {
   timerId: NodeJS.Timeout | null;
   inProgress: boolean;
@@ -284,13 +285,15 @@ type SchedulerState = {
 };
 
 const SCHED_KEY = '__atlas_paper_trader_scheduler__';
+// Module-scoped scheduler state (avoid cross-module globals)
+let moduleScheduler: SchedulerState | null = null;
 function getGlobalScheduler(): SchedulerState {
-  const g: any = globalThis as any;
-  if (!g[SCHED_KEY]){
-    g[SCHED_KEY] = { timerId: null, inProgress: false, lastRunAt: null, intervalMs: 60_000, runTick: null } as SchedulerState;
+  if (!moduleScheduler){
+    moduleScheduler = { timerId: null, inProgress: false, lastRunAt: null, intervalMs: 60_000, runTick: null } as SchedulerState;
   }
-  return g[SCHED_KEY] as SchedulerState;
+  return moduleScheduler;
 }
+export function getSchedulerState(){ return getGlobalScheduler(); }
 
 // Implementation used as the dynamic runTick that can be swapped on hot-reload
 async function runAutomaticCycleImplementation(){
@@ -570,6 +573,59 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   try{ const _beforeList = await auditStore.list(); _beforeEvalCount = Array.isArray(_beforeList) ? _beforeList.filter((a:any)=> a && a.raw && a.raw.kind === 'EVALUATION').length : 0; }catch(_){ _beforeEvalCount = 0; }
   const portfolio = opts && opts.overrideUniverse && opts.overrideUniverse.portfolio ? opts.overrideUniverse.portfolio : await portfolioAdapter.getPortfolio();
   const plannedSymbols = new Set<string>();
+  // Per-cycle in-memory promise-map to dedupe historical calls within a single cycle.
+  // Store Promises (not resolved data) so concurrent requests for the same symbol
+  // share the same provider call. This map ONLY lives for the duration of the
+  // cycle and is not a long-lived cache. The provider's own cache remains the
+  // only long-lived cache.
+  const historicalRequestsBySymbol = new Map<string, Promise<any>>();
+  const analysisResultsBySymbol = new Map<string, Promise<any>>();
+
+  // Helper: fetch historical closes once per symbol (promise dedupe) and run analyzePriceSeries once.
+  async function fetchAndAnalyze(symbol: string){
+    const sym = String(symbol).toUpperCase();
+    if (!analysisResultsBySymbol.has(sym)){
+      const p = (async ()=>{
+        try{
+          if (!historicalRequestsBySymbol.has(sym)){
+            const td = await import('../market-data/twelve-data');
+            const provider = new td.TwelveDataMarketDataProvider();
+            const histP = provider.getHistoricalDailyCloses(sym, 30);
+            historicalRequestsBySymbol.set(sym, histP);
+          }
+          const hist = await historicalRequestsBySymbol.get(sym);
+          const techMeta: any = { technicalAnalysisMode: 'observe-only' };
+          if (hist && Array.isArray(hist.closes)){
+            const analysis = analyzePriceSeries(hist.closes);
+            techMeta.technicalAnalysisStatus = 'success';
+            techMeta.technicalTrend = analysis.trend;
+            techMeta.technicalMomentumPercent = analysis.momentumPercent;
+            techMeta.technicalVolatilityPercent = analysis.volatilityPercent;
+            techMeta.technicalScore = analysis.technicalScore;
+            techMeta.technicalSignal = analysis.signal;
+            techMeta.technicalReasons = analysis.reasons;
+            techMeta.historicalDataPoints = hist.closes.length;
+            techMeta.historicalFirstDate = Array.isArray(hist.dates) && hist.dates.length ? hist.dates[0] : null;
+            techMeta.historicalLastDate = Array.isArray(hist.dates) && hist.dates.length ? hist.dates[hist.dates.length-1] : null;
+            techMeta.historicalSource = hist.source || null;
+          } else {
+            techMeta.technicalAnalysisStatus = 'unavailable';
+            techMeta.technicalAnalysisErrorCode = 'INSUFFICIENT_HISTORY';
+            techMeta.technicalAnalysisErrorMessage = 'No historical closes available';
+          }
+          return techMeta;
+        }catch(e:any){
+          const techMeta: any = { technicalAnalysisMode: 'observe-only' };
+          techMeta.technicalAnalysisStatus = 'unavailable';
+          techMeta.technicalAnalysisErrorCode = e && e.code ? e.code : 'PROVIDER_ERROR';
+          techMeta.technicalAnalysisErrorMessage = e && e.message ? e.message : String(e);
+          return techMeta;
+        }
+      })();
+      analysisResultsBySymbol.set(sym, p);
+    }
+    return analysisResultsBySymbol.get(sym) as Promise<any>;
+  }
 
   // use module-scope helpers exported for tests
 
@@ -584,8 +640,13 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         evaluatedSymbols.add(symbol);
         evaluationCount++;
       }
-      // audit evaluation
-      try{ await auditStore.append({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any); }catch(e){}
+      // Attach centralized technical analysis (observe-only) using historical daily closes
+      try{
+        const techMeta = await fetchAndAnalyze(symbol);
+        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: techMeta } } as any); }catch(e){}
+      }catch(_){
+        try{ await auditStore.append({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' } } } as any); }catch(_){ }
+      }
       if (evalRes.action === 'SELL'){
         plannedSymbols.add(symbol);
         candidates.push({ id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: 100, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0) });
@@ -640,15 +701,32 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       }
 
       if (buySignal){
+        // perform observe-only technical analysis before adding candidate (do not alter buy decision)
+        try{
+            try{
+              const techMeta = await fetchAndAnalyze(s);
+              try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: techMeta } } as any); }catch(e){}
+            }catch(e:any){
+              try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } } as any); }catch(_){ }
+            }
+        }catch(e:any){
+          // on history error, log unavailable status but continue
+          try{ await auditStore.append({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } } as any); }catch(_){}
+        }
         candidates.push({ id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: 80, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000 });
       } else {
-        // create a lightweight evaluation audit for visibility
+        // create a lightweight evaluation audit for visibility and attach centralized technical analysis
         try{
           if (!evaluatedSymbols.has(s)){
             evaluatedSymbols.add(s);
             evaluationCount++;
           }
-          await auditStore.append({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: signalReason }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any);
+            try{
+              const techMeta = await fetchAndAnalyze(s);
+              await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: signalReason }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: techMeta } } as any);
+            }catch(e:any){
+              await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: signalReason }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } } as any);
+            }
         }catch(e){}
       }
     }
@@ -715,6 +793,17 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   runtime.lastUpdated = nowIso();
   // update scheduler last/next when manual (automatic) cycle finishes
   return { ...runtime.latestCycle, evaluationCount };
+}
+
+// Helper to ensure every EVALUATION audit includes a technicalAnalysis meta object.
+async function appendEvaluation(entry: any){
+  try{
+    entry.meta = entry.meta || {};
+    if (!Object.prototype.hasOwnProperty.call(entry.meta, 'technicalAnalysis')){
+      entry.meta.technicalAnalysis = { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'MISSING_TECHNICAL', technicalAnalysisErrorMessage: null };
+    }
+  }catch(_){ /* ignore normalization errors */ }
+  return auditStore.append(entry);
 }
 
 export async function setPaperTradingEnabled(enabled: boolean){

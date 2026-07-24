@@ -26,11 +26,91 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
   private fxDailyTtlMs = 6 * 60 * 60_000; // 6 hours
   private fxDailyCache = new Map<string, { expires: number; v: any }>();
   private fxDailyPending = new Map<string, Promise<any | null>>();
+  // historical time_series cache for daily closes: key -> { expires, v }
+  private histTtlMs = 6 * 60 * 60_000; // 6 hours
+  private histCache = new Map<string, { expires: number; v: { symbol: string; closes: number[]; dates: string[]; source: string; fetchedAt: string } }>();
+  private histPending = new Map<string, Promise<any>>();
 
   constructor(){
     const key = process.env.TWELVE_DATA_API_KEY;
     if (!key) throw new Error('TWELVE_DATA_API_KEY must be set on server');
     this.apiKey = key;
+  }
+
+  // Public: fetch normalized daily closes for a provider symbol (e.g. 'MSFT')
+  // Returns { symbol, closes[], dates[], source: 'twelve-data', fetchedAt }
+  async getHistoricalDailyCloses(providerSymbol: string, outputSize = 100, timeout = 10_000) {
+    if (!providerSymbol || typeof providerSymbol !== 'string') throw Object.assign(new Error('Invalid symbol'), { code: 'UNSUPPORTED_SYMBOL' });
+    const sym = String(providerSymbol).toUpperCase();
+    const key = `${sym}:${outputSize}`;
+    const cached = this.histCache.get(key);
+    if (cached && cached.expires > Date.now()) return cached.v;
+    const pending = this.histPending.get(key);
+    if (pending) return pending;
+
+    const p = (async ()=>{
+      try{
+        const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=1day&outputsize=${Number(outputSize)}&timezone=UTC&apikey=${this.apiKey}`;
+        const res = await this.fetchWithTimeout(url, timeout);
+        if (!res.ok){
+          if (res.status === 429) throw Object.assign(new Error('Rate limit from provider'), { code: 'RATE_LIMIT' });
+          throw Object.assign(new Error(`Provider returned status ${res.status}`), { code: 'PROVIDER_ERROR' });
+        }
+        const data = await res.json();
+        if (!data) throw Object.assign(new Error('Empty provider response'), { code: 'INVALID_RESPONSE' });
+        if (data.status === 'error'){
+          const msg = String(data.message || JSON.stringify(data));
+          if (/Invalid symbol/i.test(msg) || /not found/i.test(msg)) throw Object.assign(new Error('Unsupported symbol'), { code: 'UNSUPPORTED_SYMBOL', message: msg });
+          throw Object.assign(new Error(msg), { code: 'PROVIDER_ERROR' });
+        }
+
+        const values = Array.isArray(data.values) ? data.values : (Array.isArray(data.data) ? data.data : []);
+        if (!Array.isArray(values)) throw Object.assign(new Error('Invalid provider response structure'), { code: 'INVALID_RESPONSE' });
+
+        // Normalize: values[0] is newest — drop today's incomplete candle if present
+        const items = values.slice();
+        // Build (date, close) pairs, filter invalid/negative prices
+        const pairs: { date: string; close: number }[] = [];
+        for (const it of items){
+          const rawDate = (it.datetime || it.date || it.timestamp || '').toString();
+          const closeRaw = it.close ?? it.c ?? it.value ?? null;
+          const close = typeof closeRaw === 'string' ? Number(closeRaw) : Number(closeRaw);
+          if (!rawDate || !Number.isFinite(close) || close <= 0) continue;
+          // Normalize to YYYY-MM-DD (first 10 chars) if possible
+          const cand = rawDate.length >= 10 ? rawDate.slice(0,10) : rawDate;
+          // Accept only valid YYYY-MM-DD strings
+          if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(cand)) continue;
+          pairs.push({ date: cand, close });
+        }
+
+        if (pairs.length === 0) throw Object.assign(new Error('No valid historical values'), { code: 'INSUFFICIENT_HISTORY' });
+
+        // Deterministic UTC rule: exclude today's UTC date and any future dates
+        const todayUtc = new Date().toISOString().slice(0,10);
+
+        const filtered = pairs.filter(p => {
+          // Exclude non-YYYY-MM-DD already removed; exclude today's UTC date and any future dates
+          if (p.date >= todayUtc) return false;
+          return true;
+        });
+
+        // Remove duplicates keeping the last seen (newest) for a date, then sort oldest->newest
+        const byDate = new Map<string, number>();
+        for (const p of filtered){ byDate.set(p.date, p.close); }
+        const sortedDates = Array.from(byDate.keys()).sort((a,b)=> a < b ? -1 : a > b ? 1 : 0);
+        const closes = sortedDates.map(d => byDate.get(d) as number);
+
+        // Ensure at least 20 completed days after filtering
+        if (closes.length < 20) throw Object.assign(new Error(`Insufficient history: have ${closes.length}`), { code: 'INSUFFICIENT_HISTORY' });
+
+        const out = { symbol: sym, closes, dates: sortedDates, source: 'twelve-data', fetchedAt: new Date().toISOString() };
+        this.histCache.set(key, { expires: Date.now() + this.histTtlMs, v: out });
+        return out;
+      }finally{ this.histPending.delete(key); }
+    })();
+
+    this.histPending.set(key, p as Promise<any>);
+    return p;
   }
 
   private async fetchWithTimeout(url: string, timeout = 8_000){
