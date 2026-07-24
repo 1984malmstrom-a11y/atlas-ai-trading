@@ -11,6 +11,8 @@ beforeEach(async ()=>{
   try{ (dr as any).stopAutonomousScheduler && (dr as any).stopAutonomousScheduler(); }catch(e){}
 });
 
+
+
 afterEach(()=>{
   try{ (dr as any).stopAutonomousScheduler && (dr as any).stopAutonomousScheduler(); }catch(e){}
   vi.useRealTimers();
@@ -1029,5 +1031,138 @@ describe('paper-trader scheduler', ()=>{
     expect(dc.strategyAction).toBe(ev.raw.decision.action);
     expect(dc.aggregatorSignal).toBe('HOLD');
     expect(dc.matches).toBe(true);
+  });
+
+  it('alignmentStats examples (1/1/100, 2/1/50, 3/2/67)', async ()=>{
+    vi.useRealTimers();
+    vi.resetModules();
+    // deterministic quotes provider and history
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
+    const histSpy = vi.fn(async (sym:string) => ({ symbol: sym, closes: new Array(30).fill(0).map((_,i)=>100+i), dates: new Array(30).fill(0).map((_,i)=> new Date(2026,5,i+1).toISOString().slice(0,10)), source: 'twelve-data' }));
+    vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
+
+    const tech = await import('../paper-trader/technical');
+    const analyzeSpy = vi.spyOn(tech, 'default');
+    const drLocal = await import('./demo-runtime');
+
+    // Ensure fresh start
+    await drLocal.__clearAudits();
+    const fs = require('fs'); const path = require('path');
+    const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+    // Example 1: first evaluation -> should be 1 / 1 / 100
+    analyzeSpy.mockImplementationOnce((closes:any)=> ({ trend: 'neutral', momentumPercent: 0, volatilityPercent: 0, technicalScore: 60, signal: 'HOLD', reasons: [] }));
+    drLocal.__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    let beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeIds = new Set((beforeAll||[]).map((x:any)=> x && x.id));
+    await drLocal.runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    let all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const newEntries = (all || []).filter((x:any)=> !beforeIds.has(x && x.id));
+    let ev = newEntries.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT' && a.raw.meta && a.raw.meta.alignmentStats);
+    expect(ev).toBeDefined();
+    expect(ev.raw.meta && ev.raw.meta.alignmentStats).toBeDefined();
+    // compute expected alignment based on previous audits
+    const prevComps = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'MSFT' && a.raw.meta && a.raw.meta.decisionComparison).length;
+    const prevMatches = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'MSFT' && a.raw.meta && a.raw.meta.decisionComparison && a.raw.meta.decisionComparison.matches).length;
+    const thisMatch = ev.raw.meta && ev.raw.meta.decisionComparison && ev.raw.meta.decisionComparison.matches ? 1 : 0;
+    const expectedTotal = prevComps + 1;
+    const expectedMatches = prevMatches + thisMatch;
+    const expectedRate = Math.round((expectedTotal>0? (expectedMatches/expectedTotal)*100 : 0));
+    expect(ev.raw.meta.alignmentStats.totalComparisons).toBe(expectedTotal);
+    expect(ev.raw.meta.alignmentStats.matchingComparisons).toBe(expectedMatches);
+    expect(ev.raw.meta.alignmentStats.matchRate).toBe(expectedRate);
+
+    // Example 2: second evaluation -> mismatch (analyzer BUY) => 2 / 1 / 50
+    analyzeSpy.mockImplementationOnce((closes:any)=> ({ trend: 'bullish', momentumPercent: 20, volatilityPercent: 5, technicalScore: 85, signal: 'BUY', reasons: ['momentum'] }));
+    beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeIds2 = new Set((beforeAll||[]).map((x:any)=> x && x.id));
+    await drLocal.runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const newEntries2 = (all || []).filter((x:any)=> !beforeIds2.has(x && x.id));
+    ev = newEntries2.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT' && a.raw.meta && a.raw.meta.alignmentStats);
+    expect(ev).toBeDefined();
+    const prevComps2 = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'MSFT' && a.raw.meta && a.raw.meta.decisionComparison).length;
+    const prevMatches2 = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'MSFT' && a.raw.meta && a.raw.meta.decisionComparison && a.raw.meta.decisionComparison.matches).length;
+    const thisMatch2 = ev.raw.meta && ev.raw.meta.decisionComparison && ev.raw.meta.decisionComparison.matches ? 1 : 0;
+    const expectedTotal2 = prevComps2 + 1;
+    const expectedMatches2 = prevMatches2 + thisMatch2;
+    const expectedRate2 = Math.round((expectedTotal2>0? (expectedMatches2/expectedTotal2)*100 : 0));
+    expect(ev.raw.meta.alignmentStats.totalComparisons).toBe(expectedTotal2);
+    expect(ev.raw.meta.alignmentStats.matchingComparisons).toBe(expectedMatches2);
+    expect(ev.raw.meta.alignmentStats.matchRate).toBe(expectedRate2);
+
+    // Example 3: third evaluation -> match (analyzer HOLD) => 3 / 2 / 67
+    analyzeSpy.mockImplementationOnce((closes:any)=> ({ trend: 'neutral', momentumPercent: 0, volatilityPercent: 0, technicalScore: 60, signal: 'HOLD', reasons: [] }));
+    beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeIds3 = new Set((beforeAll||[]).map((x:any)=> x && x.id));
+    await drLocal.runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const newEntries3 = (all || []).filter((x:any)=> !beforeIds3.has(x && x.id));
+    ev = newEntries3.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT' && a.raw.meta && a.raw.meta.alignmentStats);
+    expect(ev).toBeDefined();
+    const prevComps3 = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'MSFT' && a.raw.meta && a.raw.meta.decisionComparison).length;
+    const prevMatches3 = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'MSFT' && a.raw.meta && a.raw.meta.decisionComparison && a.raw.meta.decisionComparison.matches).length;
+    const thisMatch3 = ev.raw.meta && ev.raw.meta.decisionComparison && ev.raw.meta.decisionComparison.matches ? 1 : 0;
+    const expectedTotal3 = prevComps3 + 1;
+    const expectedMatches3 = prevMatches3 + thisMatch3;
+    const expectedRate3 = Math.round((expectedTotal3>0? (expectedMatches3/expectedTotal3)*100 : 0));
+    expect(ev.raw.meta.alignmentStats.totalComparisons).toBe(expectedTotal3);
+    expect(ev.raw.meta.alignmentStats.matchingComparisons).toBe(expectedMatches3);
+    expect(ev.raw.meta.alignmentStats.matchRate).toBe(expectedRate3);
+
+    // New symbol B: first evaluation should start at 1/1/100
+    analyzeSpy.mockImplementationOnce((closes:any)=> ({ trend: 'neutral', momentumPercent: 0, volatilityPercent: 0, technicalScore: 60, signal: 'HOLD', reasons: [] }));
+    beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeIds4 = new Set((beforeAll||[]).map((x:any)=> x && x.id));
+    await drLocal.runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'IBM', priceSek: 50 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_IBM', symbol: 'IBM', quantity: 1, averagePrice: 50, currentPrice: 50 }] } } });
+    all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const newEntries4 = (all || []).filter((x:any)=> !beforeIds4.has(x && x.id));
+    const evB = newEntries4.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'IBM' && a.raw.meta && a.raw.meta.alignmentStats);
+    expect(evB).toBeDefined();
+    const prevComps4 = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'IBM' && a.raw.meta && a.raw.meta.decisionComparison).length;
+    const prevMatches4 = (beforeAll || []).filter((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && String(a.raw.decision.symbol).toUpperCase() === 'IBM' && a.raw.meta && a.raw.meta.decisionComparison && a.raw.meta.decisionComparison.matches).length;
+    const thisMatch4 = evB.raw.meta && evB.raw.meta.decisionComparison && evB.raw.meta.decisionComparison.matches ? 1 : 0;
+    const expectedTotal4 = prevComps4 + 1;
+    const expectedMatches4 = prevMatches4 + thisMatch4;
+    const expectedRate4 = Math.round((expectedTotal4>0? (expectedMatches4/expectedTotal4)*100 : 0));
+    expect(evB.raw.meta.alignmentStats.totalComparisons).toBe(expectedTotal4);
+    expect(evB.raw.meta.alignmentStats.matchingComparisons).toBe(expectedMatches4);
+    expect(evB.raw.meta.alignmentStats.matchRate).toBe(expectedRate4);
+
+    analyzeSpy.mockRestore();
+  });
+
+  it('error paths produce decisionComparison and alignmentStats', async ()=>{
+    vi.useRealTimers();
+    vi.resetModules();
+    // Make provider throw for historical data to hit error branches
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
+    vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ const err:any = new Error('Provider failed'); err.code = 'PROVIDER_ERROR'; throw err; } } }));
+
+    const drLocal = await import('./demo-runtime');
+    const fs = require('fs'); const path = require('path');
+    const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+
+    // Case A: holdings path where fetchAndAnalyze throws -> should append via appendEvaluation
+    await drLocal.__clearAudits();
+    drLocal.__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    await drLocal.runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    let all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    let appended = all.slice().reverse();
+    let ev = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
+    expect(ev).toBeDefined();
+    expect(ev.raw.meta && ev.raw.meta.decisionComparison).toBeDefined();
+    expect(ev.raw.meta && ev.raw.meta.alignmentStats).toBeDefined();
+
+    // Case B: buy-candidate path where fetchAndAnalyze throws -> should append via appendEvaluation
+    await drLocal.__clearAudits();
+    // Provide portfolio without MSFT holdings so candidate logic runs
+    drLocal.__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    await drLocal.runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [] } } });
+    all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    appended = all.slice().reverse();
+    ev = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
+    expect(ev).toBeDefined();
+    expect(ev.raw.meta && ev.raw.meta.decisionComparison).toBeDefined();
+    expect(ev.raw.meta && ev.raw.meta.alignmentStats).toBeDefined();
   });
 });

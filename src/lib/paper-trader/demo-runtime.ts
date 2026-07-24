@@ -657,7 +657,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         const techMeta = await fetchAndAnalyze(symbol);
         try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, techMeta) } as any); }catch(e){}
       }catch(_){
-        try{ await auditStore.append({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' }) } as any); }catch(_){ }
+        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' }) } as any); }catch(_){ }
       }
       if (evalRes.action === 'SELL'){
         plannedSymbols.add(symbol);
@@ -723,7 +723,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             }
         }catch(e:any){
           // on history error, log unavailable status but continue
-          try{ await auditStore.append({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true, technicalAnalysis: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } } as any); }catch(_){}
+          try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } as any); }catch(_){ }
         }
         candidates.push({ id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: 80, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000 });
       } else {
@@ -991,6 +991,32 @@ async function appendEvaluation(entry: any){
         const matches = strategyAction === aggregatorSignal;
         // Do NOT modify entry.decision.action
         entry.meta.decisionComparison = { strategyAction, aggregatorSignal, matches };
+      }
+    }catch(_){ }
+
+    // Compute alignmentStats for EVALUATION audits by inspecting previous EVALUATION entries
+    try{
+      if (entry && entry.kind === 'EVALUATION'){
+        try{
+          const prev = await auditStore.list();
+          const symbol = entry && entry.decision && entry.decision.symbol ? String(entry.decision.symbol).toUpperCase() : null;
+          const prevEvals = Array.isArray(prev) ? prev.filter((a:any)=> a && a.raw && a.raw.kind === 'EVALUATION' && a.raw.decision && symbol ? String(a.raw.decision.symbol).toUpperCase() === symbol : true) : [];
+          // Count only previous evaluations that have a decisionComparison
+          let prevComparisons = 0;
+          let prevMatches = 0;
+          for (const p of prevEvals){
+            try{
+              const dc = p && p.raw && p.raw.meta && p.raw.meta.decisionComparison;
+              if (dc){ prevComparisons++; if (dc.matches) prevMatches++; }
+            }catch(_){ }
+          }
+          const thisDc = entry.meta && entry.meta.decisionComparison ? entry.meta.decisionComparison : null;
+          const thisMatch = thisDc && !!thisDc.matches ? 1 : 0;
+          const totalComparisons = prevComparisons + (thisDc ? 1 : 0);
+          const matchingComparisons = prevMatches + thisMatch;
+          const matchRate = Math.round((totalComparisons > 0 ? (matchingComparisons / totalComparisons) * 100 : 0));
+          entry.meta.alignmentStats = { totalComparisons, matchingComparisons, matchRate };
+        }catch(_){ /* ignore alignment compute errors */ }
       }
     }catch(_){ }
 
