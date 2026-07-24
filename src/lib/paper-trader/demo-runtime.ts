@@ -802,6 +802,27 @@ async function appendEvaluation(entry: any){
     if (!Object.prototype.hasOwnProperty.call(entry.meta, 'technicalAnalysis')){
       entry.meta.technicalAnalysis = { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'MISSING_TECHNICAL', technicalAnalysisErrorMessage: null };
     }
+    // Derive a short human-readable technical summary from existing technicalAnalysis
+    try{
+      const ta = entry.meta.technicalAnalysis || {};
+      // initialize technicalSummary only if not present to avoid overwriting any explicit test data
+      if (!Object.prototype.hasOwnProperty.call(entry.meta, 'technicalSummary')){
+        if (ta.technicalAnalysisStatus === 'success'){
+          const trend = ta.technicalTrend || null;
+          const signal = ta.technicalSignal || null;
+          const score = typeof ta.technicalScore === 'number' ? ta.technicalScore : (typeof ta.technicalScore === 'string' ? Number(ta.technicalScore) : null);
+          const reason = Array.isArray(ta.technicalReasons) && ta.technicalReasons.length ? String(ta.technicalReasons[0]) : (ta.technicalAnalysisErrorMessage || null);
+          const textParts = [] as string[];
+          if (trend) textParts.push(`Trend: ${trend}`);
+          if (signal) textParts.push(`Signal: ${signal}`);
+          if (score !== null && score !== undefined) textParts.push(`Score: ${score}`);
+          if (reason) textParts.push(`Reason: ${reason}`);
+          entry.meta.technicalSummary = { trend, signal, score, reason, text: textParts.join(' • ') };
+        } else {
+          entry.meta.technicalSummary = { text: 'Technical analysis unavailable' };
+        }
+      }
+    }catch(_){ /* swallow summary generation errors */ }
   }catch(_){ /* ignore normalization errors */ }
   return auditStore.append(entry);
 }

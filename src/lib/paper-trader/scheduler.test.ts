@@ -317,6 +317,48 @@ describe('paper-trader scheduler', ()=>{
     expect(histSpy.mock.calls.filter((c:any)=> c[0] === 'MSFT').length).toBeLessThanOrEqual(1);
   });
 
+  it('adds technicalSummary based on technicalAnalysis for evaluations', async ()=>{
+    // Mock quotes and twelve-data for deterministic history
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
+    const histSpy = vi.fn(async (sym:string) => {
+      const closes = new Array(30).fill(0).map((_,i)=> 100 + i);
+      const dates = new Array(30).fill(0).map((_,i)=> new Date(2026,5, i+1).toISOString().slice(0,10));
+      return { symbol: sym, closes, dates, source: 'twelve-data' };
+    });
+    vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
+
+    (dr as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 5, averagePrice: 120, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+
+    await (dr as any).__clearAudits();
+    const fs = require('fs'); const path = require('path');
+    const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+    const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeLen = beforeAll.length;
+
+    const res = await (dr as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 5, averagePrice: 120, currentPrice: 100 }] } } });
+
+    const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const appended = all.slice(beforeLen);
+    const msEval = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
+    expect(msEval).toBeDefined();
+    expect(msEval.raw.meta).toBeDefined();
+    expect(msEval.raw.meta.technicalAnalysis).toBeDefined();
+    expect(msEval.raw.meta.technicalSummary).toBeDefined();
+    const ta = msEval.raw.meta.technicalAnalysis;
+    const ts = msEval.raw.meta.technicalSummary;
+    if (ta.technicalAnalysisStatus === 'success'){
+      expect(ts.trend).toBe(ta.technicalTrend);
+      expect(ts.signal).toBe(ta.technicalSignal);
+      expect(ts.score).toBe(ta.technicalScore);
+      // reason may come from array or error message
+      const expectedReason = Array.isArray(ta.technicalReasons) && ta.technicalReasons.length ? String(ta.technicalReasons[0]) : (ta.technicalAnalysisErrorMessage || null);
+      expect(ts.reason).toBe(expectedReason);
+      expect(typeof ts.text === 'string' && ts.text.length > 0).toBeTruthy();
+    } else {
+      expect(ts.text).toMatch(/unavailable/i);
+    }
+  });
+
   it('technical BUY is observe-only (audit signals BUY, action remains HOLD, no BUY execution)', async ()=>{
     vi.useRealTimers();
     // Use a rising closes series so the real analyzer returns BUY
