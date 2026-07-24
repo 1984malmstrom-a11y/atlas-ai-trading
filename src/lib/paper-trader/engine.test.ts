@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import createPaperTrader from './engine';
+import { DEFAULT_PAPER_AUTO_MANDATE } from '../../domain/trading/victor-types';
 import { PaperTradeDecision } from './types';
 
 // In-memory deterministic id generator
@@ -214,5 +215,89 @@ describe('PaperTrader V1', ()=>{
     expect(rB.accepted).toBe(true);
     expect(rA.execution).toEqual(rB.execution);
     expect(p1._getState()).toEqual(p2._getState());
+  });
+
+  // DAILY LOSS LIMIT tests
+  it('allows trades when realized loss is under daily limit', async ()=>{
+    // Using DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent (2%) and portfolio totalValue 100000 -> limit = 2000 SEK
+    const initial = makePortfolio(100000);
+    initial.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 200, averagePrice: 100, currentPrice:100, marketValue:20000, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+    const adapter = makeAdapter(initial);
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // SELL that realizes -1000 SEK (avg 100 -> sell at 90 qty 100 => -1000)
+    const sell = makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99, referencePrice: 90, requestedNotionalSek: 9000 });
+    const r1 = await trader.handleDecision(sell);
+    const audits = await trader.getAuditEntries();
+    expect(r1.accepted).toBe(true);
+    // Next trade should still be allowed because realized (-1000) > -2000 limit
+    const buy = makeDecision({ id: 'd_buy', action: 'BUY', symbol: 'AAA', confidence: 99, referencePrice: 90, requestedNotionalSek: 1000 });
+    const r2 = await trader.handleDecision(buy);
+    expect(r2.accepted).toBe(true);
+  });
+
+  it('rejects new trades when realized is exactly at daily limit', async ()=>{
+    // Using default percent 2% -> limit 2000 SEK. Create holdings to realize exactly -2000 SEK.
+    const initial = makePortfolio(100000);
+    initial.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 200, averagePrice: 100, currentPrice:100, marketValue:20000, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+    const adapter = makeAdapter(initial);
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // SELL that realizes exactly -2000 SEK: sell 100 @ executedPrice 80 -> (80-100)*100 = -2000
+    const sell = makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99, referencePrice: 80, requestedNotionalSek: 8000 });
+    const r1 = await trader.handleDecision(sell);
+    console.log('DEBUG sell result rollover:', r1);
+    expect(r1.accepted).toBe(true);
+    // Subsequent BUY should be rejected
+    const buy = makeDecision({ id: 'd_buy2', action: 'BUY', symbol: 'AAA', confidence: 99, referencePrice: 80, requestedNotionalSek: 1000 });
+    const r2 = await trader.handleDecision(buy);
+    expect(r2.accepted).toBe(false);
+    expect(r2.code).toBe('DAILY_LOSS_LIMIT');
+  });
+
+  it('rejects when realized exceeds daily limit', async ()=>{
+    const initial = makePortfolio(100000);
+    initial.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 200, averagePrice: 100, currentPrice:100, marketValue:20000, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+    const adapter = makeAdapter(initial);
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // Sell that realizes -3000 SEK -> should block subsequent trades
+    const sell = makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99, referencePrice: 70, requestedNotionalSek: 14000 });
+    const r1 = await trader.handleDecision(sell);
+    expect(r1.accepted).toBe(true);
+    const buy = makeDecision({ id: 'd_buy3', action: 'BUY', symbol: 'AAA', confidence: 99, referencePrice: 70, requestedNotionalSek: 1000 });
+    const r2 = await trader.handleDecision(buy);
+    expect(r2.accepted).toBe(false);
+    expect(r2.code).toBe('DAILY_LOSS_LIMIT');
+  });
+
+  it('new trading day resets daily loss counting', async ()=>{
+    // Use mutable clock and real engine flows
+    let now = new Date('2026-01-02T12:00:00.000Z');
+    const clockMutable = { now: () => new Date(now) };
+    const initial = makePortfolio(100000);
+    initial.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 200, averagePrice: 100, currentPrice:100, marketValue:20000, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+    const adapter = makeAdapter(initial);
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: clockMutable as any, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // Day 1: realize -3000 SEK (sell 100 @ 70)
+    const sell = makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99, referencePrice: 70, requestedNotionalSek: 7000 });
+    const r1 = await trader.handleDecision(sell);
+    const auditsNow = await trader.getAuditEntries();
+    expect(r1.accepted).toBe(true);
+    // next trade same day should be blocked
+    const buy1 = makeDecision({ id: 'd_next', action: 'BUY', symbol: 'AAA', confidence: 99, referencePrice: 70, requestedNotionalSek: 1000 });
+    const r2 = await trader.handleDecision(buy1);
+    expect(r2.accepted).toBe(false);
+    // advance clock to next day
+    now = new Date('2026-01-03T12:00:00.000Z');
+    const buy2 = makeDecision({ id: 'd_next_day', action: 'BUY', symbol: 'AAA', confidence: 99, referencePrice: 70, requestedNotionalSek: 1000 });
+    const r3 = await trader.handleDecision(buy2);
+    expect(r3.accepted).toBe(true);
+  });
+
+  it('HOLD is not affected by daily loss limit', async ()=>{
+    const initial = makePortfolio(100000);
+    const adapter = makeAdapter(initial);
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    const res = await trader.handleDecision(makeDecision({ action: 'HOLD' }));
+    expect(res.accepted).toBe(false);
+    expect(res.code).toBe('HOLD');
   });
 });

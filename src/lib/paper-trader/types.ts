@@ -128,7 +128,10 @@ export type DecisionResult = {
 };
 
 export type CycleResult = {
-  processed: number;
+  // Number of actionable BUY/SELL candidates processed in the cycle.
+  // `processedCandidates` intentionally counts candidate decisions
+  // (BUY/SELL) that entered the candidate-processing loop.
+  processedCandidates: number;
   executed: number;
   rejects: number;
   entries: AuditEntry[];

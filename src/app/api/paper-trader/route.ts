@@ -35,6 +35,8 @@ export async function POST(req: Request){
         await runtime.setPaperTradingEnabled(false);
         return NextResponse.json({ ok: true, enabled: false });
       }
+      // START_SCHEDULER action removed: scheduler is managed by runtime singleton
+      // TRIGGER_CYCLE action removed: no HTTP-triggered scheduler activity allowed
     }
 
     // New: accept minimal trade requests

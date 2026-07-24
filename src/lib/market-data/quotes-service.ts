@@ -136,7 +136,7 @@ export async function getNormalizedQuotes(providerOverride?: MarketDataProvider,
           if (usd && usd.rate){
             out.quotes.push({ instrumentId: 'usd-sek', symbol: 'USD/SEK', name: 'USD/SEK', currency: 'SEK', price: Number(usd.rate), priceSek: Number(usd.rate), fxRateSek: Number(usd.rate), previousClose: usd.previous_close !== null && usd.previous_close !== undefined ? Number(usd.previous_close) : null, change: usd.change !== null && usd.change !== undefined ? Number(usd.change) : null, changePercent: usd.percent_change !== null && usd.percent_change !== undefined ? Number(usd.percent_change) : null, marketTimestamp: usd.timestamp || nowIso, fetchedAt: nowIso, dataStatus: 'LIVE', isStale: false, provider: 'twelve-data' });
           } else if (prevUsd){
-            out.quotes.push(prevUsd);
+            out.quotes.push({ ...prevUsd });
           } else {
             out.quotes.push({ instrumentId: 'usd-sek', symbol: 'USD/SEK', name: 'USD/SEK', currency: 'SEK', price: null, previousClose: null, change: null, changePercent: null, marketTimestamp: null, fetchedAt: nowIso, dataStatus: 'UNAVAILABLE', isStale: true, provider: 'twelve-data' });
           }
@@ -144,13 +144,17 @@ export async function getNormalizedQuotes(providerOverride?: MarketDataProvider,
           if (eur && eur.rate){
             out.quotes.push({ instrumentId: 'eur-sek', symbol: 'EUR/SEK', name: 'EUR/SEK', currency: 'SEK', price: Number(eur.rate), priceSek: Number(eur.rate), fxRateSek: Number(eur.rate), previousClose: eur.previous_close !== null && eur.previous_close !== undefined ? Number(eur.previous_close) : null, change: eur.change !== null && eur.change !== undefined ? Number(eur.change) : null, changePercent: eur.percent_change !== null && eur.percent_change !== undefined ? Number(eur.percent_change) : null, marketTimestamp: eur.timestamp || nowIso, fetchedAt: nowIso, dataStatus: 'LIVE', isStale: false, provider: 'twelve-data' });
           } else if (prevEur){
-            out.quotes.push(prevEur);
+            out.quotes.push({ ...prevEur });
           } else {
             out.quotes.push({ instrumentId: 'eur-sek', symbol: 'EUR/SEK', name: 'EUR/SEK', currency: 'SEK', price: null, previousClose: null, change: null, changePercent: null, marketTimestamp: null, fetchedAt: nowIso, dataStatus: 'UNAVAILABLE', isStale: true, provider: 'twelve-data' });
           }
+          // mark cached origin for observability (no-op after removing debug flag)
+          try{ if (Array.isArray(out.quotes)) out.quotes = out.quotes.map((q:any)=> ({ ...q })); }catch(e){}
+          // (instrumentation removed)
           return out;
         }
       }catch(e){ /* ignore and fallback to returning cached */ }
+      try{ if (_standardNormalizedCache && _standardNormalizedCache.v && Array.isArray(_standardNormalizedCache.v.quotes)) _standardNormalizedCache.v.quotes = _standardNormalizedCache.v.quotes.map((q:any)=> ({ ...q })); }catch(e){}
       return _standardNormalizedCache.v;
     }
     if (_standardNormalizedPending) return _standardNormalizedPending;
@@ -367,6 +371,7 @@ export async function getNormalizedQuotes(providerOverride?: MarketDataProvider,
           isStale: outIsStale,
           provider: 'twelve-data',
         });
+        // (instrumentation removed)
       }catch(e: unknown){
         const msg = ((): string => {
           if (e && typeof e === 'object' && 'message' in e && typeof (e as Record<string, unknown>).message === 'string') return String((e as Record<string, unknown>).message);
