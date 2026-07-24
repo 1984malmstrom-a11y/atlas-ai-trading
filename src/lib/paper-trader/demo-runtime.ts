@@ -878,8 +878,12 @@ async function appendEvaluation(entry: any){
         const ta = entry.meta.technicalAnalysis || {};
         const status = ta.technicalAnalysisStatus || 'unavailable';
         let technicalConfidence: number | null = null;
-        if (status === 'success' && typeof ta.technicalScore === 'number' && Number.isFinite(ta.technicalScore)){
-          technicalConfidence = Math.round(ta.technicalScore);
+        if (status === 'success' && ta && typeof ta.technicalScore !== 'undefined' && ta.technicalScore !== null){
+          const parsed = Number(ta.technicalScore);
+          if (Number.isFinite(parsed)) technicalConfidence = Math.round(parsed);
+          else technicalConfidence = null;
+        } else {
+          technicalConfidence = null;
         }
         const techSignal = ta.technicalSignal ? String(ta.technicalSignal) : null;
         const actualAction = entry && entry.decision && entry.decision.action ? String(entry.decision.action) : null;
@@ -889,11 +893,21 @@ async function appendEvaluation(entry: any){
         else if (technicalConfidence >= 75) { recommendationStrength = 'HIGH'; }
         else if (technicalConfidence >= 50) { recommendationStrength = 'MEDIUM'; }
         else { recommendationStrength = 'LOW'; }
+        // compute overallDecisionConfidence per rules: start with technicalConfidence (or 0 if unavailable),
+        // reduce by 20 if signalsConflict, clamp 0..100, round to int
+        let overallDecisionConfidence: number = 0;
+        if (status === 'success' && typeof technicalConfidence === 'number'){
+          overallDecisionConfidence = Math.round(Math.max(0, Math.min(100, technicalConfidence - (signalsConflict ? 20 : 0))));
+        } else {
+          overallDecisionConfidence = 0;
+        }
+
         entry.meta.decisionContext = {
           technicalConfidence,
           technicalStatus: status,
           signalsConflict,
           recommendationStrength,
+          overallDecisionConfidence,
         };
       }
     }catch(_){ /* ignore */ }
