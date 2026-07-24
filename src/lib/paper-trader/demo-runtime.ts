@@ -823,6 +823,33 @@ async function appendEvaluation(entry: any){
         }
       }
     }catch(_){ /* swallow summary generation errors */ }
+    // Derive a compact list of short reasons from the existing technicalAnalysis
+    try{
+      const ta = entry.meta.technicalAnalysis || {};
+      if (!Object.prototype.hasOwnProperty.call(entry.meta, 'technicalReasons')){
+        if (ta.technicalAnalysisStatus === 'success'){
+          const trend = ta.technicalTrend || null;
+          const momentum = (typeof ta.technicalMomentumPercent === 'number' && Number.isFinite(ta.technicalMomentumPercent)) ? Math.round(ta.technicalMomentumPercent) : null;
+          const volatility = (typeof ta.technicalVolatilityPercent === 'number' && Number.isFinite(ta.technicalVolatilityPercent)) ? Math.round(ta.technicalVolatilityPercent) : null;
+          const score = (typeof ta.technicalScore === 'number' && Number.isFinite(ta.technicalScore)) ? Math.round(ta.technicalScore) : null;
+          const important = Array.isArray(ta.technicalReasons) && ta.technicalReasons.length ? String(ta.technicalReasons[0]) : (ta.technicalAnalysisErrorMessage || null);
+          const rows: string[] = [];
+          // Combine trend and score on the first row
+          if (trend && typeof score === 'number') rows.push(`Trend: ${trend} • Score: ${score}`);
+          else if (trend) rows.push(`Trend: ${trend}`);
+          else if (typeof score === 'number') rows.push(`Score: ${score}`);
+          // add momentum, volatility, and important reason as subsequent rows
+          if (typeof momentum === 'number') rows.push(`Momentum: ${momentum}%`);
+          if (typeof volatility === 'number') rows.push(`Volatility: ${volatility}%`);
+          if (important) rows.push(`Reason: ${important}`);
+          // ensure max 4 rows
+          entry.meta.technicalReasons = rows.slice(0, 4);
+          if (!entry.meta.technicalReasons || !entry.meta.technicalReasons.length) entry.meta.technicalReasons = [`No technical reasons available`];
+        } else {
+          entry.meta.technicalReasons = ['Technical analysis unavailable'];
+        }
+      }
+    }catch(_){ /* ignore */ }
   }catch(_){ /* ignore normalization errors */ }
   return auditStore.append(entry);
 }

@@ -359,6 +359,44 @@ describe('paper-trader scheduler', ()=>{
     }
   });
 
+  it('populates technicalReasons array from technicalAnalysis', async ()=>{
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
+    const histSpy = vi.fn(async (sym:string) => {
+      const closes = new Array(30).fill(0).map((_,i)=> 100 + i);
+      const dates = new Array(30).fill(0).map((_,i)=> new Date(2026,5, i+1).toISOString().slice(0,10));
+      // craft technical output via analyzePriceSeries indirectly by using existing analyzer in runtime
+      return { symbol: sym, closes, dates, source: 'twelve-data' };
+    });
+    vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
+
+    (dr as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 5, averagePrice: 120, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+
+    await (dr as any).__clearAudits();
+    const fs = require('fs'); const path = require('path');
+    const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+    const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeLen = beforeAll.length;
+
+    await (dr as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 5, averagePrice: 120, currentPrice: 100 }] } } });
+
+    const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const appended = all.slice(beforeLen);
+    const msEval = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
+    expect(msEval).toBeDefined();
+    const tr = msEval.raw.meta && msEval.raw.meta.technicalReasons;
+    expect(Array.isArray(tr)).toBeTruthy();
+    // should have between 1 and 4 short strings
+    expect(tr.length).toBeGreaterThanOrEqual(1);
+    expect(tr.length).toBeLessThanOrEqual(4);
+    expect(typeof tr[0] === 'string').toBeTruthy();
+    // if score present it should be combined with trend in first row format
+    const first = tr[0];
+    if (first && first.includes('Trend:') && first.includes('Score:')){
+      expect(first).toMatch(/Trend:\s*\w+/);
+      expect(first).toMatch(/Score:\s*\d+/);
+    }
+  });
+
   it('technical BUY is observe-only (audit signals BUY, action remains HOLD, no BUY execution)', async ()=>{
     vi.useRealTimers();
     // Use a rising closes series so the real analyzer returns BUY
