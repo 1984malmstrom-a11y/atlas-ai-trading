@@ -705,7 +705,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       // Determine buy signal: only buy on dip vs last evaluation for this symbol (prevents random buys)
       // Find last evaluation audit for symbol
       const allAudits = await auditStore.list();
-      const lastEval = allAudits.find((a:any)=> a && a.summary && a.summary.decisionId && String(a.summary.decisionId).includes(s.toLowerCase())) || null;
+      const lastEval = allAudits.find((a:any)=> a && a.summary && a.summary.decisionId && String(a.summary.decisionId).toLowerCase().includes(String(s).toLowerCase())) || null;
       let buySignal = false; let signalReason = 'No prior evaluation';
       if (lastEval && lastEval.raw && lastEval.raw.decision && typeof lastEval.raw.decision.referencePrice === 'number'){
         const lastRef = Number(lastEval.raw.decision.referencePrice);
@@ -769,6 +769,16 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       evaluatedSymbols.add(sSym);
       evaluationCount++;
     }
+
+    // Append an EVALUATION audit that represents the strategy decision (observe-only)
+    try{
+      try{
+        const techMetaForCand = await fetchAndAnalyze(sSym);
+        await appendEvaluation({ kind: 'EVALUATION', decision: cand, reason: { action: cand.action, reason: 'Strategy decision' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(sSym, techMetaForCand) } as any);
+      }catch(e:any){
+        await appendEvaluation({ kind: 'EVALUATION', decision: cand, reason: { action: cand.action, reason: 'Strategy decision' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(sSym, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) }) } as any);
+      }
+    }catch(_){ }
 
     // decide whether to attempt execution based on per-cycle limits
     const side = (cand.action || '').toUpperCase();
@@ -970,6 +980,19 @@ async function appendEvaluation(entry: any){
         entry.meta.evaluationSource = { technicalUsed, fundamentalUsed, aggregatorUsed, agreement, conflictingSignals };
       }
     }catch(_){ /* ignore */ }
+
+    // Compute decisionComparison here (in evaluation flow) so storage layer remains passive.
+    try{
+      if (!Object.prototype.hasOwnProperty.call(entry.meta, 'decisionComparison')){
+        const dec = entry && entry.decision ? entry.decision : null;
+        const strategyAction = dec && dec.action ? String(dec.action).toUpperCase() : 'HOLD';
+        const aggSignal = entry.meta.combinedAnalysis && typeof entry.meta.combinedAnalysis.overallSignal === 'string' ? String(entry.meta.combinedAnalysis.overallSignal).toUpperCase() : 'HOLD';
+        const aggregatorSignal = aggSignal || 'HOLD';
+        const matches = strategyAction === aggregatorSignal;
+        // Do NOT modify entry.decision.action
+        entry.meta.decisionComparison = { strategyAction, aggregatorSignal, matches };
+      }
+    }catch(_){ }
 
   }catch(_){ /* ignore normalization errors */ }
   return auditStore.append(entry);
