@@ -850,6 +850,28 @@ async function appendEvaluation(entry: any){
         }
       }
     }catch(_){ /* ignore */ }
+    // Derive a short decision explanation based on available decision and technicalAnalysis
+    try{
+      // do not overwrite if present
+      if (!Object.prototype.hasOwnProperty.call(entry.meta, 'decisionExplanation')){
+        const decision = entry && entry.decision ? entry.decision : null;
+        const actualAction = decision && decision.action ? String(decision.action) : null;
+        const ta = entry.meta.technicalAnalysis || {};
+        if (!ta || ta.technicalAnalysisStatus !== 'success'){
+          entry.meta.decisionExplanation = 'Victor avvaktar eftersom teknisk analys saknas.';
+        } else {
+          const techSignal = ta.technicalSignal ? String(ta.technicalSignal) : null;
+          // If technical signal differs from actual action, mention it
+          if (techSignal && actualAction && techSignal.toUpperCase() !== actualAction.toUpperCase()){
+            entry.meta.decisionExplanation = `Victor avvaktar. Den tekniska signalen är ${techSignal}, men strategins övriga villkor gav ${actualAction}.`;
+          } else if (actualAction) {
+            entry.meta.decisionExplanation = `Victor agerar: ${actualAction}.`;
+          } else {
+            entry.meta.decisionExplanation = `Victor avvaktar.`;
+          }
+        }
+      }
+    }catch(_){ /* ignore explanation errors */ }
   }catch(_){ /* ignore normalization errors */ }
   return auditStore.append(entry);
 }

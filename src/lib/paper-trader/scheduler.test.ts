@@ -426,6 +426,17 @@ describe('paper-trader scheduler', ()=>{
     expect(msEval.raw.meta.technicalAnalysis.technicalAnalysisMode).toBe('observe-only');
     // decision action must remain HOLD
     expect(msEval.raw.decision.action).toBe('HOLD');
+    // decisionExplanation should explain actual HOLD and mention technical BUY
+    expect(msEval.raw.meta.decisionExplanation).toBeDefined();
+    const de = msEval.raw.meta.decisionExplanation as string;
+    expect(typeof de === 'string' && de.length > 0).toBeTruthy();
+    expect(/teknisk/i.test(de) || /tekniska/i.test(de) || /Victor agerar/i.test(de)).toBeTruthy();
+    // when technical signal differs from actual action, explanation should mention both
+    if (msEval.raw.meta.technicalAnalysis && msEval.raw.meta.technicalAnalysis.technicalSignal){
+      const sig = String(msEval.raw.meta.technicalAnalysis.technicalSignal);
+      expect(de.toUpperCase()).toContain('HOLD');
+      expect(de.toUpperCase()).toContain(sig.toUpperCase());
+    }
     // ensure no BUY EXECUTION occurred for MSFT
     const buyExec = appended.find((a:any)=> a && a.summary && a.summary.symbol==='MSFT' && a.summary.action==='BUY' && a.summary.executionStatus==='EXECUTED');
     expect(buyExec).toBeUndefined();
