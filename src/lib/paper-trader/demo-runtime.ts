@@ -872,6 +872,31 @@ async function appendEvaluation(entry: any){
         }
       }
     }catch(_){ /* ignore explanation errors */ }
+    // Derive decisionContext metadata for evaluations
+    try{
+      if (!Object.prototype.hasOwnProperty.call(entry.meta, 'decisionContext')){
+        const ta = entry.meta.technicalAnalysis || {};
+        const status = ta.technicalAnalysisStatus || 'unavailable';
+        let technicalConfidence: number | null = null;
+        if (status === 'success' && typeof ta.technicalScore === 'number' && Number.isFinite(ta.technicalScore)){
+          technicalConfidence = Math.round(ta.technicalScore);
+        }
+        const techSignal = ta.technicalSignal ? String(ta.technicalSignal) : null;
+        const actualAction = entry && entry.decision && entry.decision.action ? String(entry.decision.action) : null;
+        const signalsConflict = techSignal && actualAction ? (techSignal.toUpperCase() !== actualAction.toUpperCase()) : false;
+        let recommendationStrength: 'LOW'|'MEDIUM'|'HIGH' = 'LOW';
+        if (technicalConfidence === null){ recommendationStrength = 'LOW'; }
+        else if (technicalConfidence >= 75) { recommendationStrength = 'HIGH'; }
+        else if (technicalConfidence >= 50) { recommendationStrength = 'MEDIUM'; }
+        else { recommendationStrength = 'LOW'; }
+        entry.meta.decisionContext = {
+          technicalConfidence,
+          technicalStatus: status,
+          signalsConflict,
+          recommendationStrength,
+        };
+      }
+    }catch(_){ /* ignore */ }
   }catch(_){ /* ignore normalization errors */ }
   return auditStore.append(entry);
 }

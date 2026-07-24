@@ -426,6 +426,22 @@ describe('paper-trader scheduler', ()=>{
     expect(msEval.raw.meta.technicalAnalysis.technicalAnalysisMode).toBe('observe-only');
     // decision action must remain HOLD
     expect(msEval.raw.decision.action).toBe('HOLD');
+    // decisionContext: technical BUY but actual HOLD
+    const dc = msEval.raw.meta.decisionContext;
+    expect(dc).toBeDefined();
+    expect(dc.technicalStatus).toBe(msEval.raw.meta.technicalAnalysis.technicalAnalysisStatus);
+    // technicalConfidence should equal rounded technicalScore when available
+    if (msEval.raw.meta.technicalAnalysis.technicalAnalysisStatus === 'success'){
+      expect(typeof dc.technicalConfidence).toBe('number');
+      expect(dc.technicalConfidence).toBe(Math.round(msEval.raw.meta.technicalAnalysis.technicalScore));
+      expect(dc.signalsConflict).toBeTruthy();
+      const conf = dc.technicalConfidence as number;
+      const expectedStrength = conf >= 75 ? 'HIGH' : (conf >= 50 ? 'MEDIUM' : 'LOW');
+      expect(dc.recommendationStrength).toBe(expectedStrength);
+    } else {
+      expect(dc.technicalConfidence).toBeNull();
+      expect(dc.recommendationStrength).toBe('LOW');
+    }
     // decisionExplanation should explain actual HOLD and mention technical BUY
     expect(msEval.raw.meta.decisionExplanation).toBeDefined();
     const de = msEval.raw.meta.decisionExplanation as string;
@@ -613,5 +629,68 @@ describe('paper-trader scheduler', ()=>{
     const callsBySym = histSpy.mock.calls.map(c=>String(c[0]));
     expect(callsBySym.filter(x=> x==='MSFT').length).toBeLessThanOrEqual(1);
     expect(callsBySym.filter(x=> x==='NVDA').length).toBeLessThanOrEqual(1);
+  });
+
+  // Strength threshold tests: ensure recommendationStrength mapping is correct
+  const runStrengthTest = async (score:any, expectedStrength:string) => {
+    vi.useRealTimers();
+    // Mock quotes and twelve-data
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
+    const histSpy = vi.fn(async (sym:string) => {
+      const closes = new Array(30).fill(0).map((_,i)=> 100 + i);
+      const dates = new Array(30).fill(0).map((_,i)=> new Date(2026,5, i+1).toISOString().slice(0,10));
+      return { symbol: sym, closes, dates, source: 'twelve-data' };
+    });
+    vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
+
+    // Spy on analyzer and force desired score
+    const tech = await import('../paper-trader/technical');
+    const analyzeSpy = vi.spyOn(tech, 'default').mockImplementation((closes:any)=> ({ trend: 'bullish', momentumPercent: 10, volatilityPercent: 5, technicalScore: score, signal: 'BUY', reasons: ['momentum'] }));
+
+    // setup portfolio and run
+    const drLocal = await import('./demo-runtime');
+    (drLocal as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+
+    await (drLocal as any).__clearAudits();
+    const fs = require('fs'); const path = require('path');
+    const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+    const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeLen = beforeAll.length;
+
+    await (drLocal as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+
+    const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const appended = all.slice(beforeLen);
+    const msEval = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
+    expect(msEval).toBeDefined();
+    const dc = msEval.raw.meta.decisionContext;
+    expect(dc).toBeDefined();
+    expect(dc.recommendationStrength).toBe(expectedStrength);
+    analyzeSpy.mockRestore();
+  };
+
+  it('strength mapping: score 72 => MEDIUM', async ()=>{ await runStrengthTest(72, 'MEDIUM'); });
+  it('strength mapping: score 75 => HIGH', async ()=>{ await runStrengthTest(75, 'HIGH'); });
+  it('strength mapping: score 49 => LOW', async ()=>{ await runStrengthTest(49, 'LOW'); });
+  it('strength mapping: unavailable => LOW', async ()=>{
+    // simulate provider failure to get unavailable
+    vi.useRealTimers();
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
+    vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ const err:any = new Error('Provider failed'); err.code = 'PROVIDER_ERROR'; throw err; } } }));
+    const drLocal = await import('./demo-runtime');
+    (drLocal as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    await (drLocal as any).__clearAudits();
+    const fs = require('fs'); const path = require('path');
+    const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+    const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const beforeLen = beforeAll.length;
+    await (drLocal as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
+    const appended = all.slice(beforeLen);
+    const msEval = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
+    expect(msEval).toBeDefined();
+    const dc = msEval.raw.meta.decisionContext;
+    expect(dc).toBeDefined();
+    expect(dc.recommendationStrength).toBe('LOW');
   });
 });
