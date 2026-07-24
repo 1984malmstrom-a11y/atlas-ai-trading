@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import LeftSidebar from '../../components/dashboard-v1/LeftSidebar';
 import { getMockMarketData } from "../../lib/mock-market-monitor";
+import { computeUSMarketStatus } from "../../lib/us-market";
 import CompanyLogo from "../../components/CompanyLogo";
 // polling provided by MarketPollingClient mounted in root layout
 
@@ -85,6 +86,8 @@ export default function MarketMonitorPage() {
     const h = Math.floor(mins/60); const m = mins%60; return `${h} h ${m} min`;
   }
 
+  // Use shared helper `computeUSMarketStatus` from src/lib/us-market.ts
+
   useEffect(()=>{
     // subscribe to shared market polling events
     let mounted = true;
@@ -126,15 +129,17 @@ export default function MarketMonitorPage() {
             return out;
           });
           setUsingProvider(true);
-          setLastFetchedAt(detail.fetchedAt || new Date().toISOString());
+          setLastFetchedAt(d.fetchedAt || new Date().toISOString());
           // seed forex history from snapshot
           try{
-            for(const s of detail.quotes){ if (s && s.symbol && (s.symbol==='USD/SEK' || s.symbol==='EUR/SEK')){
-              const hist = forexHistoryRef.current[s.symbol] || [];
-              const p = typeof s.price==='number' ? s.price : (s.price ? Number(s.price) : null);
-              if (p !== null && hist.length===0) hist.push(p);
-              forexHistoryRef.current[s.symbol]=hist.slice(-20);
-            }}
+            for(const s of d.quotes){
+              if (s && s.symbol && (s.symbol==='USD/SEK' || s.symbol==='EUR/SEK')){
+                const hist = forexHistoryRef.current[s.symbol] || [];
+                const p = typeof s.price==='number' ? s.price : (s.price ? Number(s.price) : null);
+                if (p !== null && hist.length===0) hist.push(p);
+                forexHistoryRef.current[s.symbol]=hist.slice(-20);
+              }
+            }
           }catch(e){}
         })(detail);
       }
@@ -297,7 +302,7 @@ export default function MarketMonitorPage() {
     try{
       const d = new Date(ts);
       if (!isFinite(d.getTime())) return '—';
-      return d.toLocaleTimeString('sv-SE');
+      return d.toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     }catch(e){ return '—'; }
   }
 
@@ -311,21 +316,7 @@ export default function MarketMonitorPage() {
           <div style={{ display:'flex', gap:24, alignItems:'center', marginBottom:8 }}>
             <div>
               <div className="text-xs text-gray-500">USA</div>
-              <div className="text-sm font-semibold">
-                {(() => {
-                  const parts = getETParts(); if(!parts) return '—';
-                  const day = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short' });
-                  const nowH = parts.hour*60 + parts.minute;
-                  const openM = 9*60 + 30; const closeM = 16*60;
-                  const isWeekend = ['Sat','Sun'].includes(day);
-                  if (isWeekend) {
-                    return 'Öppnar på måndag 09:30';
-                  }
-                  if (nowH < openM){ const mins = openM - nowH; return 'Öppnar om ' + formatHoursMinutesFromMinutes(mins); }
-                  if (nowH >= openM && nowH < closeM){ const mins = closeM - nowH; return 'Stänger om ' + formatHoursMinutesFromMinutes(mins); }
-                  return 'Öppnar på måndag 09:30';
-                })()}
-              </div>
+              <div className="text-sm font-semibold">{computeUSMarketStatus()}</div>
             </div>
             <div>
               <div className="text-xs text-gray-500">FOREX</div>
@@ -339,7 +330,7 @@ export default function MarketMonitorPage() {
             <div style={{ display:'inline-flex', alignItems:'center', gap:8 }}>
               <div style={{ width:10, height:10, borderRadius:9999, background: usingMock ? '#0EA5E9' : (usingProvider ? '#10B981' : '#9CA3AF') }} />
               <div style={{ fontSize:12, fontWeight:600 }}>{usingMock ? 'Mock' : (usingProvider ? 'Live' : 'Senast')}</div>
-              <div style={{ color:'#6B7280' }}>{lastFetchedAt ? new Date(lastFetchedAt).toLocaleTimeString() : '—'}</div>
+              <div style={{ color:'#6B7280' }}>{lastFetchedAt ? new Date(lastFetchedAt).toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour12:false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—'}</div>
             </div>
           </div>
         </div>
@@ -359,7 +350,7 @@ export default function MarketMonitorPage() {
             </div>
             <div className="bg-white rounded-md p-2.5 flex flex-col gap-0.5 border border-gray-100 h-16 flex justify-center">
               <div className="text-xs text-gray-500">Senaste uppdatering</div>
-              <div className="text-sm font-semibold">{lastFetchedAt ? new Date(lastFetchedAt).toLocaleTimeString() : '—'}</div>
+              <div className="text-sm font-semibold">{lastFetchedAt ? new Date(lastFetchedAt).toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour12:false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—'}</div>
             </div>
             <div className="bg-white rounded-md p-2.5 flex flex-col gap-0.5 border border-gray-100 h-16 flex justify-center">
               <div className="text-xs text-gray-500">Nästa uppdatering</div>
@@ -373,7 +364,7 @@ export default function MarketMonitorPage() {
             <div className="text-xs text-gray-500 mt-1">
               {hasRealQuote ? `${quotes.filter(q=>q.dataStatus==='LIVE' || (usingProvider && q.price!==null)).length} instrument analyseras inför nästa uppdatering.` : 'Väntar på tillgänglig marknadsdata.'}
             </div>
-            <div className="text-xs text-gray-400 mt-2">Senaste AI-analys: {lastFetchedAt ? new Date(lastFetchedAt).toLocaleTimeString() : '—'}</div>
+            <div className="text-xs text-gray-400 mt-2">Senaste AI-analys: —</div>
           </div>
         </div>
 
