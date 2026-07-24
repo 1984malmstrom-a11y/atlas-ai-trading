@@ -45,7 +45,31 @@ export function combineAnalyses(input: { technical?: EngineResult | null, fundam
     pushReasons(fund);
   }
 
-  return { overallScore, overallSignal, confidence, reasons };
+  // Agreement / conflict analysis
+  const enginesUsed = (tech ? 1 : 0) + (fund ? 1 : 0);
+  let agreement: 'HIGH'|'MEDIUM'|'LOW' = 'HIGH';
+  let conflictingSignals = false;
+  if (enginesUsed <= 1){
+    agreement = 'HIGH';
+    conflictingSignals = false;
+  } else {
+    const sigA = (tech && typeof tech.signal === 'string') ? tech.signal.toUpperCase() : (tech && typeof tech.score === 'number' ? (overallScore >= 75 ? 'BUY' : overallScore >= 50 ? 'HOLD' : 'SELL') : null);
+    const sigB = (fund && typeof fund.signal === 'string') ? fund.signal.toUpperCase() : (fund && typeof fund.score === 'number' ? (overallScore >= 75 ? 'BUY' : overallScore >= 50 ? 'HOLD' : 'SELL') : null);
+    if (sigA && sigB){
+      if (sigA === sigB){ agreement = 'HIGH'; conflictingSignals = false; }
+      else if ((sigA === 'BUY' && sigB === 'HOLD') || (sigA === 'HOLD' && sigB === 'BUY') || (sigA === 'HOLD' && sigB === 'SELL') || (sigA === 'SELL' && sigB === 'HOLD')){
+        agreement = 'MEDIUM'; conflictingSignals = true;
+      } else {
+        // BUY vs SELL and all other mismatches fall back to LOW
+        agreement = 'LOW'; conflictingSignals = true;
+      }
+    } else {
+      // if signals missing, treat as HIGH (no conflict)
+      agreement = 'HIGH'; conflictingSignals = false;
+    }
+  }
+
+  return { overallScore, overallSignal, confidence, reasons, agreement, conflictingSignals };
 }
 
 export default combineAnalyses;
