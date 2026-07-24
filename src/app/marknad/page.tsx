@@ -49,7 +49,11 @@ function Badge({ children, className = "" }: { children: React.ReactNode; classN
 
 export default function MarketMonitorPage() {
   const mockInitial = useMemo(() => getMockMarketData(), []);
-  const [quotes, setQuotes] = useState<UIQuote[]>(() => TARGET_SYMBOLS.map(sym => ({ symbol: sym, name: null, price: null, prevPrice: null, volume: 0, updatedAt: null, dataStatus: 'MOCK' })));
+  // Do not mark initial rows as MOCK; treat them as empty until we know
+  // whether live or mock data is actually used. We'll display a LADDAR
+  // label during the initial fetch.
+  const [quotes, setQuotes] = useState<UIQuote[]>(() => TARGET_SYMBOLS.map(sym => ({ symbol: sym, name: null, price: null, prevPrice: null, volume: 0, updatedAt: null, dataStatus: null })));
+  const [initialFetchInProgress, setInitialFetchInProgress] = useState(true);
   const [hasLive, setHasLive] = useState(false);
   const POLL_MS = 30 * 1000; // used for display only (30s)
   const POLL_SECONDS = Math.floor(POLL_MS / 1000);
@@ -130,6 +134,8 @@ export default function MarketMonitorPage() {
           });
           setUsingProvider(true);
           setLastFetchedAt(d.fetchedAt || new Date().toISOString());
+          // we already have a snapshot so initial fetch is considered done
+          setInitialFetchInProgress(false);
           // seed forex history from snapshot
           try{
             for(const s of d.quotes){
@@ -149,6 +155,10 @@ export default function MarketMonitorPage() {
       if (!mounted) return;
       const d = e.detail || {};
       const fetched: any[] = Array.isArray(d.quotes) ? d.quotes : [];
+      // If we receive a successful provider snapshot (live or mock), stop initial loading
+      if (!d.error && (Boolean(d.usingProvider) || Boolean(d.isMock) || fetched.length > 0)){
+        setInitialFetchInProgress(false);
+      }
       if (!fetched.length && d.error){
         // If we don't have live data yet, show mock/fallback; otherwise ignore transient provider errors
         if (!hasLive){
@@ -240,8 +250,10 @@ export default function MarketMonitorPage() {
         // Dispatch same event shape as the shared poller would
         window.dispatchEvent(new CustomEvent('atlas:market-quotes', { detail }));
       }catch(e){
-        // fallback to mock only in dev
-        const detail:any = { quotes: [], fetchedAt: new Date().toISOString(), usingProvider: false, isMock: process.env.NODE_ENV !== 'production', source: 'mock' };
+        // On fetch error: do not clear existing quotes. Dispatch an error flag so
+        // listeners can decide whether to fallback. This avoids wiping UI data
+        // before a successful response arrives.
+        const detail:any = { error: true, fetchedAt: new Date().toISOString(), usingProvider: false, source: 'network-error' };
         window.dispatchEvent(new CustomEvent('atlas:market-quotes', { detail }));
       }finally{
         fetchInProgressRef.current = false;
@@ -275,6 +287,9 @@ export default function MarketMonitorPage() {
     window.addEventListener('atlas:market-quotes', onQuotes as EventListener);
     window.addEventListener('atlas:market-quotes-tick', onTick as EventListener);
     window.addEventListener('atlas:market-quotes-tick', _tempTickListener as EventListener);
+    // Run one immediate refresh on mount using the same refresh function.
+    // fetchInProgressRef prevents concurrent double-calls if another poller runs.
+    void fetchAndUpdate();
     // start internal timer only if no external tick observed shortly after mount
     setTimeout(() => {
       window.removeEventListener('atlas:market-quotes-tick', _tempTickListener as EventListener);
@@ -389,6 +404,13 @@ export default function MarketMonitorPage() {
                 }
               }
             }catch(e){}
+
+            // During the very first successful fetch we want to show a loading
+            // label instead of pre-populated MOCK. If the row actually uses
+            // mock data later, it will get `MOCK` as its `dataStatus`.
+            if (initialFetchInProgress && !q.dataStatus){
+              displayStatus = 'LADDAR';
+            }
 
             return (
               <div key={q.symbol} className="bg-white rounded-md py-3 px-3 border border-transparent hover:border-blue-50 transition-colors duration-150">
