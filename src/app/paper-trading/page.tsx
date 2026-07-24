@@ -9,17 +9,46 @@ export default function Page(){
   const [state, setState] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [selectedAudit, setSelectedAudit] = useState<any>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const runInFlightRef = React.useRef(false);
 
-  async function fetchState(){
+  const bgInFlightRef = React.useRef(false);
+  async function fetchState(silent = false){
     try{
+      if (!silent) setLoading(true);
       const res = await fetch('/api/paper-trader');
-      if (!res.ok) return;
+      if (!res.ok){ if (!silent) setLoading(false); return; }
       const j = await res.json();
       setState(j);
-    }catch(e){ console.error(e); }
+    }catch(e){ console.error(e); }finally{ if (!silent) setLoading(false); }
   }
 
   useEffect(()=>{ fetchState(); }, []);
+
+  // Background polling: fetch state every 30s when page is visible. No overlapping requests.
+  useEffect(()=>{
+    const POLL_MS = 30_000;
+    let interval: any = null;
+
+    const tryFetch = async () => {
+      try{
+        if (document.visibilityState !== 'visible') return;
+        if (bgInFlightRef.current) return;
+        bgInFlightRef.current = true;
+        await fetchState(true);
+      }catch(e){}
+      finally{ bgInFlightRef.current = false; }
+    };
+
+    // immediate fetch when becoming visible
+    const onVisibility = () => { if (document.visibilityState === 'visible') void tryFetch(); };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    // start interval when mounted
+    interval = setInterval(()=>{ void tryFetch(); }, POLL_MS);
+
+    return ()=>{ document.removeEventListener('visibilitychange', onVisibility); if (interval) clearInterval(interval); };
+  }, []);
 
   // Close panel on Escape and lock background scroll while open
   useEffect(()=>{
@@ -30,13 +59,26 @@ export default function Page(){
   }, [selectedAudit]);
 
   async function runCycle(){
-    if (loading) return;
+    if (loading || runInFlightRef.current) return;
+    runInFlightRef.current = true;
+    setRunError(null);
     setLoading(true);
     try{
-      await fetch('/api/paper-trader', { method: 'POST', headers: { 'content-type':'application/json' }, body: JSON.stringify({ action: 'RUN_CYCLE' }) });
+      const res = await fetch('/api/paper-trader', { method: 'POST', headers: { 'content-type':'application/json' }, body: JSON.stringify({ action: 'RUN_CYCLE' }) });
+      if (!res.ok){
+        // keep existing state, show discreet error
+        setRunError('Körningen misslyckades. Försök igen.');
+        return;
+      }
+      // refresh state from server
       await fetchState();
-    }catch(e){ console.error(e); }
-    setLoading(false);
+    }catch(e){
+      console.error(e);
+      setRunError('Nätverksfel vid körning. Försök igen.');
+    }finally{
+      runInFlightRef.current = false;
+      setLoading(false);
+    }
   }
 
   async function toggleEnabled(){
@@ -60,97 +102,167 @@ export default function Page(){
     const n = Number(cand);
     return Number.isFinite(n) ? n : 0;
   })();
+    // Simple, resilient track record builder: prefer explicit stored points if present
+    function buildTrackRecord(){
+      try{
+        // Try to use any explicit track data on state
+        if (state && state.track && Array.isArray(state.track.points)){
+          const t = state.track;
+          return {
+            points: t.points || [],
+            best: t.best ?? null,
+            worst: t.worst ?? null,
+            longestWin: t.longestWin ?? 0,
+            longestLoss: t.longestLoss ?? 0,
+            avgWin: t.avgWin ?? null,
+            avgLoss: t.avgLoss ?? null,
+          };
+        }
+        // Fallback: derive nothing (empty chart, no stats)
+        return { points: [], best: null, worst: null, longestWin: 0, longestLoss: 0, avgWin: null, avgLoss: null };
+      }catch(e){ return { points: [], best: null, worst: null, longestWin: 0, longestLoss: 0, avgWin: null, avgLoss: null }; }
+    }
+    const track = buildTrackRecord();
 
-  const safeStart = Number.isFinite(Number(startCapital)) ? Number(startCapital) : 0;
-  const totalReturnSekCalc = Number.isFinite(portfolioValueNum) && Number.isFinite(safeStart) ? (portfolioValueNum - safeStart) : 0;
-  const totalReturnPercentCalc = safeStart > 0 && Number.isFinite(totalReturnSekCalc) ? (totalReturnSekCalc / safeStart) * 100 : 0;
+  const normalizedAudit = normalizeAuditEntries(auditEntries || []);
 
-  const portfolioValueFormatted = Number.isFinite(portfolioValueNum) ? portfolioValueNum.toLocaleString() + ' kr' : '—';
-  const totalReturnSekFormatted = Number.isFinite(totalReturnSekCalc) ? (totalReturnSekCalc > 0 ? '+' : totalReturnSekCalc < 0 ? '' : '') + Math.round(totalReturnSekCalc).toLocaleString() + ' kr' : '—';
-  const totalReturnPercentFormatted = Number.isFinite(totalReturnPercentCalc) ? (totalReturnPercentCalc > 0 ? '+' : totalReturnPercentCalc < 0 ? '' : '') + totalReturnPercentCalc.toFixed(2) + '%' : '—';
+  // Time formatter for Swedish locale (Stockholm)
+  function formatDateTimeLocal(ts:any, withSeconds = false){
+    try{
+      const d = (typeof ts === 'number') ? new Date(ts) : new Date(ts);
+      const opts: any = { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
+      if (withSeconds) opts.second = '2-digit';
+      return new Intl.DateTimeFormat('sv-SE', { ...opts, timeZone: 'Europe/Stockholm' }).format(d);
+    }catch(e){ return String(ts); }
+  }
 
-  const resultPositive = (totalReturnSek || 0) > 0;
+  // Determine if an audit entry represents a decision-worthy event
+  function isDecisionEvent(e:any){
+    if (!e) return false;
+    if (e.kind === 'EXECUTION') return true;
+    const action = (e.decision && e.decision.action) || (e.request && e.request.side) || (e.proposal && e.proposal.action) || null;
+    if (action && typeof action === 'string'){ const up = action.toUpperCase(); if (['BUY','SELL','HOLD'].includes(up)) return true; }
+    if (e.kind === 'REJECT') return true;
+    return false;
+  }
+
+  // Find the chronologically latest decision-like event
+  function findLatestDecision(entries:any[]){
+    if (!Array.isArray(entries) || entries.length===0) return null;
+    const mapped = entries.map((e:any)=> ({ e, ts: e && e.timestamp ? (typeof e.timestamp==='number'? e.timestamp : Date.parse(e.timestamp)) : Date.now() }));
+    mapped.sort((a:any,b:any)=> b.ts - a.ts);
+    for (const m of mapped){ if (isDecisionEvent(m.e)) return m.e; }
+    return null;
+  }
+
+  const latestDecisionEvent = findLatestDecision(normalizedAudit || []);
+
+  // Small display helpers
+  const portfolioValueFormatted = formatCurrency(portfolioValueNum);
+  const totalReturnSekCalc = Number(totalReturnSek) || 0;
+  const totalReturnSekFormatted = formatCurrency(totalReturnSekCalc);
 
   function kindBadge(action:any){
-    if (!action) return <span className="px-2 py-1 text-xs rounded bg-gray-100">—</span>;
-    const map:any = { 'BUY': ['KÖP','bg-green-50 text-green-700'], 'SELL': ['SÄLJ','bg-red-50 text-red-700'], 'HOLD': ['BEHÅLL','bg-amber-50 text-amber-700'] };
-    const v = map[action] || [action, 'bg-gray-50 text-gray-700'];
-    return <span className={`inline-block px-3 py-1 text-sm font-semibold rounded-full ${v[1]}`}>{v[0]}</span>;
+    if (!action) return (<span className="inline-flex items-center px-2 py-1 rounded text-xs bg-gray-100">—</span>);
+    const a = String(action).toUpperCase();
+    const cls = a === 'BUY' ? 'bg-green-100 text-green-700' : a === 'SELL' ? 'bg-rose-100 text-rose-700' : 'bg-gray-100 text-gray-700';
+    return (<span className={`inline-flex items-center px-2 py-1 rounded text-xs font-semibold ${cls}`}>{a}</span>);
   }
 
-  function KPIIcon({name}:{name:string}){
-    const cls = 'w-4 h-4 text-gray-400 flex-shrink-0';
-    switch(name){
-      case 'trades':
-        return (<svg className={cls} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 12h13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M14 5l5 7-5 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>);
-      case 'percent':
-        return (<svg className={cls} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M19 5L5 19" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><circle cx="6.5" cy="6.5" r="1.5" stroke="currentColor" strokeWidth="1.5"/><circle cx="17.5" cy="17.5" r="1.5" stroke="currentColor" strokeWidth="1.5"/></svg>);
-      case 'capital':
-        return (<svg className={cls} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="7" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="1.5"/><path d="M16 7V5a2 2 0 0 0-2-2H10a2 2 0 0 0-2 2v2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>);
-      case 'avg':
-        return (<svg className={cls} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 3v18h18" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M7 13l4-4 4 8 4-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>);
-      case 'largest':
-        return (<svg className={cls} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2l2.6 6.6L21 9l-5 3.6L17.2 21 12 17.8 6.8 21 8 12.6 3 9l6.4-0.4L12 2z" stroke="currentColor" strokeWidth="0.8" strokeLinejoin="round" fill="currentColor"/></svg>);
-      case 'recent':
-      default:
-        return (<svg className={cls} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.5"/><path d="M12 7v6l4 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>);
-    }
-  }
-
-  // --- Track record helpers (local, small & safe) -----------------------
-  function safeNumber(v:any){ return Number.isFinite(Number(v)) ? Number(v) : null; }
-
-  function buildTrackRecord(){
+  function formatPrice(value:any, currency?:string){
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '—';
     try{
-      const chronological = Array.isArray(auditEntries) ? auditEntries.slice().reverse() : [];
-      const points: { t: string; value: number }[] = [];
-      if (Number.isFinite(Number(startCapital))) points.push({ t: 'start', value: Number(startCapital) });
-
-      for (const a of chronological){
-        const v = a && a.portfolioAfter && safeNumber(a.portfolioAfter.totalValue);
-        const ts = a && a.timestamp ? a.timestamp : (a && a.decision && a.decision.generatedAt) || new Date().toISOString();
-        if (v !== null && v !== undefined) points.push({ t: ts, value: v });
+      if (currency && typeof currency === 'string'){
+        return new Intl.NumberFormat('sv-SE', { style: 'currency', currency: currency }).format(n);
       }
-
-      const cur = safeNumber(totalValue);
-      if (cur !== null){ const last = points.length>0 ? points[points.length-1] : null; if (!last || last.value !== cur) points.push({ t: 'now', value: cur }); }
-      if (points.length === 0 && Number.isFinite(Number(startCapital))) points.push({ t: 'start', value: Number(startCapital) });
-
-      const execs = (Array.isArray(auditEntries) ? auditEntries : []).filter((x:any)=> x.kind === 'EXECUTION').slice().reverse();
-      const trades: { symbol?:string; pnl:number; pct?:number }[] = [];
-      for (const e of execs){
-        const before = e.portfolioBefore && safeNumber(e.portfolioBefore.totalValue);
-        const after = e.portfolioAfter && safeNumber(e.portfolioAfter.totalValue);
-        if (before !== null && after !== null){
-          const pnl = Number((after - before));
-          const pct = (before && before !== 0) ? (pnl / before * 100) : undefined;
-          trades.push({ symbol: e.execution?.symbol || e.decision?.symbol, pnl, pct });
-        }
-      }
-
-      let best:any = null; let worst:any = null;
-      for (const t of trades){ if (t && typeof t.pnl === 'number'){ if (!best || t.pnl > best.pnl) best = t; if (!worst || t.pnl < worst.pnl) worst = t; } }
-
-      let winStreak = 0, lossStreak = 0, maxWin = 0, maxLoss = 0;
-      for (const t of trades){ if (t.pnl > 0){ winStreak++; maxWin = Math.max(maxWin, winStreak); lossStreak = 0; } else if (t.pnl < 0){ lossStreak++; maxLoss = Math.max(maxLoss, lossStreak); winStreak = 0; } else { winStreak = 0; lossStreak = 0; } }
-
-      const wins = trades.filter((t)=> t.pnl>0).map((t)=> t.pnl||0);
-      const losses = trades.filter((t)=> t.pnl<0).map((t)=> Math.abs(t.pnl||0));
-      const avgWin = wins.length ? (wins.reduce((s:any,v:any)=> s+v,0)/wins.length) : null;
-      const avgLoss = losses.length ? (losses.reduce((s:any,v:any)=> s+v,0)/losses.length) : null;
-
-      return {
-        points,
-        best: best || null,
-        worst: worst || null,
-        longestWin: maxWin || 0,
-        longestLoss: maxLoss || 0,
-        avgWin: avgWin !== null ? Math.round(avgWin*100)/100 : null,
-        avgLoss: avgLoss !== null ? Math.round(avgLoss*100)/100 : null,
-      };
-    }catch(e){ return { points: [], best:null, worst:null, longestWin:0, longestLoss:0, avgWin:null, avgLoss:null }; }
+    }catch(e){ /* fallthrough */ }
+    return n.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
-  const track = buildTrackRecord();
+
+  // --- Formatting helpers ------------------------------------------------
+  function formatCurrency(v:any){
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '—';
+    return n.toLocaleString('sv-SE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' kr';
+  }
+  function formatCurrencyCompact(v:any){
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '—';
+    return n.toLocaleString('sv-SE', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' kr';
+  }
+  function formatQty(v:any){
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '—';
+    if (Math.abs(n - Math.round(n)) < 1e-9) return Math.round(n).toLocaleString('sv-SE');
+    return n.toLocaleString('sv-SE', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  }
+
+  // Group audit entries by kind+symbol+minute to collapse repetitive messages
+  function groupAuditEntries(entries:any[]){
+    if (!Array.isArray(entries)) return [];
+    const m = new Map<string, any>();
+    for (const a of entries){
+      const sym = (a.execution && a.execution.symbol) || (a.decision && a.decision.symbol) || (a.proposal && a.proposal.symbol) || '';
+      const ts = a.timestamp ? (typeof a.timestamp === 'number' ? a.timestamp : Date.parse(a.timestamp)) : (a.decision && a.decision.generatedAt ? Date.parse(a.decision.generatedAt) : Date.now());
+      // For EXECUTION entries avoid minute-level grouping so individual trades stay separate
+      const timeKey = (a.kind === 'EXECUTION') ? String(ts) : String(Math.round(ts / 60000));
+      // For rejection events include the reason message in key so different causes are not grouped together
+      const reasonKey = a.reason && a.reason.message ? `|${a.reason.message}` : (a.summary && a.summary.executionStatus ? `|${a.summary.executionStatus}` : '');
+      const key = `${a.kind || 'UNKNOWN'}|${sym}|${timeKey}${reasonKey}`;
+      if (!m.has(key)) m.set(key, { kind: a.kind, symbol: sym, count: 0, first: ts, last: ts, sample: a });
+      const val = m.get(key);
+      val.count += 1;
+      val.last = Math.max(val.last, ts);
+    }
+    const arr = Array.from(m.values()).sort((x:any,y:any)=> y.last - x.last);
+    return arr;
+  }
+
+  // Normalize audit entries emitted in different shapes (file-backed store uses {summary, raw},
+  // while some raw entries include `executed` arrays). Return a flat list of event-like objects
+  // with `kind`, `timestamp`, `execution` or `decision` where applicable.
+  function normalizeAuditEntries(entries:any[]){
+    if (!Array.isArray(entries)) return [];
+    const out: any[] = [];
+    for (const e of entries){
+      const raw = e && e.raw ? e.raw : e;
+      const ts = e && e.timestamp ? e.timestamp : raw && raw.timestamp ? raw.timestamp : (raw && raw.createdAt ? raw.createdAt : new Date().toISOString());
+
+      // If this entry contains an `executed` array (historical format), expand each execution
+      if (raw && Array.isArray(raw.executed) && raw.executed.length>0){
+        for (const ex of raw.executed){
+          const proposal = ex && ex.proposal ? ex.proposal : (ex && ex.request ? ex.request : null);
+          const result = ex && ex.result ? ex.result : null;
+          out.push({
+            kind: 'EXECUTION',
+            timestamp: ts,
+            execution: {
+              symbol: proposal && proposal.symbol ? proposal.symbol : (result && result.symbol ? result.symbol : null),
+              side: proposal && proposal.side ? proposal.side : (result && result.side ? result.side : null),
+              executedPrice: result && result.executedPrice ? result.executedPrice : (result && result.price ? result.price : null),
+              quantity: result && typeof result.quantity === 'number' ? result.quantity : (proposal && typeof proposal.quantity === 'number' ? proposal.quantity : null),
+              fee: result && typeof result.fee === 'number' ? result.fee : null,
+              orderId: result && result.orderId ? result.orderId : null,
+              status: result && result.status ? result.status : null,
+            },
+            raw: raw,
+          });
+        }
+        continue;
+      }
+
+      // If raw has an `execution` property already, keep it as EXECUTION
+      if (raw && raw.execution && (raw.execution.executedPrice || raw.execution.quantity || raw.execution.status)){
+        out.push({ kind: raw.kind || 'EXECUTION', timestamp: ts, execution: raw.execution, decision: raw.decision || raw.request || null, raw });
+        continue;
+      }
+
+      // Otherwise include the raw entry as-is
+      out.push(raw);
+    }
+    return out;
+  }
 
   return (
     <>
@@ -158,7 +270,7 @@ export default function Page(){
       <div style={{ marginLeft: 240 }} className="min-h-[80vh] bg-[#F9F6F1] p-8">
       {/* HERO */}
       <div className="max-w-6xl mx-auto">
-        <div className="flex items-start justify-between gap-6">
+        <div className="flex items-stretch justify-between gap-6">
           <div>
             <h1 className="text-2xl font-bold">PAPER TRADING</h1>
             <p className="mt-1 text-sm text-gray-700 max-w-2xl">Victor investerar ett simulerat kapital med samma riskmotor som kommer användas vid framtida autonom handel.</p>
@@ -175,52 +287,86 @@ export default function Page(){
                 <div className="text-sm text-gray-500">Demo</div>
               </div>
             </div>
+            {/* Victor + Risk: moved here (compact row) */}
+            <div className="mt-3 grid grid-cols-[1.2fr_0.8fr] gap-3 items-stretch max-w-2xl">
+              <div className="bg-white rounded-xl p-3 shadow-sm border flex flex-col justify-between">
+                <div>
+                  <div className="text-xs text-gray-500">VICTOR</div>
+                  <div className="mt-2 text-sm font-semibold">{loading ? 'Analyserar marknaden' : (latestDecision ? (latestDecision.type || 'Beslut fattat') : (enabled ? 'Bevakar marknaden' : 'Inaktiv'))}</div>
+                  <div className="mt-1 text-xs text-gray-500">{latestDecision && latestDecision.generatedAt ? `Senaste beslut: ${new Date(latestDecision.generatedAt).toLocaleString()}` : (normalizedAudit && normalizedAudit.length>0 ? `Senaste aktivitet: ${normalizedAudit[0].kind || ''}` : 'Ingen senaste aktivitet')}</div>
+                  <div className="mt-2 text-xs text-gray-600">{state.activeRecommendation ? state.activeRecommendation : 'Ingen aktiv rekommendation'}</div>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-xl p-3 shadow-sm border flex flex-col justify-center">
+                <div className="text-xs text-gray-500">RISKKONTROLL</div>
+                <div className="mt-2 grid grid-cols-1 gap-2 text-sm">
+                  {state.maxPosition !== undefined ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Max position</div><div className="font-medium">{state.maxPosition}</div></div> : null}
+                  {state.dailyLossLimit !== undefined ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Daglig förlustgräns</div><div className="font-medium">{Number.isFinite(Number(state.dailyLossLimit)) ? Number(state.dailyLossLimit).toLocaleString() + ' kr' : state.dailyLossLimit}</div></div> : null}
+                  {typeof state.tradesToday === 'number' ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Affärer idag</div><div className="font-medium">{state.tradesToday}</div></div> : null}
+                  { (state.maxPosition===undefined && state.dailyLossLimit===undefined && typeof state.tradesToday !== 'number') ? <div className="text-xs text-gray-500">Ingen riskdata tillgänglig</div> : null }
+                </div>
+              </div>
+            </div>
           </div>
-          <div className="flex items-start">
-            <div className="bg-white rounded-xl p-6 shadow-sm border w-full md:w-[440px]">
-              <div className="text-xs text-gray-500 uppercase">PORTFÖLJVÄRDE</div>
-              <div className="mt-2">
-                <div className="text-3xl md:text-5xl font-extrabold text-blue-900">{portfolioValueFormatted}</div>
-              </div>
-
-              <div className="mt-3 text-xs text-gray-500">TOTAL AVKASTNING</div>
-              <div className="mt-1">
-                <div className={`text-2xl font-semibold ${totalReturnSekCalc > 0 ? 'text-green-600' : totalReturnSekCalc < 0 ? 'text-rose-600' : 'text-gray-800'}`}>{totalReturnSekFormatted}</div>
-                <div className={`mt-1 text-sm ${totalReturnPercentCalc > 0 ? 'text-green-600' : totalReturnPercentCalc < 0 ? 'text-rose-600' : 'text-gray-600'}`}>{totalReturnPercentFormatted}</div>
-              </div>
-
-              <div className="mt-4 border-t pt-3 border-gray-100">
-                <div className="text-sm">
-                  <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full ${loading ? 'bg-amber-400' : enabled ? 'bg-green-500' : 'bg-gray-400'}`} />
-                    <div className={`${loading ? 'text-gray-700' : enabled ? 'text-green-600' : 'text-gray-600'} font-medium`}>{loading ? 'Victor analyserar' : enabled ? 'Aktiv' : 'Paper Trading pausad'}</div>
+          <div className="flex items-stretch">
+            <div style={{ width: '100%' }} className="space-y-3 h-full">
+              {/* Portfolio overview card */}
+              <div className="bg-white rounded-xl p-5 shadow-sm border h-full flex flex-col justify-between">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <div className="text-xs text-gray-500 uppercase">Portfölj</div>
+                    <div className="mt-2">
+                      <div className="text-3xl md:text-4xl font-extrabold text-blue-900">{portfolioValueFormatted}</div>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                      <div className="text-xs text-gray-500">Tillgängligt kapital</div>
+                      <div className="text-right font-medium">{Number.isFinite(Number(availableCash)) ? Number(availableCash).toLocaleString() + ' kr' : '—'}</div>
+                      <div className="text-xs text-gray-500">Investerat kapital</div>
+                      <div className="text-right font-medium">{(() => { const invested = (Number(totalValue) && Number(availableCash) >= 0) ? Number(totalValue) - Number(availableCash) : NaN; return Number.isFinite(invested) ? Math.round(invested).toLocaleString() + ' kr' : '—'; })()}</div>
+                      {state.todayPnL !== undefined ? (<><div className="text-xs text-gray-500">Dagens resultat</div><div className={`text-right font-medium ${state.todayPnL>0?'text-green-600':state.todayPnL<0?'text-rose-600':'text-gray-800'}`}>{Number.isFinite(Number(state.todayPnL))? (Number(state.todayPnL)>0?'+':'')+Number(state.todayPnL).toLocaleString() + ' kr' : '—'}</div></>) : null}
+                      <div className="text-xs text-gray-500">Totalt resultat</div>
+                      <div className={`text-right font-medium ${totalReturnSekCalc>0?'text-green-600':totalReturnSekCalc<0?'text-rose-600':'text-gray-800'}`}>{totalReturnSekFormatted}</div>
+                    </div>
                   </div>
-                  <div className="text-xs text-gray-500 mt-1">Simulerade pengar</div>
+                  <div className="ml-4 text-right" style={{ minWidth: 120 }}>
+                    <div className="text-xs text-gray-500">Systemstatus</div>
+                    <div className="mt-2">
+                      <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-md border ${loading ? 'border-amber-100 bg-amber-50 text-amber-700' : enabled ? 'border-green-100 bg-green-50 text-green-700' : 'border-gray-100 bg-gray-50 text-gray-700'}`}>
+                        <div className={`w-2 h-2 rounded-full ${loading ? 'bg-amber-400' : enabled ? 'bg-green-500' : 'bg-gray-400'}`} />
+                        <div className="text-sm font-medium">{loading ? 'Analyserar' : enabled ? 'Aktiv' : 'Pausad'}</div>
+                      </div>
+                    </div>
+                    <div className="mt-3 text-xs text-gray-500">Simulerade pengar</div>
+                  </div>
+                </div>
+
+                <div className="mt-4 border-t pt-3 border-gray-100">
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                    <button onClick={runCycle} disabled={loading || !enabled} className={`w-full sm:w-auto px-6 min-h-[42px] bg-blue-600 text-white font-semibold rounded-[12px] shadow-sm transition-colors transition-shadow duration-150 ease-in-out hover:bg-blue-700 active:scale-[0.99] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-300 disabled:bg-blue-300 disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2 ${loading ? 'opacity-60' : ''}`}>
+                      <svg aria-hidden className="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 3v18l15-9L5 3z" fill="currentColor"/></svg>
+                      <span>{loading ? 'Kör...' : 'Kör Victor nu'}</span>
+                    </button>
+                    <button
+                      onClick={toggleEnabled}
+                      disabled={loading}
+                      className={`w-full sm:w-auto px-6 min-h-[42px] bg-white text-gray-800 font-semibold rounded-[12px] shadow-sm border border-gray-200 transition-colors duration-150 ease-in-out hover:bg-gray-50 active:scale-[0.99] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-100 disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2`}
+                    >
+                      {enabled ? 'Pausa' : 'Aktivera'}
+                    </button>
+                  </div>
+                    {runError ? (<div className="mt-2 text-sm text-rose-600">{runError}</div>) : null}
                 </div>
               </div>
 
-              <div className="mt-4 border-t pt-3 border-gray-100">
-                <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-                  <button onClick={runCycle} disabled={loading || !enabled} className={`w-full sm:w-auto px-6 min-h-[42px] bg-blue-600 text-white font-semibold rounded-[12px] shadow-sm transition-colors transition-shadow duration-150 ease-in-out hover:bg-blue-700 active:scale-[0.99] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-300 disabled:bg-blue-300 disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2 ${loading ? 'opacity-60' : ''}`}>
-                    <svg aria-hidden className="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 3v18l15-9L5 3z" fill="currentColor"/></svg>
-                    <span>{loading ? 'Kör...' : 'Kör Victor nu'}</span>
-                  </button>
-                  <button
-                    onClick={toggleEnabled}
-                    disabled={loading}
-                    className={`w-full sm:w-auto px-6 min-h-[42px] bg-white text-gray-800 font-semibold rounded-[12px] shadow-sm border border-gray-200 transition-colors duration-150 ease-in-out hover:bg-gray-50 active:scale-[0.99] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-100 disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2`}
-                  >
-                    {enabled ? 'Pausa' : 'Aktivera'}
-                  </button>
-                </div>
-              </div>
+              {/* (Victor + Risk moved to left column) */}
             </div>
           </div>
         </div>
 
         {/* VICTOR PERFORMANCE - premium single card */}
         <div className="mt-4">
-          <div className="bg-white rounded-xl p-6 shadow-sm border transition-shadow hover:shadow-md">
+          <div className="bg-white rounded-xl p-4 shadow-sm border transition-shadow hover:shadow-md">
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-lg font-semibold">VICTOR PERFORMANCE</h2>
@@ -228,25 +374,19 @@ export default function Page(){
               </div>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              <div className="p-4">
-                <div className="flex items-center gap-2">
-                  <KPIIcon name="trades" />
-                  <div className="text-xs text-gray-500">AFFÄRER</div>
-                </div>
-                <div className="mt-2 text-2xl font-semibold">{(auditEntries && auditEntries.filter((a:any)=> a.kind === 'EXECUTION').length) || 0}</div>
+            <div className="mt-3 grid grid-cols-5 gap-2">
+              <div className="p-2">
+                <div className="text-xs text-gray-500">AFFÄRER</div>
+                <div className="mt-1 text-lg font-semibold">{(normalizedAudit && normalizedAudit.filter((a:any)=> a.kind === 'EXECUTION').length) || 0}</div>
               </div>
 
-              <div className="p-4">
-                <div className="flex items-center gap-2">
-                  <KPIIcon name="percent" />
-                  <div className="text-xs text-gray-500">VINSTPROCENT</div>
-                </div>
-                <div className="mt-2 text-2xl font-semibold">
+              <div className="p-2">
+                <div className="text-xs text-gray-500">VINSTPROCENT</div>
+                <div className="mt-1 text-lg font-semibold">
                   {(() => {
                     try{
                       if (!auditEntries || auditEntries.length === 0) return '—';
-                      const sells = auditEntries.filter((a:any)=> a.kind === 'EXECUTION' && a.execution && a.execution.side === 'SELL');
+                      const sells = (normalizedAudit || []).filter((a:any)=> a.kind === 'EXECUTION' && a.execution && a.execution.side === 'SELL');
                       if (sells.length === 0) return '—';
                       const withBasis = sells.map((s:any)=>{
                         const before = s.portfolioBefore;
@@ -265,18 +405,13 @@ export default function Page(){
                 </div>
               </div>
 
-              <div className="p-4">
-                <div className="flex items-center gap-2">
-                  <KPIIcon name="capital" />
-                  <div className="text-xs text-gray-500">AKTIVT KAPITAL</div>
-                </div>
-                <div className="mt-2 text-lg font-semibold">
-                  {(() => {
-                    const invested = (Number(totalValue) && Number(availableCash) >= 0) ? Number(totalValue) - Number(availableCash) : NaN;
-                    return Number.isFinite(invested) ? invested.toLocaleString() + ' kr' : '—';
-                  })()}
-                </div>
-                <div className="mt-3 w-full bg-gray-100 rounded-full h-2">
+              <div className="p-2">
+                <div className="text-xs text-gray-500">AKTIVT KAPITAL</div>
+                <div className="mt-1 text-lg font-semibold">{(() => {
+                  const invested = (Number(totalValue) && Number(availableCash) >= 0) ? Number(totalValue) - Number(availableCash) : NaN;
+                  return Number.isFinite(invested) ? formatCurrency(invested) : '—';
+                })()}</div>
+                <div className="mt-1 w-full bg-gray-100 rounded-full h-2">
                   {(() => {
                     const invested = (Number(totalValue) && Number(availableCash) >= 0) ? Number(totalValue) - Number(availableCash) : NaN;
                     const pct = Number.isFinite(invested) && Number(totalValue) > 0 ? Math.min(100, Math.round((invested / Number(totalValue)) * 100)) : 0;
@@ -284,65 +419,25 @@ export default function Page(){
                   })()}
                 </div>
               </div>
-
-              <div className="p-4">
-                <div className="flex items-center gap-2">
-                  <KPIIcon name="avg" />
-                  <div className="text-xs text-gray-500">GENOMSNITTLIG POSITION</div>
-                </div>
-                <div className="mt-2 text-2xl font-semibold">
-                  {(() => {
-                    if (!holdings || holdings.length === 0) return '—';
-                    const sum = holdings.reduce((s:any,h:any)=> s + (Number(h.marketValue)||0), 0);
-                    const avg = sum / holdings.length;
-                    return Number.isFinite(avg) ? Math.round(avg).toLocaleString() + ' kr' : '—';
-                  })()}
-                </div>
+              <div className="p-2">
+                <div className="text-xs text-gray-500">GENOMSNITTLIG POSITION</div>
+                <div className="mt-1 text-lg font-semibold">{(() => {
+                  if (!Array.isArray(holdings) || holdings.length===0) return '—';
+                  const sum = holdings.reduce((s:any,h:any)=> s + (Number(h.marketValue)||0), 0);
+                  const avg = sum / holdings.length;
+                  return Number.isFinite(avg) ? formatCurrencyCompact(avg) : '—';
+                })()}</div>
               </div>
 
-              <div className="p-4">
-                <div className="flex items-center gap-2">
-                  <KPIIcon name="largest" />
-                  <div className="text-xs text-gray-500">STÖRSTA POSITION</div>
-                </div>
-                <div className="mt-2 text-lg font-semibold flex items-center gap-3">
-                  {(() => {
-                    if (!holdings || holdings.length === 0) return '—';
-                    const max = holdings.reduce((best:any,h:any)=> ( (h.marketValue||0) > (best.marketValue||0) ? h : best ), holdings[0]);
-                    if (!max) return '—';
-                    return (
-                      <div className="flex items-center gap-3">
-                        {max.symbol ? <CompanyLogo symbol={max.symbol} name={max.name} size={28} className="rounded" /> : null}
-                        <div>{max.symbol || max.name || '—'} • {Number.isFinite(Number(max.marketValue)) ? Number(max.marketValue).toLocaleString() + ' kr' : '—'}</div>
-                      </div>
-                    );
-                  })()}
-                </div>
-              </div>
-
-              <div className="p-4">
-                <div className="flex items-center gap-2">
-                  <KPIIcon name="recent" />
-                  <div className="text-xs text-gray-500">SENASTE AKTIVITET</div>
-                </div>
-                <div className="mt-2 text-sm font-medium">
-                  {(() => {
-                    if (!auditEntries || auditEntries.length === 0) return '—';
-                    const latest = auditEntries[0];
-                    if (!latest) return '—';
-                      if (latest.kind === 'EXECUTION'){
-                        const side = latest.execution?.side === 'BUY' ? 'Köp' : (latest.execution?.side === 'SELL' ? 'Sälj' : 'Genomförd');
-                        return (
-                          <button onClick={()=>setSelectedAudit(latest)} onKeyDown={(e)=>{ if (e.key==='Enter'||e.key===' ') { e.preventDefault(); setSelectedAudit(latest); } }} aria-label={`Visa beslut för ${latest.execution?.symbol || latest.decision?.symbol || ''}`} className="text-left text-sm font-medium text-blue-600 hover:underline focus:outline-none focus:ring-2 focus:ring-blue-300">
-                            {`${side} ${latest.execution?.symbol || latest.decision?.symbol || ''}`.trim()}
-                          </button>
-                        );
-                      }
-                    if (latest.kind === 'HOLD') return 'BEHÅLL';
-                    if (latest.kind === 'REJECT') return 'Riskregel stoppade order';
-                    return '—';
-                  })()}
-                </div>
+              <div className="p-2">
+                <div className="text-xs text-gray-500">STÖRSTA POSITION</div>
+                <div className="mt-1 text-lg font-semibold">{(() => {
+                  if (!Array.isArray(holdings) || holdings.length===0) return '—';
+                  const vals = holdings.map((h:any)=> ({ v: Number(h.marketValue)||0, s: h.symbol }));
+                  const mx = vals.reduce((m:any,c:any)=> c.v> (m.v||0) ? c : m, {v:0,s:null});
+                  if (!mx || mx.v === 0) return '—';
+                  return `${mx.s || '—'} • ${formatCurrencyCompact(mx.v)}`;
+                })()}</div>
               </div>
             </div>
           </div>
@@ -352,8 +447,8 @@ export default function Page(){
         <div className="mt-6 bg-white rounded-xl p-5 shadow-sm border">
           <div className="flex items-center justify-between">
             <div>
-              <h3 className="text-lg font-semibold">VICTORS TRACK RECORD</h3>
-              <div className="text-sm text-gray-600">Hur väl har Victor presterat sedan simuleringen startade?</div>
+              <h3 className="text-lg font-semibold">VICTORS SENASTE BESLUT</h3>
+              <div className="text-sm text-gray-600">Senaste analysen och varför Victor valde att agera eller avstå.</div>
             </div>
           </div>
 
@@ -361,70 +456,48 @@ export default function Page(){
             {/* Left: equity curve ~65% */}
             <div className="col-span-8">
               <div className="bg-white rounded-lg p-4 border shadow-sm">
-                {(() => {
-                  // Determine whether there is verifiable history.
-                  // Consider an execution (BUY/SELL) as definitive history.
-                  const execs = (Array.isArray(auditEntries) ? auditEntries.filter((x:any)=> x.kind === 'EXECUTION' && (x.execution?.side === 'BUY' || x.execution?.side === 'SELL')) : []);
-                  const pts = Array.isArray(track.points) ? track.points : [];
-                  // meaningfulPoints: points with finite numeric values
-                  const meaningfulPts = pts.filter((p:any)=> Number.isFinite(Number(p?.value)));
-                  // If more than one distinct value exists among points, treat as real portfolio history
-                  const distinctValues = Array.from(new Set(meaningfulPts.map((p:any)=> Number(p.value))));
-                  const hasPortfolioHistory = distinctValues.length > 1;
-                  const hasHistory = execs.length > 0 || hasPortfolioHistory;
-
-                  // Show empty state ONLY when there are no executed BUY/SELL trades
-                  // and there is no real portfolio history yet.
-                  if (!hasHistory){
-                    return (
-                      <div className="py-6 text-left text-gray-700">
-                        <div className="text-lg font-semibold">VICTOR BYGGER SIN HISTORIK</div>
-                        <div className="mt-2 text-sm text-gray-700">Victor bygger nu upp sin verifierbara historik. Starta den första simuleringen med knappen högst upp för att börja följa hur han presterar över tid.</div>
-                        <ul className="mt-3 text-sm text-gray-600 space-y-2">
-                          <li className="flex items-start gap-2"><KPIIcon name="trades" /><span>Portföljutveckling</span></li>
-                          <li className="flex items-start gap-2"><KPIIcon name="largest" /><span>Bästa och sämsta affär</span></li>
-                          <li className="flex items-start gap-2"><KPIIcon name="avg" /><span>Vinst- och förlustsviter</span></li>
-                          <li className="flex items-start gap-2"><KPIIcon name="percent" /><span>Genomsnittlig vinst och förlust</span></li>
-                        </ul>
-                        <div className="mt-2 text-xs text-gray-500">Simulerade pengar. Ingen riktig order skickas till marknaden.</div>
-                      </div>
-                    );
-                  }
-                  // render normal track record when history exists
-                  const pts2 = track.points || [];
-                  const vals = pts2.map(p=>p.value).filter(v=> Number.isFinite(Number(v)));
-                  if (vals.length === 0) return <div className="py-12 text-center text-gray-500">—</div>;
-                  const min = Math.min(...vals);
-                  const max = Math.max(...vals);
-                  const n = pts2.length;
-                  const coords = pts2.map((p,i)=>{
-                    const x = n===1 ? 50 : (i/(n-1))*100;
-                    const y = (max === min) ? 50 : (1 - ( (p.value - min) / (max - min) )) * 80 + 10;
-                    return `${x},${y}`;
-                  }).join(' ');
-                  const area = `0,100 ${coords} 100,100`;
-                  const line = coords;
-                  const firstLabel = pts2[0] && Number.isFinite(Number(pts2[0].value)) ? Number(pts2[0].value).toLocaleString() + ' kr' : '—';
-                  const lastLabel = pts2[pts2.length-1] && Number.isFinite(Number(pts2[pts2.length-1].value)) ? Number(pts2[pts2.length-1].value).toLocaleString() + ' kr' : '—';
-                  return (
+                {(!track.best) ? (
+                  <div className="py-4 text-sm text-gray-700">
+                    <div className="font-semibold">Ingen avslutad affär ännu</div>
+                    <div className="mt-1 text-xs text-gray-500">Resultatstatistik visas när Victor har genomfört en fullständig köp- och säljcykel.</div>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
                     <div>
-                      <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="w-full h-48">
-                        <defs>
-                          <linearGradient id="tg" x1="0" x2="0" y1="0" y2="1">
-                            <stop offset="0%" stopColor="#dcfce7" stopOpacity="0.8" />
-                            <stop offset="100%" stopColor="#ecfeff" stopOpacity="0.2" />
-                          </linearGradient>
-                        </defs>
-                        <polygon points={area} fill="url(#tg)" />
-                        <polyline points={line} fill="none" stroke="#047857" strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
-                      </svg>
-                      <div className="mt-2 flex justify-between text-xs text-gray-500">
-                        <div>Start • {firstLabel}</div>
-                        <div>Nu • {lastLabel}</div>
+                      <div className="text-xs text-gray-500">BÄSTA AFFÄR</div>
+                      <div className="mt-1 font-semibold text-sm">{track.best && track.best.symbol ? track.best.symbol : '—'}</div>
+                      <div className="text-sm text-gray-700">{track.best && Number.isFinite(Number(track.best.pnl)) ? Number(track.best.pnl).toLocaleString() + ' kr' : '—' } <span className="text-xs text-gray-500">{track.best && Number.isFinite(Number(track.best.pct)) ? ' • ' + Number(track.best.pct).toFixed(2) + '%' : ''}</span></div>
+                    </div>
+
+                    <div>
+                      <div className="text-xs text-gray-500">SÄMSTA AFFÄR</div>
+                      <div className="mt-1 font-semibold text-sm">{track.worst && track.worst.symbol ? track.worst.symbol : '—'}</div>
+                      <div className="text-sm text-gray-700">{track.worst && Number.isFinite(Number(track.worst.pnl)) ? Number(track.worst.pnl).toLocaleString() + ' kr' : '—'} <span className="text-xs text-gray-500">{track.worst && Number.isFinite(Number(track.worst.pct)) ? ' • ' + Number(track.worst.pct).toFixed(2) + '%' : ''}</span></div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-xs text-gray-500">Längsta vinstsvit</div>
+                        <div className="mt-1 font-semibold">{track.longestWin ? `${track.longestWin} affärer` : '—'}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-gray-500">Längsta förlustsvit</div>
+                        <div className="mt-1 font-semibold">{track.longestLoss ? `${track.longestLoss} affärer` : '—'}</div>
                       </div>
                     </div>
-                  );
-                })()}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-xs text-gray-500">Genomsnittlig vinst</div>
+                        <div className="mt-1 font-semibold">{track.avgWin !== null ? Number(track.avgWin).toLocaleString() + ' kr' : '—'}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-gray-500">Genomsnittlig förlust</div>
+                        <div className="mt-1 font-semibold">{track.avgLoss !== null ? Number(track.avgLoss).toLocaleString() + ' kr' : '—'}</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -592,94 +665,87 @@ export default function Page(){
         {/* removed duplicate standalone analysis section (now handled inside main AI card) */}
 
         {/* Two columns */}
-        <div className="mt-8 grid grid-cols-12 gap-6">
-          <div className="col-span-8">
+        <div className="mt-8 grid grid-cols-12 gap-6 items-start lg:items-stretch">
+          <div className="col-span-7">
             {/* Holdings table */}
-            <div className="mt-0 bg-white rounded-xl p-6 shadow-sm border">
+            <div className="mt-0 bg-white rounded-xl p-6 shadow-sm border h-full flex flex-col">
               <div className="flex items-center justify-between">
                 <div className="text-sm font-medium">INNEHAV</div>
                 <div className="text-xs text-gray-400">{holdings?.length || 0} innehav</div>
               </div>
               {(!holdings || holdings.length===0) ? (
-                <div className="mt-4 text-sm text-gray-500">Victor har ännu inte genomfört någon simulerad affär.</div>
-              ) : (
-                <div className="mt-4 overflow-x-auto">
-                  <table className="w-full text-sm table-fixed">
-                    <thead>
-                      <tr className="text-left text-xs text-gray-500">
-                        <th className="w-1/12">Logo</th>
-                        <th className="w-3/12">Bolag</th>
-                        <th className="w-2/12">Ticker</th>
-                        <th className="w-2/12">Antal</th>
-                        <th className="w-2/12">Snittpris</th>
-                        <th className="w-2/12">Nuvarande värde</th>
-                        <th className="w-2/12">Resultat</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {holdings.map((h:any, idx:number)=> (
-                        <tr key={h.symbol||idx} className="border-t">
-                          <td className="py-3">{h.symbol ? <CompanyLogo symbol={h.symbol} name={h.name} size={36} innerPadding={6} /> : null}</td>
-                          <td className="py-3">
-                            <div className="font-medium">{h.name}</div>
-                            <div className="text-xs text-gray-500">{h.symbol}</div>
-                          </td>
-                          <td className="py-3">{h.symbol}</td>
-                          <td className="py-3">{h.quantity}</td>
-                          <td className="py-3">{h.averagePrice}</td>
-                          <td className="py-3">{h.marketValue}</td>
-                          <td className="py-3">{/* result */}{h.marketValue - (h.averagePrice*h.quantity) >= 0 ? <span className="text-green-600">+{Math.round((h.marketValue - (h.averagePrice*h.quantity))*100)/100}</span> : <span className="text-rose-600">{Math.round((h.marketValue - (h.averagePrice*h.quantity))*100)/100}</span>}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
+                  <div className="mt-4 text-sm text-gray-500">Victor har ännu inte genomfört någon simulerad affär.</div>
+                ) : (
+                  <div className="mt-4 overflow-x-auto lg:overflow-x-visible flex-1">
+                    <div className="flex-1 overflow-y-auto">
+                      <table className="min-w-full text-sm table-fixed">
+                        <thead>
+                          <tr className="text-left text-xs text-gray-500 sticky top-0 bg-white z-10">
+                            <th className="px-2 py-2 w-[44px]">Logo</th>
+                            <th className="px-2 py-2">Bolag</th>
+                            <th className="px-2 py-2 w-[72px]">Ticker</th>
+                            <th className="px-2 py-2 w-[64px] text-center">Antal</th>
+                            <th className="px-2 py-2 w-[110px] text-right">Snittpris</th>
+                            <th className="px-2 py-2 w-[110px] text-right">Nuvarande värde</th>
+                            <th className="px-2 py-2 w-[110px] text-right">Resultat</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {holdings.map((h:any, idx:number)=> {
+                            const result = (Number(h.marketValue) - (Number(h.averagePrice||0) * Number(h.quantity||0)));
+                            return (
+                            <tr key={h.symbol||idx} className="border-t hover:bg-gray-50">
+                              <td className="py-2 px-2 align-top w-[44px]">{h.symbol ? <CompanyLogo symbol={h.symbol} name={h.name} size={36} innerPadding={6} /> : null}</td>
+                              <td className="py-2 px-2 align-top max-w-[340px] overflow-hidden">
+                                <div className="font-medium truncate">{h.name}</div>
+                                <div className="text-xs text-gray-500">{h.symbol}</div>
+                              </td>
+                              <td className="py-2 px-2 align-top w-[72px]">{h.symbol}</td>
+                              <td className="py-2 px-2 text-center align-top w-[64px]">{formatQty(h.quantity)}</td>
+                              <td className="py-2 px-2 text-right align-top w-[110px]">{formatCurrencyCompact(h.averagePrice)}</td>
+                              <td className="py-2 px-2 text-right align-top w-[110px]">{formatCurrencyCompact(h.marketValue)}</td>
+                              <td className="py-2 px-2 text-right align-top w-[110px] whitespace-nowrap">{result >= 0 ? <span className="text-green-600">+{formatCurrencyCompact(result)}</span> : <span className="text-rose-600">{formatCurrencyCompact(result)}</span>}</td>
+                            </tr>
+                          )})}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
             </div>
           </div>
 
-          <div className="col-span-4 flex flex-col gap-6">
-            <div className="bg-white rounded-xl p-5 shadow-sm border">
-              <div className="text-sm text-gray-500">PORTFÖLJSTATUS</div>
-              <div className="mt-3 text-2xl font-semibold">{Number(totalValue).toLocaleString()} kr</div>
-              <div className="mt-2 text-sm text-gray-600">Likvida medel: {Number(availableCash).toLocaleString()} kr</div>
-              <div className="mt-3 flex items-center justify-between">
-                <div className="text-sm text-gray-500">Antal innehav</div>
-                <div className="text-sm font-medium">{holdings.length}</div>
-              </div>
-              <div className="mt-3 text-sm text-gray-500">Senaste körning: {state.latestCycle ? `${state.latestCycle.processed} beslut` : '—'}</div>
-              <div className="mt-4">
-                <div className="text-sm text-gray-500">Investerat kapital</div>
-                <div className="mt-2 text-xl font-semibold">{Math.round(( (totalValue - availableCash) / (totalValue || 1) * 100)) || 0}%</div>
-              </div>
-            </div>
-
-            <div className="bg-white rounded-xl p-5 shadow-sm border">
+          <div className="col-span-5 flex flex-col gap-6">
+            <div className="bg-white rounded-xl p-5 shadow-sm border h-full flex flex-col">
               <div className="text-sm font-medium">SENASTE AKTIVITET</div>
-              <div className="mt-4 space-y-3">
-                {auditEntries && auditEntries.length>0 ? auditEntries.slice(0,10).map((a:any, i:number)=> {
-                  const isExec = a.kind === 'EXECUTION' && a.execution;
-                  const Wrapper: any = isExec ? 'button' : 'div';
-                  const wrapperProps: any = isExec ? { onClick: ()=>setSelectedAudit(a), onKeyDown: (e:any)=>{ if (e.key==='Enter'||e.key===' ') { e.preventDefault(); setSelectedAudit(a); } }, 'aria-label': `Visa beslut för ${(a.execution&&a.execution.symbol)||(a.decision&&a.decision.symbol)||''}`, className: 'text-left w-full focus:outline-none focus:ring-2 focus:ring-blue-300 rounded' } : {};
-                  return (
-                    <Wrapper key={a.id||i} {...wrapperProps}>
-                      <div className="flex items-start gap-3 p-2 hover:bg-gray-50 rounded cursor-pointer">
-                        <div className={`w-3 h-3 rounded-full mt-1 ${a.kind==='EXECUTION' ? 'bg-green-500' : a.kind==='HOLD' ? 'bg-amber-400' : 'bg-rose-500'}`} />
-                        <div>
-                          <div className="flex items-center gap-2">
-                            {((a.execution && a.execution.symbol) || (a.decision && a.decision.symbol)) ? (
-                              <CompanyLogo symbol={(a.execution && a.execution.symbol) || (a.decision && a.decision.symbol)} size={20} />
-                            ) : null}
-                            <div className="text-sm font-medium">{a.kind === 'EXECUTION' ? 'Köp genomfört' : a.kind === 'HOLD' ? 'HOLD' : 'Nekades av riskregel'}</div>
+              <div className="mt-4 space-y-3 flex-1 overflow-y-auto">
+                {normalizedAudit && normalizedAudit.length>0 ? (()=>{
+                  const allGroups = groupAuditEntries(normalizedAudit);
+                  const execGroups = allGroups.filter((x:any)=> x.kind === 'EXECUTION');
+                  const otherGroups = allGroups.filter((x:any)=> x.kind !== 'EXECUTION');
+                  const grouped = [...execGroups, ...otherGroups].slice(0,5);
+                  return grouped.map((g:any, i:number)=>{
+                    const a = g.sample;
+                    const isExec = a && a.kind === 'EXECUTION' && a.execution;
+                    const Wrapper: any = isExec ? 'button' : 'div';
+                    const wrapperProps: any = isExec ? { onClick: ()=>setSelectedAudit(a), onKeyDown: (e:any)=>{ if (e.key==='Enter'||e.key===' ') { e.preventDefault(); setSelectedAudit(a); } }, 'aria-label': `Visa beslut för ${(a.execution&&a.execution.symbol)||(a.decision&&a.decision.symbol)||''}`, className: 'text-left w-full focus:outline-none focus:ring-2 focus:ring-blue-300 rounded' } : {};
+                    const displayKind = a && (a.kind === 'EXECUTION' ? 'Köp genomfört' : a.kind === 'HOLD' ? 'HOLD' : 'Nekades av riskregel');
+                    return (
+                      <Wrapper key={g.symbol + '|' + g.first + '|' + i} {...wrapperProps}>
+                        <div className="flex items-start gap-3 p-2 hover:bg-gray-50 rounded cursor-pointer">
+                          <div className={`w-3 h-3 rounded-full mt-1 ${a && a.kind==='EXECUTION' ? 'bg-green-500' : a && a.kind==='HOLD' ? 'bg-amber-400' : 'bg-rose-500'}`} />
+                          <div>
+                            <div className="flex items-center gap-2">
+                              {g.symbol ? <CompanyLogo symbol={g.symbol} size={20} /> : null}
+                              <div className="text-sm font-medium">{displayKind} {g.count>1 ? `×${g.count}` : ''}</div>
+                            </div>
+                            <div className="text-xs text-gray-500">{g.symbol || ''} • {g.last ? new Date(g.last).toLocaleString() : ''}</div>
                           </div>
-                          <div className="text-xs text-gray-500">{a.decision?.symbol || a.execution?.symbol || ''} • {new Date(a.timestamp).toLocaleString()}</div>
-                          {a.reason && <div className="text-xs text-gray-600 mt-1">{a.reason.message}</div>}
-                          {a.execution && <div className="text-xs text-gray-600 mt-1">{a.execution.side} {a.execution.quantity} @ {a.execution.executedPrice} kr</div>}
                         </div>
-                      </div>
-                    </Wrapper>
-                  );
-                }) : <div className="text-sm text-gray-500">Ingen aktivitet ännu.</div>}
+                      </Wrapper>
+                    );
+                  });
+                })() : <div className="text-sm text-gray-500">Ingen aktivitet ännu.</div>}
               </div>
             </div>
           </div>
