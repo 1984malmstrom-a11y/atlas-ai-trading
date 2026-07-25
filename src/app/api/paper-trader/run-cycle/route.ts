@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { runManualPaperTradingCycle } from '../../../../lib/paper-trader/demo-runtime';
+import { acquireRunCycleLock } from '../../../../lib/paper-trader/run-cycle-lock';
 
 export async function POST(req: Request){
   try{
@@ -14,11 +15,20 @@ export async function POST(req: Request){
     const idempotencyKey = req.headers.get('idempotency-key');
     if (!idempotencyKey) return NextResponse.json({ ok: false, code: 'IDEMPOTENCY_KEY_REQUIRED' }, { status: 400 });
 
-    // Call exactly one cycle; allowWhenScheduler true so scheduler guards are bypassed for manual cron trigger
-    try{
+    // Acquire distributed idempotency lock once
+    try {
+      const lock = await acquireRunCycleLock(idempotencyKey);
+      if (lock === 'DUPLICATE') {
+        return NextResponse.json({ ok: true, duplicate: true, idempotencyKey });
+      }
+      if (lock === 'UNAVAILABLE') {
+        return NextResponse.json({ ok: false, code: 'IDEMPOTENCY_UNAVAILABLE' }, { status: 503 });
+      }
+
+      // ACQUIRED -> proceed to run cycle
       const cycle = await runManualPaperTradingCycle({ allowWhenScheduler: true });
       return NextResponse.json({ ok: true, idempotencyKey, cycle });
-    }catch(e:any){
+    } catch (e: any) {
       return NextResponse.json({ ok: false, code: 'CYCLE_FAILED' }, { status: 500 });
     }
   }catch(e:any){

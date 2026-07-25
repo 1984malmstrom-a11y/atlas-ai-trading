@@ -9,6 +9,8 @@ describe('POST /api/paper-trader/run-cycle', ()=>{
     vi.doMock('next/server', () => ({ NextResponse: { json: (payload: any, init?: any) => ({ payload, status: init && init.status ? init.status : 200 }) } }));
     // mock the runtime cycle
     vi.doMock('../../../../lib/paper-trader/demo-runtime', () => ({ runManualPaperTradingCycle: mockCycle }));
+    // default lock returns ACQUIRED
+    vi.doMock('../../../../lib/paper-trader/run-cycle-lock', () => ({ acquireRunCycleLock: async () => 'ACQUIRED' }));
   });
 
   afterEach(()=>{
@@ -56,5 +58,27 @@ describe('POST /api/paper-trader/run-cycle', ()=>{
     expect(mockCycle).toHaveBeenCalledTimes(1);
     expect(mockCycle).toHaveBeenCalledWith({ allowWhenScheduler: true });
     expect((res as any).payload && (res as any).payload.cycle && (res as any).payload.cycle.result).toBeDefined();
+  });
+
+  it('returns 200 and does not run cycle when lock is DUPLICATE', async ()=>{
+    process.env.PAPER_TRADER_CRON_SECRET = 's3cr3t';
+    vi.doMock('../../../../lib/paper-trader/run-cycle-lock', () => ({ acquireRunCycleLock: async () => 'DUPLICATE' }));
+    const { POST } = await import('./route');
+    const req: any = { headers: { get: (k:string)=> { const m = new Map([['authorization','Bearer s3cr3t'],['idempotency-key','dup-1']]); return m.get(k.toLowerCase()) || m.get(k); } }, json: async ()=> ({}) } as any;
+    const res = await POST(req as any);
+    expect((res as any).status).toBe(200);
+    expect((res as any).payload && (res as any).payload.duplicate).toBe(true);
+    expect(mockCycle).not.toHaveBeenCalled();
+  });
+
+  it('returns 503 and does not run cycle when lock is UNAVAILABLE', async ()=>{
+    process.env.PAPER_TRADER_CRON_SECRET = 's3cr3t';
+    vi.doMock('../../../../lib/paper-trader/run-cycle-lock', () => ({ acquireRunCycleLock: async () => 'UNAVAILABLE' }));
+    const { POST } = await import('./route');
+    const req: any = { headers: { get: (k:string)=> { const m = new Map([['authorization','Bearer s3cr3t'],['idempotency-key','unv-1']]); return m.get(k.toLowerCase()) || m.get(k); } }, json: async ()=> ({}) } as any;
+    const res = await POST(req as any);
+    expect((res as any).status).toBe(503);
+    expect((res as any).payload && (res as any).payload.code).toBe('IDEMPOTENCY_UNAVAILABLE');
+    expect(mockCycle).not.toHaveBeenCalled();
   });
 });
