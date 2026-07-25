@@ -9,8 +9,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "victor:preflight": "vite-node scripts/run-victor-paper-preflight-cli.ts"
-    ,"victor:autopilot": "vite-node src/scripts/run-victor-autopilot.ts"
+    "victor:preflight": "vite-node scripts/run-victor-paper-preflight-cli.ts",
+    "victor:autopilot": "vite-node src/scripts/run-victor-autopilot.ts"
   },
   "dependencies": {
     "next": "16.2.9",
@@ -21,13 +21,13 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "autoprefixer": "^10",
     "eslint": "^9.39.5",
     "eslint-config-next": "^16.2.9",
-    "tailwindcss": "^3.4.10",
-    
-    "typescript": "^5",
     "postcss": "^8",
-    "autoprefixer": "^10"
-    ,"vitest": "^1.0.0"
+    "supabase": "^2.109.1",
+    "tailwindcss": "^3.4.10",
+    "typescript": "^5",
+    "vitest": "^1.0.0"
   }
 }
