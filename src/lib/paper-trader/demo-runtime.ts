@@ -6,6 +6,7 @@ import * as DecisionEngine from './decision-engine';
 import { evaluateTrade } from './trade-evaluation';
 import analyzePriceSeries from './technical';
 import { combineAnalyses } from './analysis-aggregator';
+import estimateExpectedReturn from './expected-return';
 import fs from 'fs';
 import path from 'path';
 
@@ -707,9 +708,10 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         evaluationCount++;
       }
       // Attach centralized technical analysis (observe-only) using historical daily closes
+      let _techMeta_for_holding: any = null;
       try{
-        const techMeta = await fetchAndAnalyze(symbol);
-        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, techMeta) } as any); }catch(e){}
+        _techMeta_for_holding = await fetchAndAnalyze(symbol);
+        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, _techMeta_for_holding) } as any); }catch(e){}
       }catch(_){
         try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' }) } as any); }catch(_){ }
       }
@@ -717,10 +719,23 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           plannedSymbols.add(symbol);
           // Ask Decision Engine for final decision (include per-cycle reflection)
           try{
-            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection } as any;
+            // If we have technical meta, try to compute an expected return estimate and forward it to the decision engine
+            let expectedReturnForDecision: number | undefined = undefined;
+            try{
+              if (_techMeta_for_holding && _techMeta_for_holding.technicalMomentumPercent !== undefined){
+                const techEngine = { status: _techMeta_for_holding.technicalAnalysisStatus || null, score: typeof _techMeta_for_holding.technicalScore === 'number' ? _techMeta_for_holding.technicalScore : undefined, signal: _techMeta_for_holding.technicalSignal || undefined, reasons: Array.isArray(_techMeta_for_holding.technicalReasons) ? _techMeta_for_holding.technicalReasons : undefined } as any;
+                const fundEngine = (opts && opts.overrideUniverse && opts.overrideUniverse.fundamentals && opts.overrideUniverse.fundamentals[symbol]) ? opts.overrideUniverse.fundamentals[symbol] : null;
+                const combined = combineAnalyses({ technical: techEngine, fundamental: fundEngine });
+                const estimate = estimateExpectedReturn({ momentumPercent: _techMeta_for_holding.technicalMomentumPercent, confidence: combined && typeof combined.confidence === 'number' ? combined.confidence : NaN });
+                if (estimate && typeof estimate.expectedReturnPercent === 'number' && Number.isFinite(estimate.expectedReturnPercent)) expectedReturnForDecision = estimate.expectedReturnPercent;
+              }
+            }catch(_){ /* ignore estimate failures and proceed without expectedReturnPercent for SELL */ }
+
+            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: expectedReturnForDecision } as any;
             const decRes = DecisionEngine.evaluateDecision(decInput);
             const cand = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0) } as any;
             // attach risk and reflection for auditability (reuse same reflection object)
+            if (typeof expectedReturnForDecision === 'number') (cand as any).expectedReturnPercent = expectedReturnForDecision;
             cand.risk = decRes.risk;
             if (perCycleReflection) cand.performanceReflection = perCycleReflection;
             candidates.push(cand);
@@ -783,10 +798,11 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
 
       if (buySignal){
         // perform observe-only technical analysis before adding candidate (do not alter buy decision)
+        let _techMeta_for_buy: any = null;
         try{
             try{
-              const techMeta = await fetchAndAnalyze(s);
-              try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(s, techMeta) } as any); }catch(e){}
+              _techMeta_for_buy = await fetchAndAnalyze(s);
+              try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(s, _techMeta_for_buy) } as any); }catch(e){}
             }catch(e:any){
               try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(s, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) }) } as any); }catch(_){ }
             }
@@ -795,9 +811,28 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } as any); }catch(_){ }
         }
         try{
-          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection } as any;
+          // Compute expected return estimate from technical meta + combined analysis
+          let estimateForBuy: any = null;
+          try{
+            if (_techMeta_for_buy && _techMeta_for_buy.technicalMomentumPercent !== undefined){
+              const techEngine = { status: _techMeta_for_buy.technicalAnalysisStatus || null, score: typeof _techMeta_for_buy.technicalScore === 'number' ? _techMeta_for_buy.technicalScore : undefined, signal: _techMeta_for_buy.technicalSignal || undefined, reasons: Array.isArray(_techMeta_for_buy.technicalReasons) ? _techMeta_for_buy.technicalReasons : undefined } as any;
+              const fundEngine = (opts && opts.overrideUniverse && opts.overrideUniverse.fundamentals && opts.overrideUniverse.fundamentals[s]) ? opts.overrideUniverse.fundamentals[s] : null;
+              const combined = combineAnalyses({ technical: techEngine, fundamental: fundEngine });
+              estimateForBuy = estimateExpectedReturn({ momentumPercent: _techMeta_for_buy.technicalMomentumPercent, confidence: combined && typeof combined.confidence === 'number' ? combined.confidence : NaN });
+            }
+          }catch(_){ estimateForBuy = null; }
+
+          // If estimate is null, do not create BUY candidate or call decision engine for BUY
+          if (!estimateForBuy){
+            try{ await auditStore.append({ kind: 'REJECT', decision: { id: `rej_est_${s}_${Date.now()}`, symbol: s, action: 'BUY' }, reason: { code: 'EXPECTED_RETURN_MISSING', message: 'Expected return estimate unavailable' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any); }catch(_){ }
+            continue;
+          }
+
+          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: estimateForBuy.expectedReturnPercent } as any;
           const decRes = DecisionEngine.evaluateDecision(decInput);
           const cand = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000 } as any;
+          // persist estimate on candidate for auditability
+          if (estimateForBuy && typeof estimateForBuy.expectedReturnPercent === 'number') (cand as any).expectedReturnPercent = estimateForBuy.expectedReturnPercent;
           cand.risk = decRes.risk;
           if (perCycleReflection) cand.performanceReflection = perCycleReflection;
           candidates.push(cand);

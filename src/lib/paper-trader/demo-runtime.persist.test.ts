@@ -71,6 +71,10 @@ describe('demo-runtime persistence', ()=>{
     const profile = await mod.getPerformanceProfile();
     const spy = vi.spyOn(mod, 'getPerformanceProfile' as any).mockResolvedValue(profile as any);
     // spy on decision engine to ensure reflection forwarded
+    // Mock provider to avoid network calls during historical fetch
+    vi.mock('../market-data/twelve-data', ()=>({
+      TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym: string, n: number){ return { closes: [1,2,3,4,5,6,7,8,9,10], dates: [], source: 'mock' }; } }
+    }));
     const decMod = await import('./decision-engine');
     const decSpy = vi.spyOn(decMod, 'evaluateDecision' as any);
 
@@ -142,5 +146,82 @@ describe('demo-runtime persistence', ()=>{
     expect(res.rejects).toBeGreaterThanOrEqual(1);
 
     decSpy.mockRestore();
+  });
+
+  it('forwards estimated expectedReturnPercent to DecisionEngine (momentum 8, confidence 50 => 4) and does not use raw quote', async ()=>{
+    vi.resetModules();
+    // Mock technical analysis to produce momentum=8 and technicalScore=50 (analyzePriceSeries shape)
+    vi.doMock('./technical', () => ({
+      default: () => ({
+        momentumPercent: 8,
+        technicalScore: 50,
+        signal: 'BUY',
+        reasons: ['r'],
+      }),
+    }));
+
+    // Mock historical provider to return deterministic closes (avoid network)
+    vi.mock('../market-data/twelve-data', ()=>({
+      TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym: string, n: number){ return { closes: [1,2,3,4,5,6,7,8,9,10], dates: [], source: 'mock' }; } }
+    }));
+
+    // Mock decision-engine to capture calls from demo-runtime
+    vi.mock('./decision-engine', ()=>({ evaluateDecision: vi.fn((input:any)=>({ confidence: 0.5, risk: {} })) }));
+    const decMod = await import('./decision-engine');
+    const decMock = decMod as any;
+
+    const mod = await import('./demo-runtime');
+    const runtime = mod.default || mod;
+    await mod.__clearAudits();
+
+    // Create a prior evaluation with high referencePrice so buySignal triggers
+    await mod.__appendTestAudits([{ kind: 'EVALUATION', decision: { id: 'eval_MSFT_1', symbol: 'MSFT', action: 'HOLD', referencePrice: 1000 }, timestamp: new Date().toISOString(), meta: { technicalAnalysis: { technicalAnalysisStatus: 'success' } } }]);
+
+    const override = {
+      portfolio: { availableCash: 10000, totalValue: 10000, holdings: [] },
+      quotes: [{ symbol: 'MSFT', priceSek: 900, price: 900, expectedReturnPercent: 99 }]
+    };
+
+    // Add an explicit prior evaluation for MSFT so the buy-on-dip logic finds a reference.
+    // Must ensure summary.decisionId contains 'MSFT' and raw.decision.symbol === 'MSFT'.
+    await mod.__appendTestAudits([{
+      kind: 'EVALUATION',
+      decision: { id: 'seed_eval_MSFT_1', symbol: 'MSFT', action: 'HOLD', referencePrice: 1000 },
+      timestamp: new Date().toISOString(),
+      meta: { technicalAnalysis: { technicalAnalysisStatus: 'success' } }
+    }]);
+
+    await runtime.runManualPaperTradingCycle({ overrideUniverse: override });
+
+    // Verify mocked decision-engine was called with expectedReturnPercent = 4
+    expect(decMock.evaluateDecision).toHaveBeenCalled();
+    const calls = decMock.evaluateDecision.mock.calls.map((c:any[])=> c[0]);
+    const msftCall = calls.find((c:any)=> c && c.decision && String((c.decision.symbol||'').toUpperCase()) === 'MSFT');
+    expect(msftCall).toBeDefined();
+    expect(msftCall.expectedReturnPercent).toBeCloseTo(4);
+  });
+
+  it('when estimate returns null, no BUY execution is attempted', async ()=>{
+    vi.resetModules();
+    // Mock technical analysis to produce missing momentum so estimate returns null
+    vi.mock('../market-data/twelve-data', ()=>({
+      TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym: string, n: number){ return { closes: [1,2,3,4,5,6,7,8,9,10], dates: [], source: 'mock' }; } }
+    }));
+    vi.doMock('./technical', ()=>({
+      default: ()=> ({ technicalAnalysisStatus: 'success', technicalScore: 50 })
+    }));
+
+    const mod = await import('./demo-runtime');
+    const runtime = mod.default || mod;
+    await mod.__clearAudits();
+
+    // prime last evaluation to trigger buy signal
+    await mod.__appendTestAudits([{ kind: 'EVALUATION', decision: { id: 'eval_MSFT_2', symbol: 'MSFT', action: 'HOLD', referencePrice: 1000 }, timestamp: new Date().toISOString() }]);
+
+    const override = { portfolio: { availableCash: 10000, totalValue: 10000, holdings: [] }, quotes: [{ symbol: 'MSFT', priceSek: 900, price: 900 }] };
+
+    const res = await runtime.runManualPaperTradingCycle({ overrideUniverse: override });
+    // no executions for BUY when estimate missing
+    expect(res.executed).toBe(0);
   });
 });
