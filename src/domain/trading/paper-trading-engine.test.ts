@@ -153,4 +153,29 @@ describe('PaperTradingEngine risk integration', ()=>{
     expect(tx.quantity).toBeCloseTo(5.5, 12);
     expect(tx.quantity * tx.executedPrice).toBeCloseTo(550, 6);
   });
+
+  it('SELL closing full position returns trade evaluation', ()=>{
+    const portfolio: Portfolio = { id: 'pSell', baseCurrency: 'SEK', totalValue: 10000, availableCash: 0, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: [{ id: 'h_msft', symbol: 'MSFT', name: 'MSFT', assetType: 'Stock', quantity: 2, averagePrice: 100, currentPrice: 100, marketValue: 200, unrealizedPnl: 0, unrealizedPnlPercent: 0, portfolioWeight: 0 }] };
+    const engine = new PaperTradingEngine(JSON.parse(JSON.stringify(portfolio)));
+    // Make execution deterministic: no slippage, no fees
+    engine.slippageMin = 0; engine.slippageMax = 0; engine.feePercent = 0;
+    const order: Order = { id: 'oSell1', symbol: 'MSFT', side: 'Sälj', quantity: 2, price: 90 };
+    const res = engine.simulateExecution(order);
+    expect(res.success).toBe(true);
+    const tx = (res as any).transaction as any;
+    expect(tx.quantity).toBe(2);
+    // portfolio should reflect closed position (either removed or zeroed)
+    const post = (res as any).portfolio;
+    const found = (post.holdings||[]).find((h:any)=> String(h.symbol).toUpperCase() === 'MSFT');
+    if (found){
+      expect(found.quantity).toBe(0);
+    } else {
+      expect(found).toBeUndefined();
+    }
+    // evaluation should be attached to transaction
+    expect(tx.evaluation).toBeDefined();
+    expect(tx.evaluation.pnlSek).toBeCloseTo(-20);
+    expect(tx.evaluation.pnlPercent).toBeCloseTo(-10);
+    expect(tx.evaluation.winner).toBe(false);
+  });
 });

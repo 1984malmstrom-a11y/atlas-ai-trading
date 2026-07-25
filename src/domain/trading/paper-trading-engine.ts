@@ -210,7 +210,6 @@ export class PaperTradingEngine {
       const proceed = Math.max(0, notional - fee);
       newPortfolio.availableCash += proceed;
       // If position fully closed (no remaining quantity) and we have cost-basis, evaluate trade
-      let evaluationObj: { pnlSek: number; pnlPercent: number; winner: boolean } | undefined = undefined;
       if ((existing.quantity === 0 || prevQty === order.quantity) && prevAvg !== null) {
         evaluationObj = evaluateTrade({ entryPrice: prevAvg, exitPrice: executedPrice, quantity: order.quantity });
       }
