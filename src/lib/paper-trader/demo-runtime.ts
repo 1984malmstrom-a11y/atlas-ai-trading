@@ -1262,7 +1262,9 @@ try{
   // Always ensure the global singleton references the current run implementation so hot-reload
   // can swap the callback without creating duplicate timers.
   try{ getGlobalScheduler().runTick = runAutomaticCycleImplementation; }catch(_){ }
-  if (process.env.NODE_ENV !== 'test'){
+  // Start in-memory scheduler only when explicitly enabled via env.
+  // Default: do not start automatically unless running non-test and mode set to "in_memory".
+  if (process.env.NODE_ENV !== 'test' && process.env.PAPER_TRADER_SCHEDULER_MODE === 'in_memory'){
     startAutonomousScheduler();
   }
 }catch(e){}
