@@ -15,8 +15,11 @@ function nowIso(){ return new Date().toISOString(); }
 function deterministicDecisionForQuote(instrumentId: string, quote: any): VictorTradeDecision {
   const change = quote.changePercent ?? 0;
   const generatedAt = nowIso();
-  if (change >= 1.0) return { instrumentId, action: 'SELL', confidence: Math.min(0.99, 0.5 + Math.abs(change)/10), thesis: 'Price up; trim exposure', signals: ['price_up'], risks: [], timeHorizon: 'SWING', generatedAt };
-  if (change <= -1.0) return { instrumentId, action: 'BUY', confidence: Math.min(0.99, 0.5 + Math.abs(change)/10), thesis: 'Price down; opportunity', signals: ['price_drop'], risks: [], timeHorizon: 'SWING', generatedAt };
+  const conf = Math.min(0.99, 0.5 + Math.abs(change)/10);
+  // Do NOT derive expectedReturnPercent from confidence. Use an explicit value from upstream analysis (quote.expectedReturnPercent) if provided.
+  const explicitExp = typeof (quote && (quote as any).expectedReturnPercent) === 'number' && Number.isFinite((quote as any).expectedReturnPercent) ? Number((quote as any).expectedReturnPercent) : undefined;
+  if (change >= 1.0) return { instrumentId, action: 'SELL', confidence: conf, expectedReturnPercent: explicitExp, thesis: 'Price up; trim exposure', signals: ['price_up'], risks: [], timeHorizon: 'SWING', generatedAt };
+  if (change <= -1.0) return { instrumentId, action: 'BUY', confidence: conf, expectedReturnPercent: explicitExp, thesis: 'Price down; opportunity', signals: ['price_drop'], risks: [], timeHorizon: 'SWING', generatedAt };
   return { instrumentId, action: 'HOLD', confidence: 0.5, thesis: 'No clear signal', signals: [], risks: [], timeHorizon: 'SWING', generatedAt };
 }
 
@@ -262,11 +265,21 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
     // build request
     const qty = Math.floor(orderValueSek / q.price) || 1;
     if (qty <= 0) continue;
+    const clientId = `o_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    // If this is a BUY, require an explicit finite expectedReturnPercent from Victor's decision; otherwise skip creating a BUY order.
+    if (dec.action === 'BUY' && !(typeof dec.expectedReturnPercent === 'number' && Number.isFinite(dec.expectedReturnPercent))) {
+      // Skip BUY when Victor did not supply expectedReturnPercent
+      tradesThisCycle++;
+      continue;
+    }
+
     const req = {
       instrumentId: inst.id,
       symbol: symbol,
       side: dec.action === 'BUY' ? 'BUY' : 'SELL',
       quantity: qty,
+      clientOrderId: clientId,
+      expectedReturnPercent: typeof dec.expectedReturnPercent === 'number' && Number.isFinite(dec.expectedReturnPercent) ? dec.expectedReturnPercent : undefined,
       price: (q && typeof q.price === 'number') ? Number(q.price) : undefined,
       orderType: 'MARKET'
     };

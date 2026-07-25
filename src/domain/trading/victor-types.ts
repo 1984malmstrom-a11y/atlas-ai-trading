@@ -23,6 +23,7 @@ export type VictorTradeDecision = {
   instrumentId: string;
   action: 'BUY' | 'SELL' | 'HOLD';
   confidence: number;
+  expectedReturnPercent?: number;
   targetPositionPercent?: number;
   orderValueSek?: number;
   thesis: string;

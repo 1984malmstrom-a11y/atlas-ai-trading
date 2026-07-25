@@ -15,6 +15,7 @@ export type BrokerOrderRequest = {
   orderType: 'MARKET' | 'LIMIT';
   limitPrice?: number;
   clientOrderId?: string;
+  expectedReturnPercent?: number;
   // optional reference market price used for execution simulation
   price?: number;
 };
@@ -65,6 +66,7 @@ export class AtlasPaperBrokerProvider implements BrokerProvider {
       side: order.side === 'BUY' ? 'Köp' : 'Sälj',
       quantity: order.quantity,
       price: order.orderType === 'LIMIT' ? order.limitPrice : (typeof order.price === 'number' ? order.price : undefined),
+      expectedReturnPercent: typeof order.expectedReturnPercent === 'number' && Number.isFinite(order.expectedReturnPercent) ? order.expectedReturnPercent : undefined,
     };
     // If this is a MARKET order and we have no reference price, reject to avoid default=100 bug
     if (order.orderType === 'MARKET' && (typeof engOrder.price !== 'number' || !isFinite(engOrder.price) || engOrder.price <= 0)){

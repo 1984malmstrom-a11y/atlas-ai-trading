@@ -3,6 +3,7 @@ import { vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { countSuccessfulExecutionsToday, runVictorTradingCycle } from './victor-trading-engine';
+import type { Order } from './paper-trading-engine';
 import { TRADABLE_UNIVERSE } from './tradable-universe';
 import { TwelveDataMarketDataProvider } from './market-providers';
 import { AtlasPaperBrokerProvider } from './broker-providers';
@@ -101,7 +102,7 @@ describe('victor audit counting', ()=>{
     const symbols = TRADABLE_UNIVERSE.slice(0,2).map(i=> (i.providerSymbol || i.name).toUpperCase());
     const origGetQuotes = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
     (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, expectedReturnPercent: i===0 ? 5 : undefined, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
     };
 
     // spy/patch broker placeOrder
@@ -137,7 +138,7 @@ describe('victor audit counting', ()=>{
     writeAudit([]);
     const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
     (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, expectedReturnPercent: i===0 ? 5 : undefined, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
     };
     origGetQuotes = origGQ;
 
@@ -164,7 +165,7 @@ describe('victor audit counting', ()=>{
     writeAudit([]);
     const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
     (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+      return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, expectedReturnPercent: i===0 ? 5 : undefined, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
     };
     origGetQuotes = origGQ;
 
@@ -184,7 +185,7 @@ describe('victor audit counting', ()=>{
       writeAudit([{ timestamp: new Date().toISOString(), executed: [ { proposal: {}, result: { status: 'EXECUTED' } } ] }]);
       const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
       (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-        return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        return ids.map((s:string, i:number)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: i===0 ? -2 : 2, expectedReturnPercent: i===0 ? 5 : undefined, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
       };
       origGetQuotes = origGQ;
 
@@ -212,23 +213,25 @@ describe('victor audit counting', ()=>{
 
     const price = 385.87;
     const qty = 10;
-    const order = { id: 'o_buy_1', symbol: 'MSFT', side: 'Köp', quantity: qty, price };
+    const order: Order = { id: 'o_buy_1', symbol: 'MSFT', side: 'Köp', quantity: qty, price };
+    order.expectedReturnPercent = 10;
     const res: any = eng.simulateExecution(order);
     expect(res.success).toBe(true);
     const tx = res.transaction;
-    // executedPrice should be based on provided price and not near 100
-    expect(tx.executedPrice).toBeGreaterThan(150);
-    expect(tx.executedPrice).toBeGreaterThanOrEqual(price);
-    // fee calculated from notional should be present
-    expect(tx.fee).toBeGreaterThan(0);
-    // cash should decrease by executedPrice*qty + fee
-    const expectedCash = portfolio.availableCash - (tx.executedPrice * qty + tx.fee);
-    expect(res.portfolio.availableCash).toBeCloseTo(expectedCash, 6);
-    // holding averagePrice should equal executedPrice for new holding
-    const holding = res.portfolio.holdings.find((h: any) => h.symbol === 'MSFT');
-    expect(holding).toBeTruthy();
-    expect(holding.averagePrice).toBeCloseTo(tx.executedPrice, 6);
-  });
+      // executedPrice should be based on provided price and not near 100
+      expect(tx.executedPrice).toBeGreaterThan(150);
+      expect(tx.executedPrice).toBeGreaterThanOrEqual(price);
+      // fee calculated from notional should be present
+      expect(tx.fee).toBeGreaterThan(0);
+      // cash should decrease by executedPrice*qty + fee
+      const expectedCash = portfolio.availableCash - (tx.executedPrice * qty + tx.fee);
+      expect(res.portfolio.availableCash).toBeCloseTo(expectedCash, 6);
+      // holding averagePrice should equal executedPrice for new holding
+      const holding = res.portfolio.holdings.find((h: any) => h.symbol === 'MSFT');
+      expect(holding).toBeTruthy();
+        expect(holding.averagePrice).toBeCloseTo(tx.executedPrice, 6);
+
+      });
 
   it('SELL MARKET with real quote executes near provided price and decreases holding', async ()=>{
     // Initial portfolio with existing holding
@@ -319,10 +322,10 @@ describe('victor audit counting', ()=>{
     // Deterministic slippage
     const rnd = vi.spyOn(Math, 'random').mockReturnValue(0.5);
 
-    // Mock market provider to return MSFT quote that produces BUY
+    // Mock market provider to return MSFT quote that produces BUY and include an explicit expectedReturnPercent (Victor analysis)
     const origGetQuotes = (Twelve as any).prototype.getQuotes;
     (Twelve as any).prototype.getQuotes = async function(ids: string[]){
-      return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 385.87, changePercent: -2.5, timestamp: new Date().toISOString(), source: 'twelve', isMock: false }));
+      return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 385.87, changePercent: -2.5, expectedReturnPercent: 42, timestamp: new Date().toISOString(), source: 'twelve', isMock: false }));
     };
 
     // Isolate portfolio: set a test path and seed portfolio in-memory via savePortfolio
@@ -362,6 +365,8 @@ describe('victor audit counting', ()=>{
     const proposal = (audit.proposals || []).find((p:any)=> p.request && p.request.symbol === 'MSFT');
     expect(proposal).toBeTruthy();
     expect(proposal.request.price).toBeCloseTo(385.87, 6);
+    // expectedReturnPercent must be forwarded unchanged from Victor's decision/analysis
+    expect(proposal.request.expectedReturnPercent).toBe(42);
 
     // executed entries may contain the proposal either as { request: {...} } or flattened { symbol: 'MSFT' }
     const executed = (audit.executed || []).find((e:any)=> e.proposal && ((e.proposal.request && e.proposal.request.symbol === 'MSFT') || e.proposal.symbol === 'MSFT'));
@@ -404,6 +409,34 @@ describe('victor audit counting', ()=>{
     rmSpy.mockRestore();
     restorePath();
   });
+
+    it('BUY without expectedReturnPercent creates no broker order', async ()=>{
+      const portfolioSvc = await import('../portfolio/portfolio-service');
+      const Twelve = TwelveDataMarketDataProvider as any;
+      const origGetQuotes = (Twelve as any).prototype.getQuotes;
+      (Twelve as any).prototype.getQuotes = async function(ids: string[]){
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 385.87, changePercent: -2.5, timestamp: new Date().toISOString(), source: 'twelve', isMock: false }));
+      };
+
+      // isolate portfolio
+      const tmpPath = `${process.cwd()}/src/data/portfolio.test2.json`;
+      const restorePath = portfolioSvc.__setPortfolioPathForTest(tmpPath);
+      const initial = { id: 'paper-test-2', baseCurrency: 'SEK', totalValue: 1000000, availableCash: 1000000, holdings: [] } as any;
+      await portfolioSvc.savePortfolio(initial);
+
+      const freshVictor = await import(`./victor-trading-engine?update=${Date.now()}`);
+      const mandate = { ...DEFAULT_PAPER_AUTO_MANDATE, mode: 'PAPER_AUTO', allowedInstrumentIds: ['microsoft'], maxTradesPerCycle: 1, maxOrderValueSek: 100000, minimumBuyConfidence: 0, allowAutomaticBuys: true } as any;
+      const res = await (freshVictor as any).runVictorTradingCycle({ mandate, trigger: 'TEST' } as any);
+      const audit = (res as any).report && (res as any).report.audit;
+      expect(audit).toBeTruthy();
+      // No proposals/executions should have been created because expectedReturnPercent was absent
+      const proposal = (audit.proposals || []).find((p:any)=> p.request && p.request.symbol === 'MSFT');
+      expect(proposal).toBeFalsy();
+      expect((audit.executed || []).length).toBe(0);
+
+      (Twelve as any).prototype.getQuotes = origGetQuotes;
+      restorePath();
+    });
 
   it('Broker rejects orders with invalid quantity (0, -1, NaN) using engine rejection reason', async ()=>{
     const portfolioSvc = await import('../portfolio/portfolio-service');
@@ -462,7 +495,7 @@ describe('victor audit counting', ()=>{
     const eng = new (PaperTradingEngine as any)(portfolio);
     const limitPrice = 123.45;
     const qty = 5;
-    const order = { id: 'o_limit_1', symbol: 'FOO', side: 'Köp', quantity: qty, price: limitPrice };
+    const order: Order = { id: 'o_limit_1', symbol: 'FOO', side: 'Köp', quantity: qty, price: limitPrice, expectedReturnPercent: 10 };
     const res: any = eng.simulateExecution(order);
     expect(res.success).toBe(true);
     expect(res.transaction.executedPrice).toBeGreaterThanOrEqual(limitPrice);
@@ -913,7 +946,7 @@ describe('victor audit counting', ()=>{
       vi.setSystemTime(new Date('2026-07-20T14:00:00-04:00'));
       const origGQ = (TwelveDataMarketDataProvider as any).prototype.getQuotes;
       (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, expectedReturnPercent: 5, timestamp: new Date().toISOString(), source: 'twelve-data', isStale: false }));
       };
 
       let placeCalls = 0;
@@ -947,7 +980,7 @@ describe('victor audit counting', ()=>{
       // timestamp just inside freshness (FRESH_MS - 1000)
       const tsInside = new Date(Date.now() - (FRESH_MS - 1000)).toISOString();
       (TwelveDataMarketDataProvider as any).prototype.getQuotes = async function(ids: string[]){
-        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, timestamp: tsInside, source: 'twelve-data', isStale: false }));
+        return ids.map((s:string)=> ({ symbol: s.toUpperCase(), price: 100, changePercent: -2, expectedReturnPercent: 5, timestamp: tsInside, source: 'twelve-data', isStale: false }));
       };
 
       let placeCalls = 0;

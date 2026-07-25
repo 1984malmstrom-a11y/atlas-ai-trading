@@ -8,6 +8,7 @@ export type Order = {
   side: 'Köp' | 'Sälj';
   quantity: number;
   price?: number; // limit or executed
+  expectedReturnPercent?: number;
 }
 
 export type Execution = {
@@ -67,6 +68,11 @@ export class PaperTradingEngine {
     const original = this.portfolio;
     let lastRiskReport: { score: number; level: 'LOW'|'MEDIUM'|'HIGH'; reasons: string[] } | undefined = undefined;
     let evaluationObj: { pnlSek: number; pnlPercent: number; winner: boolean } | undefined = undefined;
+    // intermediate vars for BUY adjustments
+    let tentativeQty: number = 0;
+    let confidenceAdjustedNotional: number = NaN;
+    let existingMarketValue: number = 0;
+    let decisionRiskReport: any = null;
 
     // SELL checks
     if (order.side === 'Sälj') {
@@ -78,48 +84,102 @@ export class PaperTradingEngine {
 
     // BUY checks
     if (order.side === 'Köp') {
-      // Run risk engine first
+      // Validate expectedReturnPercent provided by Victor via typed order flow
+      if (!Number.isFinite((order as any).expectedReturnPercent)) {
+        return { success: false, code: 'INVALID_QUANTITY', message: 'Missing or invalid expectedReturnPercent', portfolio: original };
+      }
+      const expectedReturnPercent = (order as any).expectedReturnPercent as number;
+
+      // Run decision engine first, passing through expectedReturnPercent
       const decisionResult = evaluateDecision({
         portfolio: { availableCash: original.availableCash, totalValue: original.totalValue, holdings: original.holdings.map(h => ({ symbol: h.symbol, quantity: h.quantity, currentPrice: h.currentPrice, marketValue: h.marketValue })) },
         decision: { side: 'BUY', symbol: order.symbol, quantity: order.quantity, notional },
         todaysTradeCount: 0,
+        expectedReturnPercent,
       });
 
       const riskReport = decisionResult.risk;
+      decisionRiskReport = riskReport;
 
       if (!riskReport.allowed) {
-        // If the only reason for denial is SIGNAL_HOLD, treat as non-blocking for this demo engine
-        // (keeps backward-compatible behavior for small demo buys in tests).
-        const onlyHold = Array.isArray(riskReport.reasons) && riskReport.reasons.length === 1 && riskReport.reasons[0] === 'SIGNAL_HOLD';
-        if (!onlyHold){
-          // map some common reasons to failure codes; use POSITION_LIMIT_EXCEEDED as default
-          let code: FailureCode = 'POSITION_LIMIT_EXCEEDED';
-          if (riskReport.reasons.includes('INSUFFICIENT_CASH')) code = 'INSUFFICIENT_CASH';
-          if (riskReport.reasons.includes('INVALID_RISK_INPUT')) code = 'INVALID_QUANTITY';
-          return { success: false, code, message: 'Blocked by risk engine', portfolio: original, risk: { score: riskReport.score, level: riskReport.level, reasons: riskReport.reasons } };
-        }
+        // Deny BUY when risk engine indicates not allowed (including SIGNAL_HOLD).
+        let code: FailureCode = 'POSITION_LIMIT_EXCEEDED';
+        if (riskReport.reasons.includes('INSUFFICIENT_CASH')) code = 'INSUFFICIENT_CASH';
+        if (riskReport.reasons.includes('INVALID_RISK_INPUT')) code = 'INVALID_QUANTITY';
+        return { success: false, code, message: 'Blocked by risk engine', portfolio: original, risk: { score: riskReport.score, level: riskReport.level, reasons: riskReport.reasons } };
       }
 
       lastRiskReport = { score: riskReport.score, level: riskReport.level, reasons: riskReport.reasons };
 
-      const existingMarketValue = original.holdings.find(h => h.symbol === order.symbol)?.marketValue || 0;
-      const projectedMarketValue = notional + existingMarketValue;
+      existingMarketValue = original.holdings.find(h => h.symbol === order.symbol)?.marketValue || 0;
+
+      // Use confidence-adjusted notional from risk.positionSizing when available
+      confidenceAdjustedNotional = riskReport.positionSizing && typeof riskReport.positionSizing.confidenceAdjustedNotional === 'number' ? Number(riskReport.positionSizing.confidenceAdjustedNotional) : NaN;
+
+      const baselinePrice = marketPrice;
+      const requestedQty = Number.isFinite(order.quantity as number) ? Number(order.quantity) : Infinity;
+      if (Number.isFinite(confidenceAdjustedNotional)) {
+        if (confidenceAdjustedNotional > 0) {
+          const maxQtyByConfidence = confidenceAdjustedNotional / baselinePrice;
+          tentativeQty = Math.max(0, Math.min(requestedQty, maxQtyByConfidence));
+        } else {
+          // explicit zero or negative sized notional -> deny
+          return { success: false, code: 'INVALID_QUANTITY', message: 'Blocked by position sizing (invalid adjusted notional)', portfolio: original, risk: lastRiskReport };
+        }
+      } else {
+        // missing/undefined sizing -> deny
+        return { success: false, code: 'INVALID_QUANTITY', message: 'Blocked by position sizing (missing adjusted notional)', portfolio: original, risk: lastRiskReport };
+      }
+      if (tentativeQty <= 0) {
+        return { success: false, code: 'INVALID_QUANTITY', message: 'Blocked by position sizing (zero quantity)', portfolio: original, risk: lastRiskReport };
+      }
+
+      // We'll re-evaluate affordability and position limits after computing the actual executedPrice (with slippage and fees)
+    }
+
+    // At this point compute final BUY quantities/notional based on tentativeQty and the actual executedPrice/slippage
+    let finalQty = order.quantity;
+    let finalNotional = notional;
+    let finalFee = fee;
+    if (order.side === 'Köp'){
+      // tentativeQty was computed above; use executedPrice to compute notional
+      // Note: executedPrice was computed earlier (marketPrice +/- slippage)
+      // Recompute tentative notional and cap by confidenceAdjustedNotional
+      const recomputedNotional = tentativeQty * executedPrice;
+      const cappedNotional = (Number.isFinite(confidenceAdjustedNotional) && confidenceAdjustedNotional > 0) ? Math.min(recomputedNotional, confidenceAdjustedNotional) : recomputedNotional;
+      finalQty = Math.max(0, cappedNotional / executedPrice);
+      finalNotional = finalQty * executedPrice;
+      finalFee = Math.abs(finalNotional) * this.feePercent;
+
+      // Ensure final cost fits available cash; if not, reduce quantity
+      const cost = finalNotional + finalFee;
+      if (cost > original.availableCash){
+        const maxAffordableQty = original.availableCash / (executedPrice * (1 + this.feePercent));
+        finalQty = Math.min(finalQty, maxAffordableQty);
+        finalNotional = finalQty * executedPrice;
+        finalFee = Math.abs(finalNotional) * this.feePercent;
+      }
+
+      // Check position limit with finalNotional
+      const projectedMarketValue = finalNotional + existingMarketValue;
       if (!this.evaluatePositionLimit(projectedMarketValue)) return { success: false, code: 'POSITION_LIMIT_EXCEEDED', message: 'Positionsgräns överskrids', portfolio: original, risk: lastRiskReport };
-      const cost = notional + fee;
-      if (cost > original.availableCash) return { success: false, code: 'INSUFFICIENT_CASH', message: 'Otillräckligt saldo', portfolio: original, risk: lastRiskReport };
+
+      if (!Number.isFinite(finalQty) || finalQty <= 0){
+        return { success: false, code: 'INVALID_QUANTITY', message: 'Blocked by position sizing (no affordable quantity)', portfolio: original, risk: lastRiskReport };
+      }
     }
 
     // Build new immutable portfolio
     const newPortfolio: Portfolio = JSON.parse(JSON.stringify(original));
 
     if (order.side === 'Köp') {
-      // deduct cash
-      newPortfolio.availableCash = Math.max(0, newPortfolio.availableCash - (notional + fee));
-      // merge or add holding
+      // deduct cash using final notional and fee
+      newPortfolio.availableCash = Math.max(0, newPortfolio.availableCash - (finalNotional + finalFee));
+      // merge or add holding using finalQty
       const existing = newPortfolio.holdings.find(h => h.symbol === order.symbol);
       if (existing) {
-        const newQty = existing.quantity + order.quantity;
-        existing.averagePrice = ((existing.averagePrice * existing.quantity) + (executedPrice * order.quantity)) / newQty;
+        const newQty = existing.quantity + finalQty;
+        existing.averagePrice = ((existing.averagePrice * existing.quantity) + (executedPrice * finalQty)) / newQty;
         existing.quantity = newQty;
         existing.currentPrice = executedPrice;
         existing.marketValue = existing.quantity * existing.currentPrice;
@@ -129,10 +189,10 @@ export class PaperTradingEngine {
           symbol: order.symbol,
           name: order.symbol,
           assetType: 'Stock',
-          quantity: order.quantity,
+          quantity: finalQty,
           averagePrice: executedPrice,
           currentPrice: executedPrice,
-          marketValue: order.quantity * executedPrice,
+          marketValue: finalQty * executedPrice,
           unrealizedPnl: 0,
           unrealizedPnlPercent: 0,
           portfolioWeight: 0,
@@ -159,7 +219,7 @@ export class PaperTradingEngine {
     // Recalculate total value
     newPortfolio.totalValue = newPortfolio.holdings.reduce((s, it) => s + it.marketValue, 0) + newPortfolio.availableCash;
 
-    const transaction: Execution = { orderId: order.id, executedPrice, quantity: order.quantity, fee };
+    const transaction: Execution = { orderId: order.id, executedPrice, quantity: order.side === 'Köp' ? finalQty : order.quantity, fee: order.side === 'Köp' ? finalFee : fee };
     // attach evaluation object if we computed one above
     try{
       if (typeof evaluationObj !== 'undefined' && evaluationObj !== null){
