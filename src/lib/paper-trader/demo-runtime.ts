@@ -9,6 +9,8 @@ import { combineAnalyses } from './analysis-aggregator';
 import estimateExpectedReturn from './expected-return';
 import fs from 'fs';
 import path from 'path';
+import computeNextPortfolioState from './portfolio-mutation';
+import { Portfolio } from '../../domain/portfolio/types';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
 
@@ -160,8 +162,8 @@ function createInMemoryPortfolioAdapter(initialCash: number){
   const PORTFOLIO_PATH = path.join(process.cwd(), 'src', 'data', 'portfolio.json');
 
   // initialize state from file if exists, otherwise default
-  let state = {
-    id: 'demo', baseCurrency: 'SEK', totalValue: initialCash, availableCash: initialCash, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: [] as any[]
+  let state: Portfolio = {
+    id: 'demo', baseCurrency: 'SEK', totalValue: initialCash, availableCash: initialCash, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: []
   };
 
   try{
@@ -195,23 +197,8 @@ function createInMemoryPortfolioAdapter(initialCash: number){
   return {
     getPortfolio: async ()=> JSON.parse(JSON.stringify(state)),
     applyExecution: async (exec: SimulatedExecution)=>{
-      const before = JSON.parse(JSON.stringify(state));
-      const sym = exec.symbol.toUpperCase();
-      if (exec.side === 'BUY'){
-        state.availableCash = Math.round((state.availableCash - exec.notional - exec.fee) * 100)/100;
-        let found = state.holdings.find((h:any)=> h.symbol === sym);
-        if (found){ found.quantity += exec.quantity; found.currentPrice = exec.executedPrice; found.marketValue = Math.round(found.quantity * found.currentPrice * 100)/100; }
-        else { state.holdings.push({ id: `h_${sym}`, symbol: sym, name: sym, assetType: 'Stock', quantity: exec.quantity, averagePrice: exec.executedPrice, currentPrice: exec.executedPrice, marketValue: Math.round(exec.quantity * exec.executedPrice * 100)/100, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 }); }
-      } else {
-        const found = state.holdings.find((h:any)=> h.symbol === sym);
-        const sellQty = Math.min(found ? found.quantity : 0, exec.quantity);
-        const proceeds = Math.round(sellQty * exec.executedPrice * 100)/100;
-        state.availableCash = Math.round((state.availableCash + proceeds - exec.fee) * 100)/100;
-        if (found){ found.quantity = Math.round((found.quantity - sellQty) * 100)/100; found.currentPrice = exec.executedPrice; found.marketValue = Math.round(found.quantity * found.currentPrice * 100)/100; if(found.quantity<=0) state.holdings = state.holdings.filter((h:any)=> h!==found); }
-      }
-      const mv = state.holdings.reduce((s:any,h:any)=> s + (h.marketValue||0), 0);
-      state.totalValue = Math.round((state.availableCash + mv) * 100)/100;
-      // persist after each execution synchronously
+      const nextPortfolio = computeNextPortfolioState(state, exec);
+      state = nextPortfolio;
       persist();
       return JSON.parse(JSON.stringify(state));
     }
