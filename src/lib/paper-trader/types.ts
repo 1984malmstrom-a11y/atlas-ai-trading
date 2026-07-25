@@ -11,6 +11,7 @@ export type PaperTradeDecision = {
   generatedAt: string;
   reasoning?: string[];
   requestedNotionalSek?: number;
+  risk?: RiskReport;
 };
 
 export type PaperTraderConfig = {
@@ -125,6 +126,64 @@ export type DecisionResult = {
   code?: string;
   message?: string;
   execution?: SimulatedExecution | null;
+};
+
+export type RiskReport = {
+  allowed: boolean;
+  score: number; // 0-100
+  level: 'LOW' | 'MEDIUM' | 'HIGH';
+  reasons: string[];
+  recommendedNotional?: number;
+  exposure?: {
+    largestHoldingPercent: number;
+    totalInvestedPercent: number;
+    cashPercent: number;
+  };
+  diversification?: {
+    holdingCount: number;
+    concentrationScore: number;
+    isConcentrated: boolean;
+  };
+  positionSizing?: {
+    recommendedNotional: number;
+    confidenceAdjustedNotional: number;
+  };
+  drawdown?: {
+    drawdownPercent: number;
+    isDrawdownWarning: boolean;
+    isDrawdownCritical: boolean;
+  };
+};
+
+export type TradeEvaluation = {
+  pnlSek: number;
+  pnlPercent: number;
+  winner: boolean;
+};
+
+export type PerformanceSummary = {
+  totalTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  breakEvenTrades: number;
+  winRatePercent: number;
+  totalPnlSek: number;
+  averagePnlSek: number;
+  averageWinnerSek: number;
+  averageLoserSek: number;
+  profitFactor: number | null;
+  expectancySek: number;
+};
+
+export type PerformanceReflection = {
+  status: 'INSUFFICIENT_DATA' | 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE';
+  confidenceMultiplier: number;
+  reasons: string[];
+};
+
+export type PerformanceProfile = {
+  summary: PerformanceSummary;
+  reflection: PerformanceReflection;
 };
 
 export type CycleResult = {

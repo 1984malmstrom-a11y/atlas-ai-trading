@@ -8,6 +8,29 @@ describe('RiskEngine basic rules', ()=>{
     const res = evaluateRisk({ portfolio, decision, maxPositionPercent: 0.10 });
     expect(res.allowed).toBe(false);
     expect(res.reasons).toContain('POSITION_SIZE_EXCEEDS_LIMIT');
+    // score: 100 - 40 = 60 -> MEDIUM
+    expect(res.score).toBe(60);
+    expect(res.level).toBe('MEDIUM');
+  });
+
+  it('applies cash-after-buy penalty correctly', ()=>{
+    const portfolio = { availableCash: 15000, totalValue: 100000, holdings: [] };
+    const decision = { side: 'BUY' as const, symbol: 'CASH', requestedNotionalSek: 6000 };
+    const res = evaluateRisk({ portfolio, decision });
+    // cashAfter = 9000 < 10000 -> -30 => score 70 -> MEDIUM
+    expect(res.score).toBe(70);
+    expect(res.level).toBe('MEDIUM');
+    expect(res.allowed).toBe(true);
+  });
+
+  it('applies todaysTradeCount >=80% penalty correctly', ()=>{
+    const portfolio = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    const decision = { side: 'BUY' as const, symbol: 'T80', requestedNotionalSek: 100 };
+    const res = evaluateRisk({ portfolio, decision, todaysTradeCount: 4, dailyTradeLimit: 5 });
+    // todaysTradeCount 4 >= 0.8*5 => -20 => score 80 -> LOW
+    expect(res.score).toBe(80);
+    expect(res.level).toBe('LOW');
+    expect(res.allowed).toBe(true);
   });
 
   it('rejects when daily trade limit reached', ()=>{

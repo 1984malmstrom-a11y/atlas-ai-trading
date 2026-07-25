@@ -1,5 +1,9 @@
 import createPaperTrader from './engine';
 import { PaperTraderConfig, PaperTradeDecision, SimulatedExecution, AuditEntry } from './types';
+import { calculatePerformance } from './performance-analytics';
+import { evaluatePerformanceReflection } from './reflection-engine';
+import * as DecisionEngine from './decision-engine';
+import { evaluateTrade } from './trade-evaluation';
 import analyzePriceSeries from './technical';
 import { combineAnalyses } from './analysis-aggregator';
 import fs from 'fs';
@@ -110,7 +114,8 @@ class FileAuditStore {
       confidence: decision && typeof decision.confidence === 'number' ? decision.confidence : null,
       referencePrice: decision && typeof decision.referencePrice === 'number' ? decision.referencePrice : null,
       quoteTimestamp: decision && (decision.generatedAt || null),
-      risks: decision && (decision.risks || decision.reasoning) || null,
+      // Prefer an explicit `risk` object on the decision/execution if present. Reuse as-is.
+      risks: (decision && (decision as any).risk) ? (decision as any).risk : (exec && (exec as any).risk) ? (exec as any).risk : (decision && (decision.risks || decision.reasoning)) || null,
       executionStatus: exec && exec.status ? exec.status : (exec ? 'EXECUTED' : null),
       executedPrice: exec && typeof exec.executedPrice === 'number' ? exec.executedPrice : null,
       quantity: exec && typeof exec.quantity === 'number' ? exec.quantity : null,
@@ -523,6 +528,44 @@ export async function getPaperTradingState(){
   return out;
 }
 
+export async function getPerformanceSummary(){
+  // Read all audits and extract valid TradeEvaluation objects from EVALUATION entries
+  try{
+    const all = await auditStore.list();
+    const evals: any[] = [];
+    for (const item of Array.isArray(all) ? all : []){
+      try{
+        const raw = (item && (item as any).raw) ? (item as any).raw : item;
+        if (!raw || raw.kind !== 'EVALUATION') continue;
+        // possible locations: raw.evaluation or raw.execution.evaluation
+        const candidate = raw.evaluation || (raw.execution && raw.execution.evaluation) || null;
+        if (!candidate) continue;
+        const pnlSek = Number(candidate.pnlSek);
+        const pnlPercent = Number(candidate.pnlPercent);
+        const winner = candidate.winner === true || candidate.winner === false ? Boolean(candidate.winner) : null;
+        if (!Number.isFinite(pnlSek) || !Number.isFinite(pnlPercent) || typeof winner !== 'boolean') continue;
+        evals.push({ pnlSek, pnlPercent, winner });
+      }catch(_){ continue; }
+    }
+    return calculatePerformance(evals as any);
+  }catch(_){
+    return calculatePerformance([]);
+  }
+}
+
+export async function getPerformanceProfile(){
+  try{
+    const summary = await getPerformanceSummary();
+    const reflection = evaluatePerformanceReflection(summary);
+    return { summary, reflection };
+  }catch(_){
+    // On error, return an insufficient-data style profile
+    const summary = await getPerformanceSummary();
+    const reflection = evaluatePerformanceReflection(summary);
+    return { summary, reflection };
+  }
+}
+
 async function fetchQuotes(){
   // Prefer calling the server-side normalization function directly when available
   try{
@@ -555,7 +598,7 @@ async function fetchQuotes(){
   }catch(e){ return null; }
 }
 
-export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: boolean, overrideUniverse?: { quotes?: any[], portfolio?: any, fundamentals?: Record<string, any> } }){
+export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: boolean, overrideUniverse?: { quotes?: any[], portfolio?: any, fundamentals?: Record<string, any> }, getPerformanceProfileOverride?: ()=>Promise<any> }){
   // Prevent overlapping with automatic scheduler when called externally
   try{
     const sched = getGlobalScheduler();
@@ -573,6 +616,17 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   let _beforeEvalCount = 0;
   try{ const _beforeList = await auditStore.list(); _beforeEvalCount = Array.isArray(_beforeList) ? _beforeList.filter((a:any)=> a && a.raw && a.raw.kind === 'EVALUATION').length : 0; }catch(_){ _beforeEvalCount = 0; }
   const portfolio = opts && opts.overrideUniverse && opts.overrideUniverse.portfolio ? opts.overrideUniverse.portfolio : await portfolioAdapter.getPortfolio();
+  // Fetch performance profile once per cycle. If an override is provided use it (tests),
+  // otherwise call the regular `getPerformanceProfile`. If it fails, continue without reflection.
+  let profile: any = null;
+  try{
+    if (opts && typeof opts.getPerformanceProfileOverride === 'function'){
+      profile = await opts.getPerformanceProfileOverride();
+    } else {
+      profile = await getPerformanceProfile();
+    }
+  }catch(_){ profile = null; }
+  const perCycleReflection = profile && profile.reflection ? profile.reflection : undefined;
   const plannedSymbols = new Set<string>();
   // Per-cycle in-memory promise-map to dedupe historical calls within a single cycle.
   // Store Promises (not resolved data) so concurrent requests for the same symbol
@@ -660,8 +714,23 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' }) } as any); }catch(_){ }
       }
       if (evalRes.action === 'SELL'){
-        plannedSymbols.add(symbol);
-        candidates.push({ id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: 100, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0) });
+          plannedSymbols.add(symbol);
+          // Ask Decision Engine for final decision (include per-cycle reflection)
+          try{
+            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection } as any;
+            const decRes = DecisionEngine.evaluateDecision(decInput);
+            const cand = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0) } as any;
+            // attach risk and reflection for auditability (reuse same reflection object)
+            cand.risk = decRes.risk;
+            if (perCycleReflection) cand.performanceReflection = perCycleReflection;
+            candidates.push(cand);
+          }catch(e:any){
+            // On decision engine error: append a REJECT audit and skip this candidate
+            try{
+              await auditStore.append({ kind: 'REJECT', decision: { id: `rej_dec_${symbol}_${Date.now()}`, symbol, action: 'SELL' }, reason: { code: 'DECISION_ENGINE_ERROR', message: String(e && e.message ? e.message : e) }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any);
+            }catch(_){ }
+            continue;
+          }
       }
     }
   }
@@ -725,7 +794,20 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           // on history error, log unavailable status but continue
           try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) } } as any); }catch(_){ }
         }
-        candidates.push({ id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: 80, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000 });
+        try{
+          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection } as any;
+          const decRes = DecisionEngine.evaluateDecision(decInput);
+          const cand = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000 } as any;
+          cand.risk = decRes.risk;
+          if (perCycleReflection) cand.performanceReflection = perCycleReflection;
+          candidates.push(cand);
+        }catch(e:any){
+          // On decision engine error: append a REJECT audit and skip this candidate
+          try{
+            await auditStore.append({ kind: 'REJECT', decision: { id: `rej_dec_${s}_${Date.now()}`, symbol: s, action: 'BUY' }, reason: { code: 'DECISION_ENGINE_ERROR', message: String(e && e.message ? e.message : e) }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any);
+          }catch(_){ }
+          continue;
+        }
       } else {
         // create a lightweight evaluation audit for visibility and attach centralized technical analysis
         try{
@@ -794,8 +876,49 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       continue;
     }
 
+    // Capture portfolio snapshot before attempting execution so we can compute cost-basis
+    const beforeExecutionPortfolio = await portfolioAdapter.getPortfolio();
     const res = await runtime.trader.handleDecision(cand as any);
     if (res && res.accepted){
+      // attempt to compute trade evaluation for SELLs that fully close a position
+      try{
+        const exec = (res as any).execution || (res as any).transaction || null;
+        if (exec && String((exec as any).side || cand.action).toUpperCase() === 'SELL'){
+          // fetch portfolio after execution to detect closure
+          const afterExecutionPortfolio = await portfolioAdapter.getPortfolio();
+          const sym = String(cand.symbol || '').toUpperCase();
+          const stillHolding = Array.isArray(afterExecutionPortfolio.holdings) && afterExecutionPortfolio.holdings.find((h:any)=> String(h.symbol||'').toUpperCase() === sym);
+          if (!stillHolding){
+            // position closed: compute cost-basis from beforeExecutionPortfolio
+            const beforeHolding = Array.isArray(beforeExecutionPortfolio.holdings) ? beforeExecutionPortfolio.holdings.find((h:any)=> String(h.symbol||'').toUpperCase() === sym) : null;
+            const entryPrice = beforeHolding && typeof beforeHolding.averagePrice === 'number' ? Number(beforeHolding.averagePrice) : null;
+            const exitPrice = typeof (exec as any).executedPrice === 'number' ? Number((exec as any).executedPrice) : null;
+            const qty = typeof (exec as any).quantity === 'number' ? Number((exec as any).quantity) : null;
+            if (entryPrice !== null && exitPrice !== null && qty !== null){
+              const evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
+              // attach evaluation object to execution returned to caller
+              try{ (exec as any).evaluation = evaluation; }catch(_){ }
+              // find the appended EXECUTION audit in the FileAuditStore and mutate its raw.execution to include the same evaluation object (reuse reference)
+              try{
+                const entries = (auditStore as any).entries as any[] | undefined;
+                if (Array.isArray(entries)){
+                  for (let i = entries.length - 1; i >= 0; i--){
+                    const it = entries[i];
+                    if (it && it.raw && it.raw.kind === 'EXECUTION' && it.raw.execution && it.raw.execution.id === exec.id){
+                      try{ (it.raw.execution as any).evaluation = evaluation; }catch(_){ }
+                      break;
+                    }
+                  }
+                }
+              }catch(_){ }
+              // append a dedicated EVALUATION audit that reuses the same evaluation object
+              try{
+                await auditStore.append({ kind: 'EVALUATION', decision: cand, execution: exec, evaluation, portfolioBefore: beforeExecutionPortfolio, portfolioAfter: afterExecutionPortfolio, timestamp: nowIso(), meta: { automatic: true } } as any);
+              }catch(_){ }
+            }
+          }
+        }
+      }catch(_){ }
       // record executed side counts but continue processing other symbols
       if (cand.action === 'BUY') executedBuy++;
       if (cand.action === 'SELL') executedSell++;
@@ -1032,7 +1155,44 @@ export async function setPaperTradingEnabled(enabled: boolean){
 
 export async function executePaperTradeDecision(decision: PaperTradeDecision){
   runtime.latestDecision = decision;
+  // capture before snapshot
+  const beforeExecutionPortfolio = await portfolioAdapter.getPortfolio();
   const res = await runtime.trader.handleDecision(decision as any);
+  // If executed and SELL that closes a position, compute and attach evaluation and update audit
+  try{
+    if (res && (res as any).accepted){
+      const exec = (res as any).execution || (res as any).transaction || null;
+      if (exec && String((exec as any).side || decision.action).toUpperCase() === 'SELL'){
+        const afterExecutionPortfolio = await portfolioAdapter.getPortfolio();
+        const sym = String(decision.symbol || '').toUpperCase();
+        const stillHolding = Array.isArray(afterExecutionPortfolio.holdings) && afterExecutionPortfolio.holdings.find((h:any)=> String(h.symbol||'').toUpperCase() === sym);
+        if (!stillHolding){
+          const beforeHolding = Array.isArray(beforeExecutionPortfolio.holdings) ? beforeExecutionPortfolio.holdings.find((h:any)=> String(h.symbol||'').toUpperCase() === sym) : null;
+          const entryPrice = beforeHolding && typeof beforeHolding.averagePrice === 'number' ? Number(beforeHolding.averagePrice) : null;
+          const exitPrice = typeof (exec as any).executedPrice === 'number' ? Number((exec as any).executedPrice) : null;
+          const qty = typeof (exec as any).quantity === 'number' ? Number((exec as any).quantity) : null;
+          if (entryPrice !== null && exitPrice !== null && qty !== null){
+            const evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
+            try{ (exec as any).evaluation = evaluation; }catch(_){ }
+            try{
+              const entries = (auditStore as any).entries as any[] | undefined;
+              if (Array.isArray(entries)){
+                for (let i = entries.length - 1; i >= 0; i--){
+                  const it = entries[i];
+                  if (it && it.raw && it.raw.kind === 'EXECUTION' && it.raw.execution && it.raw.execution.id === exec.id){
+                    try{ (it.raw.execution as any).evaluation = evaluation; }catch(_){ }
+                    break;
+                  }
+                }
+              }
+            }catch(_){ }
+            try{ await auditStore.append({ kind: 'EVALUATION', decision, execution: exec, evaluation, portfolioBefore: beforeExecutionPortfolio, portfolioAfter: afterExecutionPortfolio, timestamp: nowIso(), meta: { automatic: true } } as any); }catch(_){ }
+          }
+        }
+      }
+    }
+  }catch(_){ }
+
   // update lightweight runtime state for observability
   runtime.latestCycle = res && (res as any).accepted ? { processedCandidates: 1, executed: 1, rejects: 0 } : { processedCandidates: 1, executed: 0, rejects: 1 } as any;
   runtime.latestDecision = decision;
@@ -1053,4 +1213,4 @@ try{
   }
 }catch(e){}
 
-export default { getPaperTradingState, runManualPaperTradingCycle, setPaperTradingEnabled };
+export default { getPaperTradingState, runManualPaperTradingCycle, setPaperTradingEnabled, getPerformanceSummary, getPerformanceProfile };
