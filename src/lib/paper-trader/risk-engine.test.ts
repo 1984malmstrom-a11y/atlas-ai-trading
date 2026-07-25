@@ -1,0 +1,90 @@
+import { describe, it, expect } from 'vitest';
+import { evaluateRisk, PortfolioSnapshot, TradeDecision } from './risk-engine';
+
+describe('RiskEngine basic rules', ()=>{
+  it('rejects when position would exceed 10% cap', ()=>{
+    const portfolio = { availableCash: 100000, totalValue: 100000, holdings: [{ symbol: 'ABC', quantity: 10, currentPrice: 500, marketValue: 5000 }] };
+    const decision = { side: 'BUY' as const, symbol: 'ABC', requestedNotionalSek: 6000 };
+    const res = evaluateRisk({ portfolio, decision, maxPositionPercent: 0.10 });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('POSITION_SIZE_EXCEEDS_LIMIT');
+  });
+
+  it('rejects when daily trade limit reached', ()=>{
+    const portfolio = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    const decision = { side: 'BUY' as const, symbol: 'XYZ', requestedNotionalSek: 1000 };
+    const res = evaluateRisk({ portfolio, decision, todaysTradeCount: 5, dailyTradeLimit: 5 });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('DAILY_TRADE_LIMIT_REACHED');
+  });
+
+  it('rejects when cash insufficient', ()=>{
+    const portfolio = { availableCash: 500, totalValue: 100000, holdings: [] };
+    const decision = { side: 'BUY' as const, symbol: 'XYZ', requestedNotionalSek: 1000 };
+    const res = evaluateRisk({ portfolio, decision });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('INSUFFICIENT_CASH');
+  });
+
+  it('allows when all rules pass', ()=>{
+    const portfolio = { availableCash: 100000, totalValue: 100000, holdings: [{ symbol: 'AAA', quantity: 1, currentPrice: 100, marketValue: 100 }] };
+    const decision = { side: 'BUY' as const, symbol: 'AAA', requestedNotionalSek: 5000 };
+    const res = evaluateRisk({ portfolio, decision, todaysTradeCount: 0, dailyTradeLimit: 5 });
+    expect(res.allowed).toBe(true);
+    expect(res.reasons.length).toBe(0);
+  });
+
+  it('rejects BUY without a valid notional (and no quantity/refPrice)', ()=>{
+    const portfolio: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    const decision: TradeDecision = { side: 'BUY', symbol: 'NOP' };
+    const res = evaluateRisk({ portfolio, decision });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('INVALID_RISK_INPUT');
+  });
+
+  it('uses quantity * referencePrice when notional missing', ()=>{
+    const portfolio: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    const decision: TradeDecision = { side: 'BUY', symbol: 'QRP', quantity: 10, referencePrice: 100 };
+    const res = evaluateRisk({ portfolio, decision });
+    // computed notional = 1000, within caps and cash available
+    expect(res.allowed).toBe(true);
+    expect(res.reasons.length).toBe(0);
+  });
+
+  it('rejects when portfolio numbers are NaN or negative', ()=>{
+    const bad1: PortfolioSnapshot = { availableCash: NaN, totalValue: 100000, holdings: [] };
+    const decision: TradeDecision = { side: 'BUY', symbol: 'X', requestedNotionalSek: 100 };
+    const r1 = evaluateRisk({ portfolio: bad1, decision });
+    expect(r1.allowed).toBe(false);
+    expect(r1.reasons).toContain('INVALID_RISK_INPUT');
+
+    const bad2: PortfolioSnapshot = { availableCash: 1000, totalValue: -1, holdings: [] };
+    const r2 = evaluateRisk({ portfolio: bad2, decision });
+    expect(r2.allowed).toBe(false);
+    expect(r2.reasons).toContain('INVALID_RISK_INPUT');
+  });
+
+  it('rejects when maxPositionPercent is NaN', ()=>{
+    const portfolio: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    const decision: TradeDecision = { side: 'BUY', symbol: 'M', requestedNotionalSek: 100 };
+    const res = evaluateRisk({ portfolio, decision, maxPositionPercent: NaN });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('INVALID_RISK_INPUT');
+  });
+
+  it('rejects when todaysTradeCount is negative', ()=>{
+    const portfolio: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    const decision: TradeDecision = { side: 'BUY', symbol: 'T', requestedNotionalSek: 100 };
+    const res = evaluateRisk({ portfolio, decision, todaysTradeCount: -1 });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('INVALID_RISK_INPUT');
+  });
+
+  it('rejects when existing holding has invalid marketValue', ()=>{
+    const portfolio: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [{ symbol: 'BAD', quantity: 1, marketValue: NaN }] };
+    const decision: TradeDecision = { side: 'BUY', symbol: 'BAD', requestedNotionalSek: 10 };
+    const res = evaluateRisk({ portfolio, decision });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('INVALID_RISK_INPUT');
+  });
+});
