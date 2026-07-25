@@ -930,9 +930,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             const exitPrice = typeof (exec as any).executedPrice === 'number' ? Number((exec as any).executedPrice) : null;
             const qty = typeof (exec as any).quantity === 'number' ? Number((exec as any).quantity) : null;
             if (entryPrice !== null && exitPrice !== null && qty !== null){
-              const evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
-              // attach evaluation object to execution returned to caller
-              try{ (exec as any).evaluation = evaluation; }catch(_){ }
+              // Prefer an existing evaluation object on the execution if it looks valid; otherwise compute a fallback
+              let evaluation: any = null;
+              try{
+                const existing = (exec as any).evaluation;
+                if (existing && typeof existing.pnlSek === 'number' && typeof existing.pnlPercent === 'number' && (existing.winner === true || existing.winner === false)){
+                  evaluation = existing;
+                }
+              }catch(_){ /* ignore */ }
+              if (!evaluation){
+                evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
+                try{ (exec as any).evaluation = evaluation; }catch(_){ }
+              }
               // find the appended EXECUTION audit in the FileAuditStore and mutate its raw.execution to include the same evaluation object (reuse reference)
               try{
                 const entries = (auditStore as any).entries as any[] | undefined;
@@ -1207,8 +1216,18 @@ export async function executePaperTradeDecision(decision: PaperTradeDecision){
           const exitPrice = typeof (exec as any).executedPrice === 'number' ? Number((exec as any).executedPrice) : null;
           const qty = typeof (exec as any).quantity === 'number' ? Number((exec as any).quantity) : null;
           if (entryPrice !== null && exitPrice !== null && qty !== null){
-            const evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
-            try{ (exec as any).evaluation = evaluation; }catch(_){ }
+            // Prefer an existing evaluation object on the execution if it looks valid; otherwise compute a fallback
+            let evaluation: any = null;
+            try{
+              const existing = (exec as any).evaluation;
+              if (existing && typeof existing.pnlSek === 'number' && typeof existing.pnlPercent === 'number' && (existing.winner === true || existing.winner === false)){
+                evaluation = existing;
+              }
+            }catch(_){ /* ignore */ }
+            if (!evaluation){
+              evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
+              try{ (exec as any).evaluation = evaluation; }catch(_){ }
+            }
             try{
               const entries = (auditStore as any).entries as any[] | undefined;
               if (Array.isArray(entries)){
