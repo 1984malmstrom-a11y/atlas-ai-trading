@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import computeNextPortfolioState from './portfolio-mutation';
 import { Portfolio } from '../../domain/portfolio/types';
+import { createSupabasePortfolioAdapter } from './supabase-portfolio-adapter';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
 
@@ -208,7 +209,17 @@ function createInMemoryPortfolioAdapter(initialCash: number){
 // initialize runtime
 const AUDIT_PATH = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
 const auditStore = new FileAuditStore(AUDIT_PATH);
-const portfolioAdapter = createInMemoryPortfolioAdapter(START_CAPITAL);
+export function createRuntimePortfolioAdapter(){
+  const store = (process.env && process.env.PAPER_TRADER_PORTFOLIO_STORE) || '';
+  if (store === 'supabase'){
+    const rawId = (process.env && process.env.PAPER_TRADER_PORTFOLIO_ID) || '';
+    const portfolioId = (typeof rawId === 'string' ? rawId.trim() : '') || 'demo';
+    return createSupabasePortfolioAdapter(portfolioId);
+  }
+  return createInMemoryPortfolioAdapter(START_CAPITAL);
+}
+
+const portfolioAdapter = createRuntimePortfolioAdapter();
 
 // export FileAuditStore for focused tests
 export { FileAuditStore };
