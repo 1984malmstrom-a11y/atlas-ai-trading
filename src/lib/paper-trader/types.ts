@@ -13,6 +13,8 @@ export type PaperTradeDecision = {
   reasoning?: string[];
   requestedNotionalSek?: number;
   risk?: RiskReport;
+  // Optional array of signal identifiers produced by decision engines
+  signals?: string[];
 };
 
 export type PaperTraderConfig = {
