@@ -316,32 +316,49 @@ describe('demo-runtime persistence', ()=>{
   });
 
   it('persists tradeFeedbackEffect EXACTLY (BUY_BLOCKED case)', async ()=>{
-    const mod = await import('./demo-runtime');
-    const runtime = mod.default || mod;
-    await mod.__clearAudits();
+    // Table-driven test: for each desired signalFeedbackEffect, mock DecisionEngine to return it
+    const scenarios = [
+      { symbol: 'MSFT', signalFeedback: 'BUY_BLOCKED' as const, tradeFeedback: 'BUY_BLOCKED' as const },
+      { symbol: 'MSFT', signalFeedback: 'OBSERVED' as const, tradeFeedback: 'OBSERVED' as const },
+      { symbol: 'MSFT', signalFeedback: 'NOT_APPLIED' as const, tradeFeedback: 'NOT_APPLIED' as const },
+    ];
 
-    // Seed many prior EVALUATION audits with tradeReview losses to create weak feedback (evaluatedCount >= 10)
-    const seeds: any[] = [];
-    for (let i=0;i<10;i++){
-      seeds.push({ kind: 'EVALUATION', decision: { id: `seed_loss_${i}`, symbol: 'FAKE', action: 'HOLD' }, evaluation: { tradeReview: { executionId: `exec_${i}`, verdict: 'LOSS', pnlSek: -5, pnlPercent: -5, winner: false, summary: 'Förlust' } }, timestamp: new Date().toISOString() });
+    for (const s of scenarios){
+      // isolate module state and mocks for each scenario
+      vi.resetModules();
+      // ensure technical analysis + provider return deterministic data so buy candidate is reachable
+      vi.doMock('./technical', () => ({ default: () => ({ momentumPercent: 8, technicalScore: 50, signal: 'BUY', reasons: ['r'] }) }));
+      vi.mock('../market-data/twelve-data', ()=>({
+        TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym: string, n: number){ return { closes: [1,2,3,4,5,6,7,8,9,10], dates: [], source: 'mock' }; } }
+      }));
+        // Mock DecisionEngine to return the scenario-specific feedback values
+        const decRes = { confidence: 50, risk: {}, tradeFeedbackEffect: s.tradeFeedback, signalFeedbackEffect: s.signalFeedback } as any;
+        vi.doMock('./decision-engine', ()=>({ evaluateDecision: vi.fn(()=> decRes) }));
+
+      const mod = await import('./demo-runtime');
+      const runtime = mod.default || mod;
+      await mod.__clearAudits();
+
+      // seed a prior evaluation entry so buy-on-dip logic will create a BUY candidate for our symbol
+      await mod.__appendTestAudits([{ kind: 'EVALUATION', decision: { id: `seed_eval_${s.symbol}_1`, symbol: s.symbol, action: 'HOLD', referencePrice: 1000 }, timestamp: new Date().toISOString() }]);
+
+      const overrideBuy = { portfolio: { availableCash: 10000, totalValue: 10000, holdings: [] }, quotes: [{ symbol: s.symbol, priceSek: 900, price: 900 }] };
+
+      const auditFile = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
+
+      // Run the runtime flow once with the scenario DecisionEngine mock
+      await runtime.runManualPaperTradingCycle({ overrideUniverse: overrideBuy });
+      const afterRaw2 = JSON.parse(fs.readFileSync(auditFile, 'utf-8') || '[]');
+      const afterEvalCount2 = Array.isArray(afterRaw2) ? afterRaw2.filter((e:any)=> e && e.raw && e.raw.kind === 'EVALUATION').length : 0;
+      // find all evaluations for our symbol that include a persisted tradeFeedbackEffect
+      const matches = afterRaw2.filter((e:any)=> e && e.raw && e.raw.decision && String((e.raw.decision.symbol||'').toUpperCase()) === String(s.symbol).toUpperCase() && e.raw.evaluation && typeof e.raw.evaluation.tradeFeedbackEffect !== 'undefined');
+      // Exactly one persisted strategy evaluation with tradeFeedbackEffect should exist for this scenario
+      expect(matches.length).toBe(1);
+      const found = matches[0];
+      expect(found).toBeDefined();
+      // verify persisted values
+      expect(found.raw.evaluation.signalFeedbackEffect).toBe(s.signalFeedback);
+      expect(found.raw.evaluation.tradeFeedbackEffect).toBe(s.tradeFeedback);
     }
-    // Add a seed evaluation that provides a high referencePrice so buy-on-dip logic will consider a BUY candidate
-    seeds.push({ kind: 'EVALUATION', decision: { id: 'seed_eval_FAKE_1', symbol: 'FAKE', action: 'HOLD', referencePrice: 1000 }, timestamp: new Date().toISOString() });
-    await mod.__appendTestAudits(seeds);
-
-    const overrideBuy = { portfolio: { availableCash: 10000, totalValue: 10000, holdings: [] }, quotes: [{ symbol: 'FAKE', priceSek: 900, price: 900 }] };
-    await runtime.runManualPaperTradingCycle({ overrideUniverse: overrideBuy });
-
-    // create an explicit EVALUATION audit with the exact value and verify persistence
-    await mod.__appendTestAudits([{ kind: 'EVALUATION', decision: { id: 'test_eval_blocked', symbol: 'TST' }, evaluation: { tradeFeedbackEffect: 'BUY_BLOCKED' }, timestamp: new Date().toISOString() }]);
-    // ensure getPaperTradingState returns all audits by clearing latestDecision
-    try{ (mod as any).latestDecision = null; }catch(_){ }
-    const auditFile = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
-    expect(fs.existsSync(auditFile)).toBe(true);
-    const raw = fs.readFileSync(auditFile, 'utf-8');
-    const parsed = JSON.parse(raw || '[]');
-    const found = Array.isArray(parsed) ? parsed.find((e:any)=> e && e.raw && e.raw.decision && String((e.raw.decision.id||'')) === 'test_eval_blocked') : null;
-    expect(found).toBeDefined();
-    expect(found && found.raw && found.raw.evaluation && found.raw.evaluation.tradeFeedbackEffect).toBe('BUY_BLOCKED');
   });
 });
