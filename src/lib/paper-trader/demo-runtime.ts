@@ -5,6 +5,7 @@ import { evaluatePerformanceReflection } from './reflection-engine';
 import * as DecisionEngine from './decision-engine';
 import { evaluateTrade } from './trade-evaluation';
 import { resolveSingleEntryForReview } from './trade-review-entry';
+import { createTradeFeedback } from './trade-feedback';
 import { buildTradeReview } from './trade-review-builder';
 import analyzePriceSeries from './technical';
 import { combineAnalyses } from './analysis-aggregator';
@@ -52,6 +53,40 @@ export function decideBuySignalFromLastRef(usePrice: number, lastRef: number | n
   if (!lastRef || !usePrice) return { buySignal: false, reason: 'No prior evaluation' };
   if (usePrice <= lastRef * 0.99) return { buySignal: true, reason: 'Price dipped 1% vs last reference' };
   return { buySignal: false, reason: 'No dip' };
+}
+
+// Build compact trade feedback summary from auditStore (if any). Returns undefined when none.
+async function computeTradeFeedbackSummary(auditStore: any){
+  try{
+    const audits = await auditStore.list();
+    if (!Array.isArray(audits) || audits.length === 0) return undefined;
+    const rows: Array<{ pnlSek:number; pnlPercent:number; verdict:string; ts:string }> = [];
+    for (const a of audits){
+      if (!a || typeof a !== 'object') continue;
+      const raw = (a as Record<string, unknown>)['raw'] ?? a;
+      if (!raw || typeof raw !== 'object') continue;
+      const evaluation = (raw as Record<string, unknown>)['evaluation'] as Record<string, unknown> | undefined;
+      if (!evaluation || typeof evaluation !== 'object') continue;
+      const tr = evaluation['tradeReview'] as Record<string, unknown> | undefined;
+      if (!tr || typeof tr !== 'object') continue;
+      // Use createTradeFeedback to normalize/validate each found trade review entry
+      try{
+        const execId = (tr['executionId'] || tr['executionId']) as unknown as string;
+        const pnlSek = Number(tr['pnlSek']);
+        const pnlPercent = Number(tr['pnlPercent']);
+        const winner = Boolean(tr['winner']);
+        const tf = createTradeFeedback({ executionId: execId ?? '', pnlSek, pnlPercent, winner });
+        const ts = (a as Record<string, unknown>)['timestamp'] || (raw as Record<string, unknown>)['timestamp'] || '';
+        rows.push({ pnlSek: tf.pnlSek, pnlPercent: tf.pnlPercent, verdict: tf.verdict, ts: String(ts) });
+      }catch(_){ /* skip invalid review entries */ }
+    }
+    if (rows.length === 0) return undefined;
+    const wins = rows.filter(r => r.verdict === 'STRONG_WIN' || r.verdict === 'WIN').length;
+    const avgPnl = rows.reduce((s,r)=> s + r.pnlSek, 0) / rows.length;
+    rows.sort((a,b)=> (a.ts || '') > (b.ts || '') ? 1 : -1);
+    const last = rows[rows.length-1];
+    return { winRate: wins / rows.length, avgPnlSek: avgPnl, evaluatedCount: rows.length, lastVerdict: last.verdict };
+  }catch(_){ return undefined; }
 }
 
 class InMemoryAuditStore {
@@ -734,9 +769,9 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               }
             }catch(_){ /* ignore estimate failures and proceed without expectedReturnPercent for SELL */ }
 
-            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: expectedReturnForDecision } as any;
+            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: expectedReturnForDecision, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore) } as any;
             const decRes = DecisionEngine.evaluateDecision(decInput);
-            const cand = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0) } as any;
+            const cand = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0), tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect } as any;
             // attach risk and reflection for auditability (reuse same reflection object)
             if (typeof expectedReturnForDecision === 'number') (cand as any).expectedReturnPercent = expectedReturnForDecision;
             cand.risk = decRes.risk;
@@ -831,9 +866,9 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             continue;
           }
 
-          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: estimateForBuy.expectedReturnPercent } as any;
+          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: estimateForBuy.expectedReturnPercent, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore) } as any;
           const decRes = DecisionEngine.evaluateDecision(decInput);
-          const cand = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000 } as any;
+          const cand = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000, tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect } as any;
           // persist estimate on candidate for auditability
           if (estimateForBuy && typeof estimateForBuy.expectedReturnPercent === 'number') (cand as any).expectedReturnPercent = estimateForBuy.expectedReturnPercent;
           cand.risk = decRes.risk;
@@ -892,11 +927,11 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
 
     // Append an EVALUATION audit that represents the strategy decision (observe-only)
     try{
-      try{
+        try{
         const techMetaForCand = await fetchAndAnalyze(sSym);
-        await appendEvaluation({ kind: 'EVALUATION', decision: cand, reason: { action: cand.action, reason: 'Strategy decision' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(sSym, techMetaForCand) } as any);
+        await appendEvaluation({ kind: 'EVALUATION', decision: cand, evaluation: { tradeFeedbackEffect: (cand as any).tradeFeedbackEffect }, reason: { action: cand.action, reason: 'Strategy decision' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(sSym, techMetaForCand) } as any);
       }catch(e:any){
-        await appendEvaluation({ kind: 'EVALUATION', decision: cand, reason: { action: cand.action, reason: 'Strategy decision' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(sSym, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) }) } as any);
+        await appendEvaluation({ kind: 'EVALUATION', decision: cand, evaluation: { tradeFeedbackEffect: (cand as any).tradeFeedbackEffect }, reason: { action: cand.action, reason: 'Strategy decision' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(sSym, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: e && e.code ? e.code : 'PROVIDER_ERROR', technicalAnalysisErrorMessage: e && e.message ? e.message : String(e) }) } as any);
       }
     }catch(_){ }
 
