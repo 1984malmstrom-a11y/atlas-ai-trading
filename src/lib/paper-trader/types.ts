@@ -1,4 +1,5 @@
 import { Portfolio, Holding } from '../../domain/portfolio/types';
+// Note: TradeEvaluation defined below to avoid circular type-only import issues
 
 export type TradeAction = 'BUY' | 'SELL' | 'HOLD';
 
@@ -91,7 +92,7 @@ export interface PortfolioAdapter {
 
 export interface AuditStore {
   append(entry: AuditEntry): Promise<void>;
-  list(): Promise<AuditEntry[]>;
+  list(): Promise<AuditStoreItem[]>;
 }
 
 export interface Clock { now(): Date }
@@ -113,19 +114,30 @@ export type SimulatedExecution = {
 export type AuditEntry = {
   id: string;
   timestamp: string;
-  kind: 'RECEIVED' | 'HOLD' | 'REJECT' | 'EXECUTION';
+  kind: 'RECEIVED' | 'HOLD' | 'REJECT' | 'EXECUTION' | 'EVALUATION';
   decision?: PaperTradeDecision;
   reason?: { code: string; message: string };
   execution?: SimulatedExecution;
   portfolioBefore?: Portfolio;
   portfolioAfter?: Portfolio;
+  evaluation?: TradeEvaluation;
 };
+
+export type AuditStoreEnvelope = {
+  id: string;
+  timestamp: string;
+  summary: Record<string, unknown>;
+  raw: AuditEntry;
+};
+
+export type AuditStoreItem = AuditEntry | AuditStoreEnvelope;
 
 export type DecisionResult = {
   accepted: boolean;
   code?: string;
   message?: string;
   execution?: SimulatedExecution | null;
+  transaction?: SimulatedExecution | null;
 };
 
 export type RiskReport = {
@@ -155,11 +167,13 @@ export type RiskReport = {
   };
 };
 
+// TradeEvaluation is imported from ./trade-evaluation (type-only)
 export type TradeEvaluation = {
   pnlSek: number;
   pnlPercent: number;
   winner: boolean;
 };
+
 
 export type PerformanceSummary = {
   totalTrades: number;

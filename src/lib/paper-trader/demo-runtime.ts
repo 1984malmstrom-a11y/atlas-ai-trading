@@ -12,6 +12,7 @@ import path from 'path';
 import computeNextPortfolioState from './portfolio-mutation';
 import { Portfolio } from '../../domain/portfolio/types';
 import { createSupabasePortfolioAdapter } from './supabase-portfolio-adapter';
+import { SupabaseAuditAdapter } from './supabase-audit-adapter';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
 
@@ -208,7 +209,9 @@ function createInMemoryPortfolioAdapter(initialCash: number){
 
 // initialize runtime
 const AUDIT_PATH = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
-const auditStore = new FileAuditStore(AUDIT_PATH);
+// choose audit store using same env used for portfolio store configuration
+const _store = (process.env && process.env.PAPER_TRADER_PORTFOLIO_STORE) || '';
+const auditStore = _store === 'supabase' ? new SupabaseAuditAdapter() : new FileAuditStore(AUDIT_PATH);
 export function createRuntimePortfolioAdapter(){
   const store = (process.env && process.env.PAPER_TRADER_PORTFOLIO_STORE) || '';
   if (store === 'supabase'){
@@ -915,7 +918,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     if (res && res.accepted){
       // attempt to compute trade evaluation for SELLs that fully close a position
       try{
-        const exec = (res as any).execution || (res as any).transaction || null;
+        const exec: SimulatedExecution | null = (res.execution || res.transaction) || null;
         if (exec && String((exec as any).side || cand.action).toUpperCase() === 'SELL'){
           // fetch portfolio after execution to detect closure
           const afterExecutionPortfolio = await portfolioAdapter.getPortfolio();
@@ -937,7 +940,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                 }
               }catch(_){ /* ignore */ }
               if (!evaluation){
-                evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
+                evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty, totalFees: exec.fee ?? 0 });
                 try{ (exec as any).evaluation = evaluation; }catch(_){ }
               }
               // find the appended EXECUTION audit in the FileAuditStore and mutate its raw.execution to include the same evaluation object (reuse reference)
@@ -1202,8 +1205,8 @@ export async function executePaperTradeDecision(decision: PaperTradeDecision){
   const res = await runtime.trader.handleDecision(decision as any);
   // If executed and SELL that closes a position, compute and attach evaluation and update audit
   try{
-    if (res && (res as any).accepted){
-      const exec = (res as any).execution || (res as any).transaction || null;
+    if (res && res.accepted){
+      const exec: SimulatedExecution | null = (res.execution || res.transaction) || null;
       if (exec && String((exec as any).side || decision.action).toUpperCase() === 'SELL'){
         const afterExecutionPortfolio = await portfolioAdapter.getPortfolio();
         const sym = String(decision.symbol || '').toUpperCase();
@@ -1223,7 +1226,7 @@ export async function executePaperTradeDecision(decision: PaperTradeDecision){
               }
             }catch(_){ /* ignore */ }
             if (!evaluation){
-              evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty });
+              evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty, totalFees: exec.fee ?? 0 });
               try{ (exec as any).evaluation = evaluation; }catch(_){ }
             }
             try{

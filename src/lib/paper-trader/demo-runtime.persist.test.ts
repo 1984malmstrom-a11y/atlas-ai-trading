@@ -90,8 +90,32 @@ describe('demo-runtime persistence', ()=>{
     const audits = state.auditEntries || [];
     const evals = audits.filter((a:any)=> a && a.raw && a.raw.kind === 'EVALUATION');
     // find the evaluation for AAPL
-    const aaplEval = evals.find((e:any)=> e && e.raw && e.raw.decision && String((e.raw.decision.symbol||'').toUpperCase()) === 'AAPL');
+    // find any evaluation for AAPL; prefer the post-execution evaluation if present
+    const aaplEvalExec = evals.find((e:any)=> e && e.raw && e.raw.decision && String((e.raw.decision.symbol||'').toUpperCase()) === 'AAPL' && e.raw.execution);
+    const aaplEvalAny = evals.find((e:any)=> e && e.raw && e.raw.decision && String((e.raw.decision.symbol||'').toUpperCase()) === 'AAPL');
+    const aaplEval = aaplEvalExec || aaplEvalAny;
     expect(aaplEval).toBeDefined();
+    // Verify evaluation uses execution.fee when post-execution evaluation is present
+    if (aaplEvalExec){
+      const exec = aaplEvalExec.raw.execution;
+      const evaluation = aaplEvalExec.raw.evaluation;
+      expect(exec).toBeDefined();
+      expect(evaluation).toBeDefined();
+      const before = aaplEvalExec.raw.portfolioBefore || null;
+      const beforeHolding = before && Array.isArray(before.holdings) ? before.holdings.find((h:any)=> String((h.symbol||'').toUpperCase()) === 'AAPL') : null;
+      const entryPrice = beforeHolding && typeof beforeHolding.averagePrice === 'number' ? Number(beforeHolding.averagePrice) : null;
+      const qty = typeof exec.quantity === 'number' ? Number(exec.quantity) : null;
+      const exitPrice = typeof exec.executedPrice === 'number' ? Number(exec.executedPrice) : null;
+      const fee = typeof exec.fee === 'number' ? Number(exec.fee) : 0;
+      if (entryPrice !== null && qty !== null && exitPrice !== null){
+        const gross = Math.round(((exitPrice - entryPrice) * qty) * 100)/100;
+        const net = Math.round((gross - fee) * 100)/100;
+        const expectedPct = (entryPrice * qty) !== 0 ? (net / (entryPrice * qty)) * 100 : 0;
+        expect(evaluation.pnlSek).toBeCloseTo(net, 2);
+        expect(evaluation.pnlPercent).toBeCloseTo(expectedPct, 4);
+        expect(evaluation.winner).toBe(net > 0);
+      }
+    }
     // Ensure decision engine was called and received the reflection
     expect(decSpy).toHaveBeenCalled();
     const calledArg = decSpy.mock.calls[0][0];

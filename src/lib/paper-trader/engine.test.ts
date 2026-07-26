@@ -98,7 +98,12 @@ describe('PaperTrader V1', ()=>{
     expect(res.accepted).toBe(false);
     expect(res.code).toBe('HOLD');
     const audits = await trader.getAuditEntries();
-    expect(audits.some(a=> a.kind === 'HOLD')).toBe(true);
+    expect(
+      audits.some((audit) => {
+        const rawAudit = 'raw' in audit ? audit.raw : audit;
+        return rawAudit.kind === 'HOLD';
+      }),
+    ).toBe(true);
   });
 
   it('low BUY-confidence rejected', async ()=>{
