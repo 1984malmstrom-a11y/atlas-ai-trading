@@ -26,27 +26,27 @@ describe('createTradeReview', () => {
     const r = createTradeReview(valid);
     expect(Object.isFrozen(r)).toBe(true);
     // attempt mutation should not change value
-    try { (r as any).symbol = 'BBB'; } catch (e) {}
+    try { (r as unknown as Record<string, unknown>).symbol = 'BBB'; } catch (e) {}
     expect(r.symbol).toBe('AAA');
   });
 
   it('empty executionId throws', () => {
     const bad = { ...valid, executionId: ' ' };
-    expect(() => createTradeReview(bad as any)).toThrow();
+    expect(() => createTradeReview(bad as unknown as TradeReview)).toThrow();
   });
 
   it('empty symbol throws', () => {
     const bad = { ...valid, symbol: '' };
-    expect(() => createTradeReview(bad as any)).toThrow();
+    expect(() => createTradeReview(bad as unknown as TradeReview)).toThrow();
   });
 
   it('negative holdingMinutes throws', () => {
     const bad = { ...valid, holdingMinutes: -1 };
-    expect(() => createTradeReview(bad as any)).toThrow();
+    expect(() => createTradeReview(bad as unknown as TradeReview)).toThrow();
   });
 
   it('empty createdAt throws', () => {
     const bad = { ...valid, createdAt: ' ' };
-    expect(() => createTradeReview(bad as any)).toThrow();
+    expect(() => createTradeReview(bad as unknown as TradeReview)).toThrow();
   });
 });

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { resolveSingleEntryForReview, type TradeReviewEntry } from './trade-review-entry';
 import type { AuditEntry, AuditStoreEnvelope } from './types';
 
-function envelope(e: any): AuditStoreEnvelope { return { id: e.id || 'x', timestamp: e.timestamp || new Date().toISOString(), summary: {}, raw: e } as any; }
+function envelope(e: AuditEntry): AuditStoreEnvelope { return { id: e.id || 'x', timestamp: e.timestamp || new Date().toISOString(), summary: {}, raw: e } as AuditStoreEnvelope; }
 
 describe('resolveSingleEntryForReview', () => {
   const portfolioId = 'demo';
@@ -48,7 +48,7 @@ describe('resolveSingleEntryForReview', () => {
   });
 
   it('ogiltig BUY execution/timestamp → null', () => {
-    const buy: any = { id: 'a6', timestamp: 'not-a-time', kind: 'EXECUTION', execution: { id: 'e6', decisionId: 'd6', symbol, side: 'BUY', quantity: 2, executedPrice: 10, notional: 20, fee: 0, generatedAt: '2026-06-01T00:00:00Z' } };
+    const buy: AuditEntry = { id: 'a6', timestamp: 'not-a-time', kind: 'EXECUTION', execution: { id: 'e6', decisionId: 'd6', symbol, side: 'BUY', quantity: 2, executedPrice: 10, notional: 20, fee: 0, generatedAt: '2026-06-01T00:00:00Z' } };
     const res = resolveSingleEntryForReview({ audits: [envelope(buy)], portfolioId, symbol, soldQuantity: 2 });
     expect(res).toBeNull();
   });

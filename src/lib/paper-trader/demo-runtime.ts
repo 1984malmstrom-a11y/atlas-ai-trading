@@ -948,7 +948,12 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               // Attempt to resolve a single-entry BUY for a safe TradeReview
               try{
                 const audits = await auditStore.list();
-                const portfolioId = beforeExecutionPortfolio && (beforeExecutionPortfolio as any).id ? String((beforeExecutionPortfolio as any).id) : '';
+                let portfolioId = '';
+                if (beforeExecutionPortfolio && typeof beforeExecutionPortfolio === 'object' && beforeExecutionPortfolio !== null){
+                  const asRec = beforeExecutionPortfolio as Record<string, unknown>;
+                  const idVal = asRec['id'];
+                  if (typeof idVal === 'string') portfolioId = idVal;
+                }
                 const entry = resolveSingleEntryForReview({ audits, portfolioId, symbol: sym, soldQuantity: qty });
                 if (entry){
                   const exitTs = nowIso();
@@ -964,7 +969,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                     confidenceAtEntry: entry.confidenceAtEntry,
                     createdAt: exitTs,
                   });
-                  try{ (evaluation as any).tradeReview = review; }catch(_){ }
+                  try{ if (evaluation && typeof evaluation === 'object') (evaluation as Record<string, unknown>).tradeReview = review; }catch(_){ }
                 }
               }catch(_){ /* tolerate resolver failures silently */ }
               // find the appended EXECUTION audit in the FileAuditStore and mutate its raw.execution to include the same evaluation object (reuse reference)
@@ -1256,7 +1261,12 @@ export async function executePaperTradeDecision(decision: PaperTradeDecision){
             // Attempt to resolve a single-entry BUY for a safe TradeReview
             try{
               const audits = await auditStore.list();
-              const portfolioId = beforeExecutionPortfolio && (beforeExecutionPortfolio as any).id ? String((beforeExecutionPortfolio as any).id) : '';
+              let portfolioId = '';
+              if (beforeExecutionPortfolio && typeof beforeExecutionPortfolio === 'object' && beforeExecutionPortfolio !== null){
+                const asRec = beforeExecutionPortfolio as Record<string, unknown>;
+                const idVal = asRec['id'];
+                if (typeof idVal === 'string') portfolioId = idVal;
+              }
               const entry = resolveSingleEntryForReview({ audits, portfolioId, symbol: sym, soldQuantity: qty });
               if (entry){
                 const exitTs = nowIso();
@@ -1272,7 +1282,7 @@ export async function executePaperTradeDecision(decision: PaperTradeDecision){
                   confidenceAtEntry: entry.confidenceAtEntry,
                   createdAt: exitTs,
                 });
-                try{ (evaluation as any).tradeReview = review; }catch(_){ }
+                try{ if (evaluation && typeof evaluation === 'object') (evaluation as Record<string, unknown>).tradeReview = review; }catch(_){ }
               }
             }catch(_){ /* tolerate resolver failures silently */ }
             try{

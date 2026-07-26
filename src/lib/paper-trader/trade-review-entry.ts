@@ -1,4 +1,4 @@
-import type { AuditStoreItem, AuditEntry } from './types';
+import type { AuditStoreItem, AuditEntry, AuditStoreEnvelope } from './types';
 
 export type TradeReviewEntry = {
   executionId: string;
@@ -7,10 +7,18 @@ export type TradeReviewEntry = {
   confidenceAtEntry: number | null;
 };
 
+function isObject(v: unknown): v is Record<string, unknown> { return typeof v === 'object' && v !== null; }
+
+function isEnvelope(e: unknown): e is AuditStoreEnvelope {
+  if (!isObject(e)) return false;
+  const o = e as Record<string, unknown>;
+  return 'raw' in o && isObject(o['raw']);
+}
+
 function asAudit(entry: AuditStoreItem): AuditEntry | null {
-  if (!entry || typeof entry !== 'object') return null;
-  const obj: any = entry as any;
-  return ('raw' in obj && obj.raw && typeof obj.raw === 'object') ? (obj.raw as AuditEntry) : (entry as AuditEntry);
+  if (!isObject(entry)) return null;
+  if (isEnvelope(entry)) return entry.raw as AuditEntry;
+  return entry as AuditEntry;
 }
 
 function isFiniteNumber(v: unknown): v is number { return typeof v === 'number' && Number.isFinite(v); }
@@ -33,8 +41,10 @@ export function resolveSingleEntryForReview(args: {
       if (a.kind !== 'EXECUTION') continue;
       // portfolioId may be present on envelope only; skip if mismatch when provided on envelope
       // Use permissive check: if audit has no portfolioId info, accept (spec says filter by portfolioId if matches)
-      const env = it as any;
-      if (typeof env.portfolioId === 'string' && env.portfolioId !== portfolioId) continue;
+      if (isObject(it)){
+        const pid = (it as Record<string, unknown>)['portfolioId'];
+        if (typeof pid === 'string' && pid !== portfolioId) continue;
+      }
       const exec = a.execution;
       if (!exec) continue;
       if (String(exec.side || '').toUpperCase() !== 'BUY') continue;

@@ -68,6 +68,7 @@ describe('buildTradeReview', () => {
 
   it('fel från createTradeReview propagaterar', () => {
     const bad = { ...args, executionId: '' };
-    expect(() => buildTradeReview(bad as any)).toThrow();
+    const badArg = bad as unknown as Parameters<typeof buildTradeReview>[0];
+    expect(() => buildTradeReview(badArg)).toThrow();
   });
 });
