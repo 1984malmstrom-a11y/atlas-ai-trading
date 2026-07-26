@@ -67,6 +67,13 @@ describe('demo-runtime persistence', ()=>{
     const runtime = mod.default || mod;
     // ensure clean audits
     await mod.__clearAudits();
+    // seed an explicit prior BUY execution matching the holding so resolver can find a single-entry
+    await mod.__appendTestAudits([{
+      kind: 'EXECUTION',
+      timestamp: '2026-01-01T00:00:00Z',
+      decision: { id: 'd_buy_aapl', symbol: 'AAPL', action: 'BUY', confidence: 80, referencePrice: 100, generatedAt: '2026-01-01T00:00:00Z' },
+      execution: { id: 'e_buy_aapl', decisionId: 'd_buy_aapl', symbol: 'AAPL', side: 'BUY', quantity: 2, executedPrice: 100, notional: 200, fee: 0, generatedAt: '2026-01-01T00:00:00Z' }
+    }]);
     // read current profile (may be INSufficient data in test env) and ensure it's forwarded
     const profile = await mod.getPerformanceProfile();
     const spy = vi.spyOn(mod, 'getPerformanceProfile' as any).mockResolvedValue(profile as any);

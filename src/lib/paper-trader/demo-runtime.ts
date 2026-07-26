@@ -4,6 +4,8 @@ import { calculatePerformance } from './performance-analytics';
 import { evaluatePerformanceReflection } from './reflection-engine';
 import * as DecisionEngine from './decision-engine';
 import { evaluateTrade } from './trade-evaluation';
+import { resolveSingleEntryForReview } from './trade-review-entry';
+import { buildTradeReview } from './trade-review-builder';
 import analyzePriceSeries from './technical';
 import { combineAnalyses } from './analysis-aggregator';
 import estimateExpectedReturn from './expected-return';
@@ -943,6 +945,28 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                 evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty, totalFees: exec.fee ?? 0 });
                 try{ (exec as any).evaluation = evaluation; }catch(_){ }
               }
+              // Attempt to resolve a single-entry BUY for a safe TradeReview
+              try{
+                const audits = await auditStore.list();
+                const portfolioId = beforeExecutionPortfolio && (beforeExecutionPortfolio as any).id ? String((beforeExecutionPortfolio as any).id) : '';
+                const entry = resolveSingleEntryForReview({ audits, portfolioId, symbol: sym, soldQuantity: qty });
+                if (entry){
+                  const exitTs = nowIso();
+                  const holdingMinutes = Math.max(0, Math.floor((new Date(exitTs).getTime() - new Date(entry.entryTimestamp).getTime()) / 60000));
+                  const review = buildTradeReview({
+                    executionId: entry.executionId,
+                    symbol: sym,
+                    entryPrice: entry.entryPrice,
+                    exitPrice: exitPrice,
+                    quantity: qty,
+                    totalFees: exec.fee ?? 0,
+                    holdingMinutes,
+                    confidenceAtEntry: entry.confidenceAtEntry,
+                    createdAt: exitTs,
+                  });
+                  try{ (evaluation as any).tradeReview = review; }catch(_){ }
+                }
+              }catch(_){ /* tolerate resolver failures silently */ }
               // find the appended EXECUTION audit in the FileAuditStore and mutate its raw.execution to include the same evaluation object (reuse reference)
               try{
                 const entries = (auditStore as any).entries as any[] | undefined;
@@ -1229,6 +1253,28 @@ export async function executePaperTradeDecision(decision: PaperTradeDecision){
               evaluation = evaluateTrade({ entryPrice, exitPrice, quantity: qty, totalFees: exec.fee ?? 0 });
               try{ (exec as any).evaluation = evaluation; }catch(_){ }
             }
+            // Attempt to resolve a single-entry BUY for a safe TradeReview
+            try{
+              const audits = await auditStore.list();
+              const portfolioId = beforeExecutionPortfolio && (beforeExecutionPortfolio as any).id ? String((beforeExecutionPortfolio as any).id) : '';
+              const entry = resolveSingleEntryForReview({ audits, portfolioId, symbol: sym, soldQuantity: qty });
+              if (entry){
+                const exitTs = nowIso();
+                const holdingMinutes = Math.max(0, Math.floor((new Date(exitTs).getTime() - new Date(entry.entryTimestamp).getTime()) / 60000));
+                const review = buildTradeReview({
+                  executionId: entry.executionId,
+                  symbol: sym,
+                  entryPrice: entry.entryPrice,
+                  exitPrice: exitPrice,
+                  quantity: qty,
+                  totalFees: exec.fee ?? 0,
+                  holdingMinutes,
+                  confidenceAtEntry: entry.confidenceAtEntry,
+                  createdAt: exitTs,
+                });
+                try{ (evaluation as any).tradeReview = review; }catch(_){ }
+              }
+            }catch(_){ /* tolerate resolver failures silently */ }
             try{
               const entries = (auditStore as any).entries as any[] | undefined;
               if (Array.isArray(entries)){
