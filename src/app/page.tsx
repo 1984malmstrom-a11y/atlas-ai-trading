@@ -9,8 +9,11 @@ import RecentTrades from '../components/atlas/RecentTrades';
 import CoachBriefing from '../components/atlas/CoachBriefing';
 import RiskOverview from '../components/atlas/RiskOverview';
 import InvestorProfilePanel from '../components/atlas/InvestorProfilePanel';
+import { getPortfolio } from '../domain/portfolio/portfolio-service';
 
 export default function Page() {
+  // Server-side: obtain the canonical initial portfolio and pass to client component
+  const initialPortfolio = getPortfolio();
   return (
     <div className="h-screen w-screen overflow-hidden bg-[#F5EFE6]">
       <LeftSidebar />
@@ -24,7 +27,7 @@ export default function Page() {
                 <DailySimulationWrapper />
                 <PortfolioAnalysis />
                 <PortfolioSummary />
-                <HoldingsTable />
+                <HoldingsTable initialPortfolio={initialPortfolio} />
                 <RecentTrades />
               </div>
 

@@ -1,16 +1,15 @@
 "use client";
 import React, { useEffect, useState } from 'react';
-import { getPortfolio } from '../../domain/portfolio/portfolio-service';
 import ls from '../../lib/local-storage';
-import { getMockPortfolio } from '../../data/mock-portfolio';
+import { Portfolio } from '../../domain/portfolio/types';
 import { formatCurrency, formatPercent } from '../../lib/formatters';
 
-export default function HoldingsTable(){
+export default function HoldingsTable({ initialPortfolio }: { initialPortfolio: Portfolio }){
   const [portfolio, setPortfolio] = useState(() => {
     try{
       const p = ls.loadPortfolio();
-      return p || getPortfolio();
-    }catch(e){ return getPortfolio(); }
+      return p || initialPortfolio;
+    }catch(e){ return initialPortfolio; }
   });
 
   useEffect(() => {

@@ -16,12 +16,17 @@ export type Execution = {
   executedPrice: number;
   quantity: number;
   fee: number;
+  // New detailed cost breakdown
+  commission: number; // same as fee (kept for clarity)
+  slippageCost: number; // positive SEK cost caused by slippage (per-share slippage * qty)
+  totalTradingCost: number; // commission + slippageCost
   evaluation?: {
     pnlSek: number;
     pnlPercent: number;
     winner: boolean;
   };
 }
+
 
 export type FailureCode =
   | 'INVALID_QUANTITY'
@@ -218,7 +223,14 @@ export class PaperTradingEngine {
     // Recalculate total value
     newPortfolio.totalValue = newPortfolio.holdings.reduce((s, it) => s + it.marketValue, 0) + newPortfolio.availableCash;
 
-    const transaction: Execution = { orderId: order.id, executedPrice, quantity: order.side === 'Köp' ? finalQty : order.quantity, fee: order.side === 'Köp' ? finalFee : fee };
+    // Compute per-execution cost breakdown (commission + slippage)
+    const qtyForCost = order.side === 'Köp' ? finalQty : order.quantity;
+    const commission = order.side === 'Köp' ? finalFee : fee;
+    const slippagePerShare = Math.abs(executedPrice - marketPrice);
+    const slippageCost = slippagePerShare * qtyForCost;
+    const totalTradingCost = commission + slippageCost;
+
+    const transaction: Execution = { orderId: order.id, executedPrice, quantity: order.side === 'Köp' ? finalQty : order.quantity, fee: order.side === 'Köp' ? finalFee : fee, commission, slippageCost, totalTradingCost };
     // attach evaluation object if we computed one above
     try{
       if (typeof evaluationObj !== 'undefined' && evaluationObj !== null){

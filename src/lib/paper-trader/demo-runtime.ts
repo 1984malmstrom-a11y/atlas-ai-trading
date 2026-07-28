@@ -1,4 +1,5 @@
 import createPaperTrader from './engine';
+import ensureDailyStart from './ensure-daily-start';
 import { PaperTraderConfig, PaperTradeDecision, SimulatedExecution, AuditEntry } from './types';
 import { calculatePerformance } from './performance-analytics';
 import { evaluatePerformanceReflection } from './reflection-engine';
@@ -298,7 +299,7 @@ const config: PaperTraderConfig = {
   maxTradesPerCycle: 1,
 };
 
-const trader = createPaperTrader({ portfolioAdapter, auditStore, config });
+let trader = createPaperTrader({ portfolioAdapter, auditStore, config });
 
 const runtime: RuntimeState = {
   startCapital: START_CAPITAL,
@@ -655,6 +656,22 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   let _beforeEvalCount = 0;
   try{ const _beforeList = await auditStore.list(); _beforeEvalCount = Array.isArray(_beforeList) ? _beforeList.filter((a:any)=> a && a.raw && a.raw.kind === 'EVALUATION').length : 0; }catch(_){ _beforeEvalCount = 0; }
   const portfolio = opts && opts.overrideUniverse && opts.overrideUniverse.portfolio ? opts.overrideUniverse.portfolio : await portfolioAdapter.getPortfolio();
+
+  // If using Supabase-backed portfolio store, ensure persistent daily start before creating trader
+  try{
+    const store = (process.env && process.env.PAPER_TRADER_PORTFOLIO_STORE) || '';
+    if (store === 'supabase'){
+      const rawId = (process.env && process.env.PAPER_TRADER_PORTFOLIO_ID) || '';
+      const portfolioId = (typeof rawId === 'string' ? rawId.trim() : '') || 'demo';
+      // ensureDailyStart may throw; per requirements let it bubble and abort cycle
+      const dr = await ensureDailyStart({ portfolioId });
+      // recreate trader with explicit dailyStartValue
+      trader = createPaperTrader({ portfolioAdapter, auditStore, config, dailyStartValue: dr.startValue });
+      runtime.trader = trader;
+    }
+  }catch(e){
+    throw e;
+  }
   // Fetch performance profile once per cycle. If an override is provided use it (tests),
   // otherwise call the regular `getPerformanceProfile`. If it fails, continue without reflection.
   let profile: any = null;

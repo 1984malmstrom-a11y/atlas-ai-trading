@@ -178,4 +178,100 @@ describe('PaperTradingEngine risk integration', ()=>{
     expect(tx.evaluation.pnlPercent).toBeCloseTo(-10);
     expect(tx.evaluation.winner).toBe(false);
   });
+
+  it('SELL deterministic slippage: commission, slippageCost, totalTradingCost and cash behavior', ()=>{
+    const portfolio: Portfolio = { id: 'pSell2', baseCurrency: 'SEK', totalValue: 10000, availableCash: 1000, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: [{ id: 'h1', symbol: 'SELLX', name: 'SELLX', assetType: 'Stock', quantity: 10, averagePrice: 50, currentPrice: 100, marketValue: 1000, unrealizedPnl: 0, unrealizedPnlPercent: 0, portfolioWeight: 0 }] };
+    const engine = new PaperTradingEngine(JSON.parse(JSON.stringify(portfolio)));
+    // deterministic slippage: set min==max
+    engine.slippageMin = 0.005; engine.slippageMax = 0.005; // 0.5% slippage
+    engine.feePercent = 0.001; // 0.1% commission for clearer numbers
+
+    const order: Order = { id: 'oSellDet', symbol: 'SELLX', side: 'Sälj', quantity: 4, price: 100 };
+
+    // Run simulation (SELL path should not call decision engine)
+    const res = engine.simulateExecution(order) as any;
+    expect(res.success).toBe(true);
+    const tx = res.transaction as any;
+
+    const marketPrice = order.price!;
+    // 1) executedPrice should be less than marketPrice for SELL (negative slippage)
+    expect(tx.executedPrice).toBeLessThan(marketPrice);
+
+    // 2) commission === fee
+    expect(tx.commission).toBeDefined();
+    expect(tx.fee).toBeDefined();
+    expect(tx.commission).toBeCloseTo(tx.fee, 12);
+
+    // 3) slippageCost === abs(executedPrice - marketPrice) * quantity
+    const expectedSlippagePer = Math.abs(tx.executedPrice - marketPrice);
+    const expectedSlippageTotal = expectedSlippagePer * tx.quantity;
+    expect(tx.slippageCost).toBeCloseTo(expectedSlippageTotal, 12);
+
+    // 4) totalTradingCost === commission + slippageCost
+    expect(tx.totalTradingCost).toBeCloseTo(tx.commission + tx.slippageCost, 12);
+
+    // 5) availableCash increases exactly by executedNotional - commission
+    const executedNotional = tx.executedPrice * tx.quantity;
+    const expectedAvailable = portfolio.availableCash + (executedNotional - tx.commission);
+    expect(res.portfolio.availableCash).toBeCloseTo(expectedAvailable, 12);
+
+    // 6) slippageCost is not subtracted a second time: executedNotional == marketNotional - slippageCost
+    const marketNotional = marketPrice * tx.quantity;
+    const altExpr = portfolio.availableCash + (marketNotional - tx.commission - tx.slippageCost);
+    // altExpr should equal expectedAvailable (shows slippage included via executedNotional, not double-deducted)
+    expect(res.portfolio.availableCash).toBeCloseTo(altExpr, 12);
+  });
+
+  it('reports commission separately and unchanged fee behavior', ()=>{
+    const portfolio: Portfolio = { id: 'pComm', baseCurrency: 'SEK', totalValue: 20000, availableCash: 20000, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: [] };
+    const engine = new PaperTradingEngine(JSON.parse(JSON.stringify(portfolio)));
+    engine.slippageMin = 0; engine.slippageMax = 0;
+    const order: Order = { id: 'oC1', symbol: 'C1', side: 'Köp', quantity: 2, price: 100, expectedReturnPercent: 10 };
+    const fakeDecision = { accepted: true, risk: { allowed: true, score: 80, level: 'LOW', reasons: [], positionSizing: { confidenceAdjustedNotional: 200 } } } as any;
+    const spy = vi.spyOn(decMod, 'evaluateDecision' as any).mockImplementation(()=> fakeDecision as any);
+    const res = engine.simulateExecution(order) as any;
+    spy.mockRestore();
+    expect(res.success).toBe(true);
+    const tx = res.transaction as any;
+    // commission should equal historical fee field
+    expect(tx.commission).toBeDefined();
+    expect(tx.fee).toBeDefined();
+    expect(tx.commission).toBeCloseTo(tx.fee, 12);
+  });
+
+  it('reports slippage cost separately', ()=>{
+    const portfolio: Portfolio = { id: 'pSlip', baseCurrency: 'SEK', totalValue: 20000, availableCash: 20000, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: [] };
+    const engine = new PaperTradingEngine(JSON.parse(JSON.stringify(portfolio)));
+    // deterministic non-zero slippage
+    engine.slippageMin = 0.001; engine.slippageMax = 0.001;
+    const order: Order = { id: 'oS1', symbol: 'S1', side: 'Köp', quantity: 3, price: 100, expectedReturnPercent: 10 };
+    const fakeDecision = { accepted: true, risk: { allowed: true, score: 80, level: 'LOW', reasons: [], positionSizing: { confidenceAdjustedNotional: 300 } } } as any;
+    const spy = vi.spyOn(decMod, 'evaluateDecision' as any).mockImplementation(()=> fakeDecision as any);
+    const res = engine.simulateExecution(order) as any;
+    spy.mockRestore();
+    expect(res.success).toBe(true);
+    const tx = res.transaction as any;
+    // slippage per share is price * slippageMin
+    const expectedSlippagePer = order.price! * engine.slippageMin;
+    const expectedSlippageTotal = expectedSlippagePer * tx.quantity;
+    expect(tx.slippageCost).toBeCloseTo(expectedSlippageTotal, 10);
+  });
+
+  it('totalTradingCost equals commission + slippageCost and cash uses full cost', ()=>{
+    const portfolio: Portfolio = { id: 'pTotal', baseCurrency: 'SEK', totalValue: 20000, availableCash: 5000, totalReturnPercent: 0, benchmarkReturnPercent: 0, holdings: [] };
+    const engine = new PaperTradingEngine(JSON.parse(JSON.stringify(portfolio)));
+    engine.slippageMin = 0.002; engine.slippageMax = 0.002; // deterministic
+    const order: Order = { id: 'oT1', symbol: 'T1', side: 'Köp', quantity: 4, price: 100, expectedReturnPercent: 10 };
+    const fakeDecision = { accepted: true, risk: { allowed: true, score: 80, level: 'LOW', reasons: [], positionSizing: { confidenceAdjustedNotional: 400 } } } as any;
+    const spy = vi.spyOn(decMod, 'evaluateDecision' as any).mockImplementation(()=> fakeDecision as any);
+    const res = engine.simulateExecution(order) as any;
+    spy.mockRestore();
+    expect(res.success).toBe(true);
+    const tx = res.transaction as any;
+    expect(tx.totalTradingCost).toBeCloseTo(tx.commission + tx.slippageCost, 12);
+    // availableCash reduced by finalNotional (which includes slippage) + commission
+    const expectedNotional = tx.quantity * tx.executedPrice;
+    const expectedCash = portfolio.availableCash - (expectedNotional + tx.commission);
+    expect(res.portfolio.availableCash).toBeCloseTo(expectedCash, 10);
+  });
 });

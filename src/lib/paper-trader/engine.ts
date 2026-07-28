@@ -41,12 +41,16 @@ export function createPaperTrader(opts: {
   clock?: Clock;
   idGenerator?: IdGenerator;
   config?: PaperTraderConfig;
+  // optional explicit start-of-day value (overrides in-memory map)
+  dailyStartValue?: number;
 }){
   const portfolioAdapter = opts.portfolioAdapter;
   const auditStore = opts.auditStore || new InMemoryAudit();
   const clock: Clock = opts.clock || { now: () => new Date() };
   const idGen: IdGenerator = opts.idGenerator || { next: (p?:string) => `${p||'id'}_${Date.now()}` };
   const cfg: Required<typeof DEFAULTS> = { ...DEFAULTS, ...(opts.config||{}) } as unknown as Required<typeof DEFAULTS>;
+
+  const explicitDailyStart = typeof opts.dailyStartValue === 'number' && Number.isFinite(opts.dailyStartValue) && opts.dailyStartValue >= 0 ? opts.dailyStartValue : undefined;
 
   const locks = new Map<string, boolean>();
   const cooldowns = new Map<string, number>();
@@ -195,11 +199,13 @@ export function createPaperTrader(opts: {
       if (pct > 0){
         const now = clock.now();
         const key = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
-        let riskBase = dailyStartValue.get(key);
+        // If an explicit dailyStartValue was provided in the trader options, use it (do not touch internal map)
+        let riskBase: number | undefined = explicitDailyStart !== undefined ? explicitDailyStart : dailyStartValue.get(key);
         if (typeof riskBase !== 'number'){
           // Prefer a stable start capital: use availableCash as today's start capital when present
           riskBase = (typeof before.availableCash === 'number' && isFinite(before.availableCash)) ? before.availableCash : totalValue;
-          dailyStartValue.set(key, riskBase);
+          // Only persist into the in-memory map when not using an explicit value
+          if (explicitDailyStart === undefined) dailyStartValue.set(key, riskBase);
         }
         const limitSek = round2(riskBase * (pct/100));
         const realizedToday = await computeDailyRealized(clock.now());
