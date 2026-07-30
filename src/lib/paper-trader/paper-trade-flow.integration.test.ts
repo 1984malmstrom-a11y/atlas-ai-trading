@@ -61,7 +61,8 @@ describe('paper-trade flow integration (deterministic, in-memory)', ()=>{
     // Calculate expected values using engine config we provided: feesBps=10, slippageBps=5
     const feesBps = 10; const slippageBps = 5;
     const expectedExecPrice = round2(priceSek * (1 + (slippageBps/10000)));
-    const expectedQuantity = Math.floor(requestedNotionalSek / expectedExecPrice);
+    const expectedQuantity =
+      Math.floor((requestedNotionalSek * 1_000_000) / expectedExecPrice) / 1_000_000;
     expect(expectedQuantity).toBeGreaterThanOrEqual(1);
 
     // Execution assertions
