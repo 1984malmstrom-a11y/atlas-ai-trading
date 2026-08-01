@@ -185,6 +185,16 @@ export type TradeEvaluation = {
   winner: boolean;
 };
 
+export type ForexCycleExecutionMode = 'DIAGNOSTIC_ONLY' | 'EXECUTION_ALLOWED';
+
+export type DailyTradingSummary = {
+  dateKey: string; // YYYY-MM-DD (Europe/Stockholm)
+  timezone: 'Europe/Stockholm';
+  executedTradeCount: number;
+  realizedPnLSek: number;
+  dailyLossSek: number;
+};
+
 
 export type PerformanceSummary = {
   totalTrades: number;

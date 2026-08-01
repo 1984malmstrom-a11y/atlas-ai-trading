@@ -35,7 +35,12 @@ import { fetchAndBuildFundamentalIntelligence } from '../paper-trader/fundamenta
 import { buildMacroSignalsMock, buildMacroSignals, buildMacroSnapshotFromInstruments } from './macro-signals';
 import { buildSectorStrengthSummaries, createSectorStrengthSignalForInstrument } from './sector-signals';
 import { buildVolumeSignal, buildTrendQualitySignal, buildSupportResistanceSignal } from './market-structure-signals';
+import { buildForexLaunchControlState, ForexLaunchControlState } from './forex-launch-control';
+import { buildForexLaunchChecklist } from './forex-launch-checklist';
 import { buildForexReadinessState, ForexReadinessState } from './forex-readiness';
+import buildDailyTradingSummary from './daily-trading-summary';
+import buildForexNoTradeSummary from './no-trade-summary';
+import { DEFAULT_PAPER_AUTO_MANDATE } from '../../domain/trading/victor-types';
 import fs from 'fs';
 import path from 'path';
 import computeNextPortfolioState from './portfolio-mutation';
@@ -62,6 +67,10 @@ type RuntimeState = {
   latestDecisionIntelligenceBySymbol?: Record<string, any>;
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
   forexReadiness?: ForexReadinessState | null;
+  forexAutonomyArmed?: boolean;
+  forexLaunchControl?: ForexLaunchControlState | null;
+  latestForexCycleStatus?: any;
+  forexNoTradeSummary?: any;
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -664,8 +673,20 @@ const runtime: RuntimeState = {
   autonomousEnabled: true,
   latestDecisionIntelligenceBySymbol: {},
   forexReadiness: null,
+  forexAutonomyArmed: false,
+  forexLaunchControl: null,
+  latestForexCycleStatus: null,
+  forexNoTradeSummary: null,
   // scheduler is represented by the global singleton; do not duplicate state here
 };
+
+export function setForexAutonomyArmed(armed: boolean){
+  try{ runtime.forexAutonomyArmed = !!armed; }catch(_){ }
+}
+
+export function getForexAutonomyArmed(){
+  try{ return !!runtime.forexAutonomyArmed; }catch(_){ return false; }
+}
 
 // Scheduler singleton stored at module scope to survive hot reloads in dev
 type SchedulerState = {
@@ -904,7 +925,56 @@ async function runAutomaticCycleImplementation(){
     const beforeCount = Array.isArray(beforeList) ? beforeList.length : 0;
     const beforeEvalCount = Array.isArray(beforeList) ? beforeList.filter((a:any)=> a && a.raw && a.raw.kind === 'EVALUATION').length : 0;
 
-    try{ cycleResult = await runManualPaperTradingCycle({ allowWhenScheduler: true }); }catch(e:any){ cycleError = e; }
+    // Evaluate launch control before executing the manual cycle when invoked by scheduler
+    let tickCycleId: string | null = null;
+    try{
+        tickCycleId = `auto_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+        const fr = runtime.forexReadiness || null;
+        const schedState = getGlobalScheduler();
+        // compute real daily counters for launch control
+        const daily = await buildDailyTradingSummary({ auditStore, now: new Date() }).catch(()=> ({ executedTradeCount: 0, realizedPnLSek: 0, dailyLossSek: 0, dateKey: new Date().toISOString(), timezone: 'Europe/Stockholm' }));
+        const maxTradesPerDay = typeof DEFAULT_PAPER_AUTO_MANDATE.maxTradesPerDay === 'number' && isFinite(DEFAULT_PAPER_AUTO_MANDATE.maxTradesPerDay) ? DEFAULT_PAPER_AUTO_MANDATE.maxTradesPerDay : 9999;
+        const pct = typeof DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent === 'number' && isFinite(DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent) ? DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent : 0;
+        const dailyLossLimitSek = Math.round(((runtime && typeof runtime.startCapital === 'number' ? runtime.startCapital : START_CAPITAL) * (pct/100)) * 100) / 100;
+        const lc = buildForexLaunchControlState({
+          now: new Date(),
+          forexReadiness: fr,
+          autonomousEnabled: !!runtime.autonomousEnabled,
+          schedulerEnabled: !!runtime.autonomousEnabled,
+          cycleLocked: !!schedState.inProgress,
+          tradesToday: typeof daily.executedTradeCount === 'number' ? daily.executedTradeCount : 0,
+          maxTradesPerDay,
+          dailyLossSek: typeof daily.dailyLossSek === 'number' ? daily.dailyLossSek : 0,
+          dailyLossLimitSek,
+          isArmed: !!runtime.forexAutonomyArmed,
+          cycleRunning: false,
+        });
+      // persist defensive copy for telemetry
+      try{ runtime.forexLaunchControl = JSON.parse(JSON.stringify(lc)); }catch(_){ runtime.forexLaunchControl = lc as any; }
+      // emit a lightweight audit for launch control check
+      try{ await auditStore.append({ kind: 'FOREX_LAUNCH_CONTROL', cycleId: tickCycleId, raw: Object.assign({}, lc, { executionMode: runtime.forexAutonomyArmed ? 'EXECUTION_ALLOWED' : 'DIAGNOSTIC_ONLY' }), createdAt: new Date().toISOString() } as any); }catch(_){ }
+
+      // If not safe to start cycle and there are eligible forex instruments, skip run
+      if (!lc.isSafeToStartCycle){
+        // determine whether any non-stock instrument eligible would be forex
+        const now = new Date();
+        const eligibleForex = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.filter(i => {
+          const enabled = (i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true);
+          if (!enabled) return false;
+          const type = i.assetType ? String(i.assetType).toUpperCase() : 'STOCK';
+          if (type === 'STOCK') return false;
+          return isInstrumentTradableNow(i, now);
+        }) : [];
+        // if any forex-like instruments eligible, skip
+        if (eligibleForex && eligibleForex.length > 0){
+          cycleResult = { skipped: true, code: 'launch_control_blocked', reason: lc.blockingReasons, cycleId: tickCycleId } as any;
+          // persist lastForexCycleStatus for telemetry
+          try{ runtime.latestForexCycleStatus = { cycleId: tickCycleId, status: 'SKIPPED', executionMode: 'DIAGNOSTIC_ONLY', startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), analyzedPairCount: 0, executionCandidateCount: 0, executedTradeCount: 0, blockingReasons: lc.blockingReasons.slice() }; }catch(_){ }
+        }
+      }
+    }catch(e){ /* non-fatal; continue trying to run */ }
+
+    try{ if (!cycleResult) cycleResult = await runManualPaperTradingCycle({ allowWhenScheduler: true, cycleId: tickCycleId || undefined } as any); }catch(e:any){ cycleError = e; }
 
     // snapshot after run
     let afterList: any[] = [];
@@ -1146,6 +1216,18 @@ export async function getPaperTradingState(){
     try{ runtime.latestMarketNewsActivity = latestActivity; }catch(_){ }
   }catch(_){ out.latestMarketNewsActivity = undefined; }
 
+  // Expose forex autonomy controls and diagnostics (defensive copies)
+  try{
+    out.forexAutonomyArmed = !!runtime.forexAutonomyArmed;
+  }catch(_){ out.forexAutonomyArmed = false; }
+  try{ out.forexLaunchControl = runtime.forexLaunchControl ? JSON.parse(JSON.stringify(runtime.forexLaunchControl)) : null; }catch(_){ out.forexLaunchControl = null; }
+  try{ out.latestForexCycleStatus = runtime.latestForexCycleStatus ? JSON.parse(JSON.stringify(runtime.latestForexCycleStatus)) : null; }catch(_){ out.latestForexCycleStatus = null; }
+  try{ out.forexNoTradeSummary = runtime.forexNoTradeSummary ? JSON.parse(JSON.stringify(runtime.forexNoTradeSummary)) : null; }catch(_){ out.forexNoTradeSummary = null; }
+  try{
+    const checklist = buildForexLaunchChecklist({ readiness: runtime.forexReadiness || null, launchControl: runtime.forexLaunchControl || null, tradesToday: 0, maxTradesPerDay: (runtime.forexLaunchControl && (runtime.forexLaunchControl as any).maxTradesPerDay) ? (runtime.forexLaunchControl as any).maxTradesPerDay : 9999, dailyLossSek: 0, dailyLossLimitSek: Number.POSITIVE_INFINITY, runtimeInitialized: true, previousCycleHealthy: true });
+    out.forexLaunchChecklist = checklist ? JSON.parse(JSON.stringify(checklist)) : null;
+  }catch(_){ out.forexLaunchChecklist = null; }
+
   return out;
 }
 
@@ -1227,7 +1309,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   }catch(e){}
 
   // Per-run cycle id for correlation (one-per-cycle)
-  const cycleId = `cycle_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+  const suppliedCycleId = (opts && (opts as any).cycleId) ? (opts as any).cycleId : null;
+  const cycleId = suppliedCycleId || `cycle_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
   const cycleStartMs = Date.now();
   // Helper to attach optional market news intelligence summary to a snapshot
   const attachMarketNewsSummary = (snapshot: any) => {
@@ -1289,6 +1372,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // Local per-run daily start value (undefined for file-backed/default runtime)
   let cycleDailyStartValue: number | undefined = undefined;
 
+  // Initialize latestForexCycleStatus for this run (RUNNING or DIAGNOSTIC_ONLY)
+  try{
+    // Compute daily counters so launch control can decide whether execution is allowed
+    const summary = await buildDailyTradingSummary({ auditStore, now: new Date() }).catch(()=> ({ executedTradeCount: 0, realizedPnLSek: 0, dailyLossSek: 0, dateKey: new Date().toISOString(), timezone: 'Europe/Stockholm' }));
+    const maxTradesPerDay = typeof DEFAULT_PAPER_AUTO_MANDATE.maxTradesPerDay === 'number' && isFinite(DEFAULT_PAPER_AUTO_MANDATE.maxTradesPerDay) ? DEFAULT_PAPER_AUTO_MANDATE.maxTradesPerDay : 9999;
+    const pct = typeof DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent === 'number' && isFinite(DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent) ? DEFAULT_PAPER_AUTO_MANDATE.maxDailyLossPercent : 0;
+    const dailyLossLimitSek = Math.round(((runtime && typeof runtime.startCapital === 'number' ? runtime.startCapital : START_CAPITAL) * (pct/100)) * 100) / 100;
+    const lc = buildForexLaunchControlState({ now: new Date(), forexReadiness: runtime.forexReadiness || null, autonomousEnabled: !!runtime.autonomousEnabled, schedulerEnabled: !!runtime.autonomousEnabled, cycleLocked: false, tradesToday: typeof summary.executedTradeCount === 'number' ? summary.executedTradeCount : 0, maxTradesPerDay, dailyLossSek: typeof summary.dailyLossSek === 'number' ? summary.dailyLossSek : 0, dailyLossLimitSek, isArmed: !!runtime.forexAutonomyArmed, cycleRunning: false });
+    const executionMode = (runtime.forexAutonomyArmed && lc.isSafeToExecuteOrders) ? 'EXECUTION_ALLOWED' : 'DIAGNOSTIC_ONLY';
+    runtime.latestForexCycleStatus = { cycleId, status: 'RUNNING', executionMode, startedAt: new Date().toISOString(), completedAt: null, analyzedPairCount: 0, executionCandidateCount: 0, executedTradeCount: 0, blockingReasons: [] };
+  }catch(_){ }
+
   // Build simple deterministic demo decision set
   // Determine eligible instruments for this cycle using per-instrument session rules.
   const nowForCycle = new Date();
@@ -1333,6 +1428,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     const now = nowIso();
     runtime.latestDecision = { id: `skip_${now}`, action: 'HOLD', reason: 'NO_ELIGIBLE_INSTRUMENTS' } as any;
     runtime.latestCycle = { processedCandidates: 0, executed: 0, rejects: 0, skipped: true } as any;
+    try{ runtime.latestForexCycleStatus = { cycleId, status: 'SKIPPED', executionMode: 'DIAGNOSTIC_ONLY', startedAt: now, completedAt: now, analyzedPairCount: 0, executionCandidateCount: 0, executedTradeCount: 0, blockingReasons: ['NO_ELIGIBLE_INSTRUMENTS'] }; }catch(_){ }
     runtime.lastUpdated = now;
     return { skipped: true, code: 'NO_ELIGIBLE_INSTRUMENTS' } as any;
   }
@@ -2288,6 +2384,21 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       try{ (cand as any).originalConfidence = origConf; }catch(_){ }
       try{ (cand as any).confidence = applyAdaptiveConfidencePolicy(origConf, adaptiveCtx); }catch(_){ }
     }catch(_){ }
+    // Enforcement: block Forex executions when cycle is DIAGNOSTIC_ONLY
+    try{
+      const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find(i => {
+        try{ const prov = String(i.providerSymbol || i.id || '').toUpperCase(); const sym = String(cand.symbol || '').toUpperCase(); return prov === sym || (i.id && String(i.id).toUpperCase() === sym); }catch(_){ return false; }
+      }) : null;
+      const isForexInstr = inst && inst.assetType && String(inst.assetType).toUpperCase().includes('FOREX');
+      const mode = runtime.latestForexCycleStatus && runtime.latestForexCycleStatus.executionMode ? runtime.latestForexCycleStatus.executionMode : 'DIAGNOSTIC_ONLY';
+      if (isForexInstr && mode === 'DIAGNOSTIC_ONLY'){
+        // Append a REJECT audit for blocked Forex candidate and continue (no broker, no simulation)
+        try{ await cycleAuditStore.append({ kind: 'REJECT', decision: cand, reason: { code: 'FOREX_DIAGNOSTIC_ONLY', message: 'Forex execution suppressed in diagnostic-only mode' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any); }catch(_){ }
+        try{ const dd = ensureDiag(sSym); if (dd) { dd.executionAttempted = false; dd.rejectionReason = 'FOREX_DIAGNOSTIC_ONLY'; } }catch(_){ }
+        rejects++;
+        continue;
+      }
+    }catch(_){ }
     const res = await cycleTrader.handleDecision(cand);
     try{ const dd = ensureDiag(sSym); dd.executionAttempted = true; }catch(_){ }
     if (res && res.accepted){
@@ -2661,6 +2772,15 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         }catch(_){ /* ignore */ }
       }
     }catch(_){ }
+  }catch(_){ }
+  // finalize latestForexCycleStatus based on results
+  try{
+    const res = runtime.latestCycle || {};
+    const executedCount = (res && typeof res.executed === 'number') ? res.executed : 0;
+    let status: any = 'ANALYZED';
+    if (executedCount > 0) status = 'EXECUTED';
+    if (res && (res.skipped === true)) status = 'SKIPPED';
+    runtime.latestForexCycleStatus = Object.assign({}, runtime.latestForexCycleStatus || {}, { cycleId, status, executionMode: (runtime.latestForexCycleStatus && runtime.latestForexCycleStatus.executionMode) ? runtime.latestForexCycleStatus.executionMode : 'DIAGNOSTIC_ONLY', completedAt: new Date().toISOString(), analyzedPairCount: (runtime.latestForexCycleStatus && runtime.latestForexCycleStatus.analyzedPairCount) ? runtime.latestForexCycleStatus.analyzedPairCount : 0, executionCandidateCount: (runtime.latestForexCycleStatus && runtime.latestForexCycleStatus.executionCandidateCount) ? runtime.latestForexCycleStatus.executionCandidateCount : 0, executedTradeCount: executedCount, blockingReasons: (runtime.latestForexCycleStatus && Array.isArray(runtime.latestForexCycleStatus.blockingReasons) ? runtime.latestForexCycleStatus.blockingReasons : []) });
   }catch(_){ }
   // update scheduler last/next when manual (automatic) cycle finishes
   return { ...runtime.latestCycle, evaluationCount };
