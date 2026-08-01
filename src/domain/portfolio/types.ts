@@ -2,7 +2,7 @@ export type Holding = {
   id: string;
   symbol: string;
   name: string;
-  assetType: 'Stock' | 'ETF' | 'Crypto' | 'Bond';
+  assetType: 'Stock' | 'ETF' | 'Crypto' | 'Bond' | 'Forex' | 'Commodity';
   quantity: number;
   averagePrice: number;
   currentPrice: number;

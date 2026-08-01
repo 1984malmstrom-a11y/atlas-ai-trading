@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { calculatePositionSize } from './position-sizing';
+import { calculatePositionSize, mapAssetTypeToCategory, detectAssetCategory } from './position-sizing';
 
 describe('calculatePositionSize', () => {
   it('requestedNotional under cap', () => {
@@ -44,5 +44,38 @@ describe('calculatePositionSize', () => {
 
     const r0 = calculatePositionSize({ ...base, confidence: 0 });
     expect(r0.confidenceAdjustedNotional).toBe(0);
+  });
+
+  it('asset category detection: stock/forex/commodity/unknown', ()=>{
+    expect(mapAssetTypeToCategory('Stock')).toBe('Stock');
+    expect(mapAssetTypeToCategory('ETF')).toBe('Stock');
+    expect(mapAssetTypeToCategory('Forex')).toBe('Forex');
+    expect(mapAssetTypeToCategory('Commodity')).toBe('Commodity');
+    expect(mapAssetTypeToCategory('Blah')).toBe('Unknown');
+
+    const p1 = { availableCash: 10000, totalValue: 10000, holdings: [{ symbol: 'EUR_USD', quantity: 1000 } as any] };
+    (p1.holdings[0] as any).assetType = 'Forex';
+    expect(detectAssetCategory(p1, 'EUR_USD')).toBe('Forex');
+
+    const p2 = { availableCash: 10000, totalValue: 10000, holdings: [{ symbol: 'XAU_USD', quantity: 1 } as any] };
+    (p2.holdings[0] as any).assetType = 'Commodity';
+    expect(detectAssetCategory(p2, 'XAU_USD')).toBe('Commodity');
+
+    const p3 = { availableCash: 10000, totalValue: 10000, holdings: [] };
+    expect(detectAssetCategory(p3, 'NOPE')).toBe('Unknown');
+  });
+
+  it('sizing identical across categories (stock/forex/commodity)', ()=>{
+    const base = { availableCash: 5000, totalValue: 10000, requestedNotionalSek: 800 };
+    const stock = calculatePositionSize({ ...base, assetType: 'Stock' });
+    const forex = calculatePositionSize({ ...base, assetType: 'Forex' });
+    const commodity = calculatePositionSize({ ...base, assetType: 'Commodity' });
+    // Results must be identical today
+    expect(forex.recommendedNotional).toBe(stock.recommendedNotional);
+    expect(commodity.recommendedNotional).toBe(stock.recommendedNotional);
+    expect(forex.confidenceAdjustedNotional).toBe(stock.confidenceAdjustedNotional);
+    expect(commodity.confidenceAdjustedNotional).toBe(stock.confidenceAdjustedNotional);
+    expect(forex.portfolioPercent).toBeCloseTo(stock.portfolioPercent);
+    expect(commodity.portfolioPercent).toBeCloseTo(stock.portfolioPercent);
   });
 });

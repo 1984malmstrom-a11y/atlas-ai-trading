@@ -115,4 +115,51 @@ describe('acquireRunCycleLock', () => {
     const s = await acquireRunCycleLock('k', 60);
     expect(s).toBe('ACQUIRED');
   });
+
+  describe('process-local fallback (in_memory dev)', ()=>{
+    beforeEach(()=>{
+      // ensure Upstash not configured
+      delete process.env.UPSTASH_REDIS_REST_URL;
+      delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      process.env.PAPER_TRADER_SCHEDULER_MODE = 'in_memory';
+      (process.env as any).NODE_ENV = 'development';
+      // clear any existing local locks
+      try{ delete (global as any).__ATLAS_LOCAL_RUN_CYCLE_LOCKS__; }catch(_){ }
+    });
+
+    it('first acquisition succeeds and second is duplicate', async ()=>{
+      const r1 = await acquireRunCycleLockWithOwner('local-key', 60);
+      expect(r1.status).toBe('ACQUIRED');
+      const r2 = await acquireRunCycleLockWithOwner('local-key', 60);
+      expect(r2.status).toBe('DUPLICATE');
+    });
+
+    it('owner can release and then a new acquisition succeeds', async ()=>{
+      const a = await acquireRunCycleLockWithOwner('local-key-2', 60);
+      expect(a.status).toBe('ACQUIRED');
+      const ok = await releaseRunCycleLock('local-key-2', (a as any).ownerToken);
+      expect(ok).toBe(true);
+      const b = await acquireRunCycleLockWithOwner('local-key-2', 60);
+      expect(b.status).toBe('ACQUIRED');
+    });
+
+    it('wrong owner cannot release lock', async ()=>{
+      const a = await acquireRunCycleLockWithOwner('local-key-3', 60);
+      expect(a.status).toBe('ACQUIRED');
+      const ok = await releaseRunCycleLock('local-key-3', 'bad-owner');
+      expect(ok).toBe(false);
+      // original owner can still release
+      const ok2 = await releaseRunCycleLock('local-key-3', (a as any).ownerToken);
+      expect(ok2).toBe(true);
+    });
+  });
+
+  it('production without Upstash returns UNAVAILABLE', async ()=>{
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    process.env.PAPER_TRADER_SCHEDULER_MODE = 'in_memory';
+    (process.env as any).NODE_ENV = 'production';
+    const res = await acquireRunCycleLockWithOwner('prod-key', 60);
+    expect(res.status).toBe('UNAVAILABLE');
+  });
 });

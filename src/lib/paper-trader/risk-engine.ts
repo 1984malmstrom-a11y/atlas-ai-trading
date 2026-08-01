@@ -4,6 +4,33 @@ import { calculatePortfolioExposure } from './portfolio-exposure';
 import { calculateDiversification } from './diversification';
 import { calculateDrawdown } from './drawdown';
 
+export type AssetCategory = 'Stock' | 'Forex' | 'Commodity' | 'Unknown';
+
+// Map a holding/instrument `assetType` string to a normalized AssetCategory.
+export function mapAssetTypeToCategory(assetType?: string): AssetCategory{
+  if (!assetType) return 'Unknown';
+  const t = String(assetType).toUpperCase();
+  if (t.includes('FOREX')) return 'Forex';
+  if (t.includes('COMMODITY')) return 'Commodity';
+  if (t.includes('STOCK') || t.includes('ETF')) return 'Stock';
+  return 'Unknown';
+}
+
+// Detect category for a symbol from a PortfolioSnapshot by inspecting holdings.assetType when present.
+export function detectAssetCategory(portfolio: PortfolioSnapshot | null, symbol?: string): AssetCategory{
+  try{
+    if (!portfolio || !symbol) return 'Unknown';
+    const sym = String(symbol).toUpperCase();
+    if (!Array.isArray(portfolio.holdings)) return 'Unknown';
+    const found = portfolio.holdings.find(h => (h && (h.symbol||'').toString().toUpperCase() === sym));
+    if (!found) return 'Unknown';
+    // If holding exposes assetType, map it; otherwise Unknown
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const at = (found as any).assetType;
+    return mapAssetTypeToCategory(typeof at === 'string' ? at : undefined);
+  }catch(_){ return 'Unknown'; }
+}
+
 export type RiskDecision = { allowed: boolean; reasons: string[] };
 
 export type PortfolioSnapshot = {
@@ -24,6 +51,7 @@ export type TradeDecision = {
 export type RiskEngineInput = {
   portfolio: PortfolioSnapshot;
   decision: TradeDecision;
+  adaptiveDecisionContext?: any;
   // optional runtime stats
   todaysTradeCount?: number;
   peakPortfolioValue?: number; // optional peak for drawdown calculations
@@ -161,12 +189,25 @@ export function evaluateRisk(input: RiskEngineInput): RiskReport{
     }
   }
 
+  // --- Asset category awareness (new helper) ---
+  // Determine asset category for the decision symbol using portfolio holdings when available.
+  const assetCategory = detectAssetCategory(portfolio, (decision && decision.symbol) ? decision.symbol : '');
+
   // Compute risk score
   let score = 100;
 
   // Position >10% penalty (fixed 10% threshold)
   if (decision.side === 'BUY'){
-    const sizingForScoring = calculatePositionSize({ availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, requestedNotionalSek: decision.requestedNotionalSek, maxPositionPercent, confidence: input.confidence });
+    // Use sizing logic per asset category (currently identical behavior across categories)
+    let sizingForScoring: any;
+    switch (assetCategory){
+      case 'Forex':
+      case 'Commodity':
+      case 'Stock':
+      default:
+          sizingForScoring = calculatePositionSize({ availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, requestedNotionalSek: decision.requestedNotionalSek, maxPositionPercent, confidence: input.confidence });
+        break;
+    }
     const exposure = calculatePortfolioExposure(portfolio);
     const intendedAdd = (typeof sizingForScoring.recommendedNotional === 'number' && Number.isFinite(sizingForScoring.recommendedNotional)) ? sizingForScoring.recommendedNotional : 0;
 
@@ -210,14 +251,57 @@ export function evaluateRisk(input: RiskEngineInput): RiskReport{
   if (score < 0) score = 0;
   if (score > 100) score = 100;
 
+  // Preserve original risk before adaptive adjustments
+  const originalRisk = score;
+  const effectiveRisk = applyAdaptiveRiskPolicy(typeof originalRisk === 'number' ? originalRisk : 0, (input as any).adaptiveDecisionContext);
+
   const level: 'LOW' | 'MEDIUM' | 'HIGH' = score >= 80 ? 'LOW' : (score >= 50 ? 'MEDIUM' : 'HIGH');
 
   const allowed = reasons.length === 0;
   // Attach recommendedNotional, exposure, diversification and drawdown for callers
-  const sizingFinal = calculatePositionSize({ availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, requestedNotionalSek: decision.requestedNotionalSek, maxPositionPercent, confidence: input.confidence });
+    const sizingFinal = calculatePositionSize({ availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, requestedNotionalSek: decision.requestedNotionalSek, maxPositionPercent, confidence: effectiveRisk });
+    try{ (sizingFinal as any).originalRisk = originalRisk; (sizingFinal as any).effectiveRisk = effectiveRisk; }catch(_){ }
   const exposureFinal = calculatePortfolioExposure(portfolio);
   const diversificationFinal = calculateDiversification(portfolio);
-  return { allowed, score, level, reasons, recommendedNotional: sizingFinal.recommendedNotional, exposure: exposureFinal, diversification: diversificationFinal, drawdown, positionSizing: { recommendedNotional: sizingFinal.recommendedNotional, confidenceAdjustedNotional: sizingFinal.confidenceAdjustedNotional } };
+    // Apply adaptive position size policy immediately after sizingFinal is produced
+    const originalPositionSize = typeof sizingFinal.confidenceAdjustedNotional === 'number' && Number.isFinite(sizingFinal.confidenceAdjustedNotional) ? sizingFinal.confidenceAdjustedNotional : sizingFinal.recommendedNotional;
+    const effectivePositionSize = applyAdaptivePositionSizePolicy(originalPositionSize, (input as any).adaptiveDecisionContext, sizingFinal.recommendedNotional);
+    // Override confidenceAdjustedNotional so execution uses effectivePositionSize while preserving original/effective separately
+    const positionSizing = { recommendedNotional: sizingFinal.recommendedNotional, confidenceAdjustedNotional: effectivePositionSize, originalPositionSize, effectivePositionSize } as any;
+    return { allowed, score, level, reasons, recommendedNotional: sizingFinal.recommendedNotional, exposure: exposureFinal, diversification: diversificationFinal, drawdown, positionSizing };
+}
+
+// Apply adaptive risk policy: deterministic, uses only adaptiveDecisionContext.riskBias,
+// clamps bias to +/-0.20 (fractional), applies multiplicative adjustment and clamps to 0-100
+export function applyAdaptiveRiskPolicy(originalRisk: number, adaptiveDecisionContext: any){
+  let orig = typeof originalRisk === 'number' && !Number.isNaN(originalRisk) ? originalRisk : 0;
+  const bias = (adaptiveDecisionContext && typeof adaptiveDecisionContext.riskBias === 'number') ? Number(adaptiveDecisionContext.riskBias) : 0;
+  const limitedBias = Math.max(-0.2, Math.min(0.2, bias));
+  let adjusted = orig * (1 + limitedBias);
+  adjusted = Math.max(0, Math.min(100, adjusted));
+  adjusted = Math.round(adjusted * 100) / 100;
+  return adjusted;
+}
+
+// Apply adaptive position size policy: deterministic, uses only confidenceBias and riskBias from adaptiveDecisionContext
+// - confidenceBias adjusts size by up to +/-10% (confidenceBias in points -> fraction by /100)
+// - riskBias adjusts size by up to +/-15% (interpret riskBias as fraction)
+// - combined adjustment limited to +/-20%
+// - final size clamped to engine limit passed as maxAllowed (recommendedNotional)
+export function applyAdaptivePositionSizePolicy(originalPositionSize: number, adaptiveDecisionContext: any, maxAllowed: number){
+  let orig = typeof originalPositionSize === 'number' && !Number.isNaN(originalPositionSize) ? originalPositionSize : 0;
+  const cb = (adaptiveDecisionContext && typeof adaptiveDecisionContext.confidenceBias === 'number') ? Number(adaptiveDecisionContext.confidenceBias) : 0;
+  // confidenceBias is expressed in percentage points (e.g., 5 -> 5 points), convert to fraction
+  let confFrac = cb / 100;
+  // limit confidence adjustment to +/-10%
+  confFrac = Math.max(-0.10, Math.min(0.10, confFrac));
+  let adjusted = orig * (1 + confFrac);
+  // Clamp to engine limits
+  const maxAllowedSafe = (typeof maxAllowed === 'number' && Number.isFinite(maxAllowed) && maxAllowed >= 0) ? maxAllowed : orig;
+  adjusted = Math.max(0, Math.min(maxAllowedSafe, adjusted));
+  // Deterministic rounding to 2 decimals
+  adjusted = Math.round(adjusted * 100) / 100;
+  return adjusted;
 }
 
 // Optional helper to use Decision Engine as final step. Uses dynamic import

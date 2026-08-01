@@ -1,9 +1,298 @@
 /* Server-side Twelve Data provider implementation */
 const _so = 'server' + '-only';
 void import(_so).catch(()=>{});
+  }
 
-import type { MarketDataProvider, MarketQuote } from './types';
-import { TRADABLE_INSTRUMENTS, findInstrumentById } from './instruments';
+  // Get FX rate from `fromCurrency` to SEK. Returns positive finite number or null on failure.
+import path from 'path';
+
+// Exported small parser for Twelve Data timestamps. Kept minimal and deterministic.
+export function parseTwelveTimestamp(cand: any): Date | null {
+  try{
+    if (cand === null || cand === undefined || cand === '') return null;
+    // numbers: detect seconds (10-digit) vs milliseconds (13-digit)
+    if (typeof cand === 'number'){
+      const n = Number(cand);
+      if (!Number.isFinite(n)) return null;
+      if (n > 1e12) return new Date(n); // ms
+      return new Date(Math.floor(n * 1000)); // seconds
+    }
+    const s = String(cand).trim();
+    if (/^[0-9]+$/.test(s)){
+      const n = Number(s);
+      if (!Number.isFinite(n)) return null;
+      if (s.length === 13 || n > 1e12) return new Date(n);
+      return new Date(Math.floor(n * 1000));
+    }
+
+    // Provider local datetime without offset (e.g. "2026-07-29 06:24:00")
+    // When requests used timezone=UTC we must treat this as UTC (append 'Z')
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)){
+      const iso = s.replace(' ', 'T') + 'Z';
+      const d = new Date(iso);
+      return isFinite(d.getTime()) ? d : null;
+    }
+
+    // Date only YYYY-MM-DD -> treat as UTC midnight
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)){
+      const [y, m, day] = s.split('-').map(x => Number(x));
+      if (Number.isFinite(y) && Number.isFinite(m) && Number.isFinite(day)){
+        return new Date(Date.UTC(y, m-1, day, 0, 0, 0));
+      }
+    }
+
+    // ISO with Z or offset — let Date parse reliably
+    const dAuto = new Date(s);
+    return isFinite(dAuto.getTime()) ? dAuto : null;
+  }catch(e){ return null; }
+}
+
+// --- Fundamental capability detection and lightweight adapters ---
+export type FundamentalCapabilityStatus = 'AVAILABLE' | 'UNAVAILABLE' | 'PLAN_RESTRICTED' | 'SYMBOL_UNSUPPORTED' | 'PROVIDER_ERROR';
+export type FundamentalCapabilities = {
+  checkedAt: string;
+  profile: FundamentalCapabilityStatus;
+  statistics: FundamentalCapabilityStatus;
+  incomeStatement: FundamentalCapabilityStatus;
+  balanceSheet: FundamentalCapabilityStatus;
+  cashFlow: FundamentalCapabilityStatus;
+  earnings: FundamentalCapabilityStatus;
+};
+
+async function safeFetchJson(url: string, timeout = 7000): Promise<any>{
+  const controller = new AbortController();
+  const id = setTimeout(()=> controller.abort(), timeout);
+  try{ const res = await fetch(url, { signal: controller.signal }); const txt = await res.text(); try{ return JSON.parse(txt); }catch(e){ return null; } }
+  finally{ clearTimeout(id); }
+}
+
+function interpretTdErrorMessage(msg: string | undefined): FundamentalCapabilityStatus {
+  if (!msg) return 'UNAVAILABLE';
+  const m = String(msg || '').toLowerCase();
+  if (m.includes('invalid symbol') || m.includes('unsupported symbol') || m.includes('not found')) return 'SYMBOL_UNSUPPORTED';
+  if (m.includes('subscription') || m.includes('premium') || m.includes('plan')) return 'PLAN_RESTRICTED';
+  return 'UNAVAILABLE';
+}
+
+export async function detectFundamentalCapabilities(symbol: string): Promise<FundamentalCapabilities> {
+  try{
+    const key = process.env.TWELVE_DATA_API_KEY;
+    const checkedAt = new Date().toISOString();
+    if (!key) return { checkedAt, profile: 'PROVIDER_ERROR', statistics: 'PROVIDER_ERROR', incomeStatement: 'PROVIDER_ERROR', balanceSheet: 'PROVIDER_ERROR', cashFlow: 'PROVIDER_ERROR', earnings: 'PROVIDER_ERROR' };
+    const sym = encodeURIComponent(String(symbol || '').trim());
+    if (!sym) return { checkedAt, profile: 'SYMBOL_UNSUPPORTED', statistics: 'SYMBOL_UNSUPPORTED', incomeStatement: 'SYMBOL_UNSUPPORTED', balanceSheet: 'SYMBOL_UNSUPPORTED', cashFlow: 'SYMBOL_UNSUPPORTED', earnings: 'SYMBOL_UNSUPPORTED' };
+
+    const endpoints: [keyof Omit<FundamentalCapabilities,'checkedAt'>, string][] = [
+      ['profile', `https://api.twelvedata.com/profile?symbol=${sym}&apikey=${key}`],
+      ['statistics', `https://api.twelvedata.com/statistics?symbol=${sym}&apikey=${key}`],
+      ['incomeStatement', `https://api.twelvedata.com/income_statement?symbol=${sym}&apikey=${key}&interval=annual&outputsize=1`],
+      ['balanceSheet', `https://api.twelvedata.com/balance_sheet?symbol=${sym}&apikey=${key}&interval=annual&outputsize=1`],
+      ['cashFlow', `https://api.twelvedata.com/cash_flow?symbol=${sym}&apikey=${key}&interval=annual&outputsize=1`],
+      ['earnings', `https://api.twelvedata.com/earnings?symbol=${sym}&apikey=${key}`],
+    ];
+
+    const results = await Promise.all(endpoints.map(async ([k, url])=>{
+      try{
+        const data = await safeFetchJson(url, 7000);
+        if (!data) return [k, 'UNAVAILABLE'] as const;
+        if (data.status === 'error' || (data.message && typeof data.message === 'string')){
+          const code = interpretTdErrorMessage(data.message || data.status || undefined);
+          return [k, code] as const;
+        }
+        // Some endpoints return arrays or objects — treat non-empty as AVAILABLE
+        const hasPayload = (Array.isArray(data) && data.length > 0) || (data && typeof data === 'object' && Object.keys(data).length > 0);
+        return [k, hasPayload ? 'AVAILABLE' : 'UNAVAILABLE'] as const;
+      }catch(e){ return [k, 'UNAVAILABLE'] as const; }
+    }));
+
+    const out: any = { checkedAt };
+    for (const [k, v] of results){ out[k as string] = v; }
+    // ensure all keys present
+    return { checkedAt, profile: out.profile || 'UNAVAILABLE', statistics: out.statistics || 'UNAVAILABLE', incomeStatement: out.incomeStatement || 'UNAVAILABLE', balanceSheet: out.balanceSheet || 'UNAVAILABLE', cashFlow: out.cashFlow || 'UNAVAILABLE', earnings: out.earnings || 'UNAVAILABLE' };
+  }catch(e){ return { checkedAt: new Date().toISOString(), profile: 'PROVIDER_ERROR', statistics: 'PROVIDER_ERROR', incomeStatement: 'PROVIDER_ERROR', balanceSheet: 'PROVIDER_ERROR', cashFlow: 'PROVIDER_ERROR', earnings: 'PROVIDER_ERROR' }; }
+}
+
+// Lightweight fetch adapters that return small typed objects or null on failure. Keep parsing defensive and numeric conversions safe.
+function toNumberSafe(v: any): number | undefined { if (v === null || v === undefined || v === '') return undefined; const n = typeof v === 'number' ? v : Number(v); if (!Number.isFinite(n)) return undefined; return n; }
+
+export async function fetchCompanyProfile(symbol: string): Promise<any | null> {
+  try{
+    const key = process.env.TWELVE_DATA_API_KEY; if (!key) return null;
+    const sym = encodeURIComponent(String(symbol || '').trim()); if (!sym) return null;
+    const url = `https://api.twelvedata.com/profile?symbol=${sym}&apikey=${key}`;
+    const data = await safeFetchJson(url, 7000); if (!data) return null;
+    if (data.status === 'error') return null;
+    return { name: data.name || data.description, sector: data.sector, industry: data.industry, country: data.country, exchange: data.exchange, website: data.website };
+  }catch(e){ return null; }
+}
+
+export async function fetchCompanyStatistics(symbol: string): Promise<any | null> {
+  try{
+    const key = process.env.TWELVE_DATA_API_KEY; if (!key) return null;
+    const sym = encodeURIComponent(String(symbol || '').trim()); if (!sym) return null;
+    const url = `https://api.twelvedata.com/statistics?symbol=${sym}&apikey=${key}`;
+    const data = await safeFetchJson(url, 7000); if (!data) return null;
+    if (data.status === 'error') return null;
+    // map selected fields
+    const out: any = {};
+    out.currency = data.currency || data.fiscal_currency;
+    out.revenue = toNumberSafe(data.revenue ?? data.total_revenue ?? data.annual_revenue);
+    out.netIncome = toNumberSafe(data.net_income ?? data.netprofit ?? data.net_profit);
+    out.grossMarginPercent = toNumberSafe(data.gross_margin ?? data.grossMargin ?? data.gross_margin_percent);
+    out.operatingMarginPercent = toNumberSafe(data.operating_margin ?? data.operatingMargin ?? data.operating_margin_percent);
+    out.netMarginPercent = toNumberSafe(data.net_margin ?? data.netMargin ?? data.net_margin_percent);
+    out.returnOnEquityPercent = toNumberSafe(data.return_on_equity ?? data.returnOnEquity ?? data.roe);
+    out.debtToEquity = toNumberSafe(data.debt_to_equity ?? data.debtToEquity ?? data.debt_equity_ratio);
+    out.currentRatio = toNumberSafe(data.current_ratio ?? data.currentRatio);
+    out.interestCoverage = toNumberSafe(data.interest_coverage ?? data.ebit_interest_coverage);
+    out.marketCapitalization = toNumberSafe(data.market_capitalization ?? data.market_cap ?? data.marketCapitalization);
+    out.trailingPe = toNumberSafe(data.pe ?? data.trailing_pe ?? data.trailingPe);
+    out.forwardPe = toNumberSafe(data.forward_pe ?? data.forwardPe);
+    return out;
+  }catch(e){ return null; }
+}
+
+async function fetchSingleAnnualEndpoint(symbol: string, endpoint: string): Promise<any[] | null> {
+  try{
+    const key = process.env.TWELVE_DATA_API_KEY; if (!key) return null;
+    const sym = encodeURIComponent(String(symbol || '').trim()); if (!sym) return null;
+    const url = `${endpoint}?symbol=${sym}&apikey=${key}&interval=annual&outputsize=5`;
+    const data = await safeFetchJson(url, 8000); if (!data) return null;
+    if (data.status === 'error') return null;
+    const values = Array.isArray(data.values) ? data.values : (Array.isArray(data.data) ? data.data : []);
+    if (!Array.isArray(values) || values.length === 0) return null;
+    // Normalize to array oldest->newest
+    const out = values.slice().map((v:any)=> v).filter(Boolean);
+    return out.length ? out : null;
+  }catch(e){ return null; }
+}
+
+export async function fetchIncomeStatement(symbol: string): Promise<any[] | null> { return fetchSingleAnnualEndpoint(symbol, 'https://api.twelvedata.com/income_statement'); }
+export async function fetchBalanceSheet(symbol: string): Promise<any[] | null> { return fetchSingleAnnualEndpoint(symbol, 'https://api.twelvedata.com/balance_sheet'); }
+export async function fetchCashFlow(symbol: string): Promise<any[] | null> { return fetchSingleAnnualEndpoint(symbol, 'https://api.twelvedata.com/cash_flow'); }
+
+export async function fetchEarnings(symbol: string): Promise<any[] | null> {
+  try{
+    const key = process.env.TWELVE_DATA_API_KEY; if (!key) return null;
+    const sym = encodeURIComponent(String(symbol || '').trim()); if (!sym) return null;
+    const url = `https://api.twelvedata.com/earnings?symbol=${sym}&apikey=${key}&outputsize=5`;
+    const data = await safeFetchJson(url, 7000); if (!data) return null;
+    if (data.status === 'error') return null;
+    const values = Array.isArray(data.values) ? data.values : (Array.isArray(data.data) ? data.data : []);
+    if (!Array.isArray(values) || values.length === 0) return null;
+    return values.slice();
+  }catch(e){ return null; }
+}
+
+
+// Extracted quote parser so batch-mapping and class methods can share logic.
+export function parseQuoteResponse(raw: any, instrumentId: string): MarketQuote {
+  // reuse logic from former class method
+  const price = Number(raw.price ?? raw.close ?? raw.last_price ?? NaN);
+  const prev = Number(raw.previous_close ?? raw.prev_close ?? raw.close_prev ?? raw.close ?? NaN);
+  if (!Number.isFinite(price) || price <= 0) throw new Error('Invalid price from provider');
+  const change = Number.isFinite(Number(raw.change)) ? Number(raw.change) : (Number.isFinite(price) && Number.isFinite(prev) ? price - prev : 0);
+  const changePct = Number.isFinite(Number(raw.percent_change)) ? Number(raw.percent_change) : (Number.isFinite(prev) && prev !== 0 ? (price - prev) / prev * 100 : 0);
+  const sym = String(raw.symbol || raw.ticker || '').toUpperCase();
+  const exchange = String(raw.exchange || raw.exchange_short || '').toUpperCase() || 'UNKNOWN';
+  const name = String(raw.name || '');
+  const currency = String(raw.currency || raw.currency_base || raw.currency_quote || '').toUpperCase() || 'UNKNOWN';
+  // pick best timestamp candidates
+  const tsCandidates = [raw.last_quote_at, raw.last_trade_time, raw.updated_at, raw.timestamp, raw.datetime, raw.status_time, raw.ts, raw.datetime_utc];
+  let tsDate: Date | null = null;
+  for (const cand of tsCandidates){
+    if (cand === null || cand === undefined || cand === '') continue;
+    try{ const parsed = parseTwelveTimestamp(cand); if (parsed){ tsDate = parsed; break; } }catch(e){ }
+  }
+  if (!tsDate) tsDate = new Date();
+  const timestamp = tsDate.toISOString();
+  const isStale = (()=>{ try{ const ageSec = (Date.now() - tsDate.getTime())/1000; return ageSec > 120; }catch(e){ return true; } })();
+  const dataStatus: 'REALTIME' | 'DELAYED' | 'UNKNOWN' = ((): any => {
+    try{ if (raw.is_market_open === true) return 'REALTIME'; if (raw.is_market_open === false) return 'DELAYED'; if (raw.is_realtime === true || raw.is_realtime === 'true') return 'REALTIME'; return 'UNKNOWN'; }catch(e){ return 'UNKNOWN'; }
+  })();
+
+  return {
+    instrumentId,
+    symbol: sym || instrumentId,
+    exchange,
+    name,
+    price: price,
+    previousClose: Number(prev) || 0,
+    change: Number(change) || 0,
+    changePercent: Number(changePct) || 0,
+    currency,
+    timestamp,
+    source: 'twelve-data',
+    isStale,
+    dataStatus,
+  };
+}
+
+// Robust mapper that handles multiple Twelve Data batch response shapes and returns parsed MarketQuote[]
+export function mapProviderBatchResponse(data: any, idToSymbol: Map<string,string>): any[] {
+  const out: any[] = [];
+  // Build reverse lookup: providerSymbolUpper -> instrumentId
+  const providerToId = new Map<string,string>();
+  for (const [id, sym] of idToSymbol.entries()){
+    if (sym) providerToId.set(String(sym).toUpperCase(), id);
+    providerToId.set(String(id).toUpperCase(), id); // allow instrument id as fallback key
+  }
+
+  // Helper to try to resolve a provider object to instrument id
+  const resolveAndParse = (rawObj: any, providerKeyCandidate?: string) => {
+    try{
+      // read possible symbol fields
+      const fields = [rawObj.symbol, rawObj.ticker, providerKeyCandidate, rawObj.requestedSymbol, rawObj.exchange_symbol, rawObj.s];
+      for (const f of fields){
+        if (!f) continue;
+        const up = String(f).toUpperCase();
+        const id = providerToId.get(up);
+        if (id){
+          const parsed: any = parseQuoteResponse(rawObj, id) as any;
+          // ensure providerSymbol is set on output
+          try{ if (!parsed.provider) parsed.provider = 'twelve-data'; }catch(_){ }
+          try{ parsed.providerSymbol = (idToSymbol.get(id) || up); }catch(_){ parsed.providerSymbol = up; }
+          return parsed;
+        }
+      }
+      return null;
+    }catch(e){ return null; }
+  };
+
+  // Case 1: array of quote objects
+  if (Array.isArray(data)){
+    for (const d of data){
+      const p = resolveAndParse(d);
+      if (p) out.push(p);
+    }
+    return out;
+  }
+
+  // Case 2: object keyed by provider symbols or instrument ids (e.g. { MSFT: {...}, AAPL: {...} })
+  if (data && typeof data === 'object'){
+    // If object directly represents a single quote (has symbol), try parsing it first
+    if (data.symbol || data.ticker || data.price || data.close){
+      const p = resolveAndParse(data);
+      if (p) out.push(p);
+      return out;
+    }
+
+    // Otherwise iterate keys
+    for (const key of Object.keys(data)){
+      try{
+        const val = (data as any)[key];
+        if (!val) continue;
+        // key might be providerSymbol; try parse with key as hint
+        const p = resolveAndParse(val, key);
+        if (p) out.push(p);
+      }catch(e){ continue; }
+    }
+    return out;
+  }
+
+  // Unknown shape -> return empty (caller may fall back to per-id fetch)
+  return out;
+}
 
 type TDSearchResult = {
   symbol: string;
@@ -11,6 +300,104 @@ type TDSearchResult = {
   currency: string;
   name?: string;
 };
+
+// Public symbol lookup: validate an exact configured provider symbol without exposing raw provider payloads
+export async function lookupTwelveSymbolExact(providerSymbol: string, timeout = 8000): Promise<{ found: boolean; exactMatch: boolean; assetType?: string; exchange?: string; error?: string | null }>{
+  try{
+    if (!providerSymbol || typeof providerSymbol !== 'string') return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' };
+    const key = process.env.TWELVE_DATA_API_KEY;
+    if (!key) return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' };
+    const sym = String(providerSymbol).trim();
+    if (!sym) return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' };
+    const q = encodeURIComponent(sym);
+    const url = `https://api.twelvedata.com/symbol_search?symbol=${q}&apikey=${key}`;
+    const controller = new AbortController();
+    const id = setTimeout(()=> controller.abort(), timeout);
+    let res: any = null;
+    try{ res = await fetch(url, { signal: controller.signal }); }catch(e){ return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' }; }finally{ clearTimeout(id); }
+    if (!res || !res.ok) return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' };
+    let data: any = null;
+    try{ data = await res.json(); }catch(e){ return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' }; }
+    const candidates: any[] = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);
+    if (!Array.isArray(candidates) || candidates.length === 0) return { found: false, exactMatch: false, error: null };
+    // try to find exact symbol match (case-insensitive)
+    const upper = sym.toUpperCase();
+    for (const c of candidates){
+      try{
+        const csym = String(c.symbol || c.exchange_symbol || c.ticker || '').toUpperCase().trim();
+        if (csym === upper){
+          const assetType = (c.type || c.asset_type || c.instrument_type || c.security_type || c.category || '') as string;
+          const exchange = String(c.exchange || c.exchange_short || c.region || '').trim() || undefined;
+          return { found: true, exactMatch: true, assetType: assetType || undefined, exchange: exchange || undefined, error: null };
+        }
+      }catch(e){ continue; }
+    }
+    // candidates exist but none matched exactly
+    return { found: true, exactMatch: false, error: null };
+  }catch(e){ return { found: false, exactMatch: false, error: 'PROVIDER_ERROR' }; }
+}
+
+export type TwelveSymbolCandidate = {
+  symbol: string;
+  instrumentName?: string;
+  instrumentType?: string;
+  exchange?: string;
+  country?: string;
+};
+// Internal: normalize a raw provider candidate to our public TwelveSymbolCandidate shape.
+function normalizeTdCandidate(raw: any): TwelveSymbolCandidate | null {
+  try{
+    if (!raw || typeof raw !== 'object') return null;
+    // Accept many possible field names
+    const symbol = String(raw.symbol || raw.exchange_symbol || raw.ticker || raw.s || raw.code || '').trim();
+    if (!symbol) return null;
+    const instrumentName = String(raw.instrument_name || raw.instrumentName || raw.name || raw.title || raw.description || '').trim() || undefined;
+    const instrumentType = String(raw.instrument_type || raw.instrumentType || raw.type || raw.security_type || raw.category || '').trim() || undefined;
+    const exchange = String(raw.exchange || raw.exchange_short || raw.region || raw.mic_code || '').trim() || undefined;
+    const country = String(raw.country || raw.region || raw.country_code || '').trim() || undefined;
+    return {
+      symbol: symbol.toUpperCase(),
+      instrumentName: instrumentName || undefined,
+      instrumentType: instrumentType || undefined,
+      exchange: exchange || undefined,
+      country: country || undefined,
+    };
+  }catch(e){ return null; }
+}
+
+export async function searchTwelveSymbolCandidates(query: string, timeout = 8000): Promise<TwelveSymbolCandidate[]>{
+  try{
+    const q = String(query || '').trim();
+    if (!q) return [];
+    const key = process.env.TWELVE_DATA_API_KEY;
+    if (!key) return [];
+    const encoded = encodeURIComponent(q);
+    const url = `https://api.twelvedata.com/symbol_search?symbol=${encoded}&apikey=${key}`;
+    const controller = new AbortController();
+    const id = setTimeout(()=> controller.abort(), timeout);
+    let res: any = null;
+    try{ res = await fetch(url, { signal: controller.signal }); }catch(e){ return []; }finally{ clearTimeout(id); }
+    if (!res || !res.ok) return [];
+    let data: any = null;
+    try{ data = await res.json(); }catch(e){ return []; }
+    const candidatesRaw: any[] = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);
+    if (!Array.isArray(candidatesRaw) || candidatesRaw.length === 0) return [];
+    const seen = new Set<string>();
+    const out: TwelveSymbolCandidate[] = [];
+    for (const raw of candidatesRaw){
+      try{
+        const c = normalizeTdCandidate(raw);
+        if (!c) continue;
+        const keyId = (c.symbol + '|' + (c.exchange || '')).toUpperCase();
+        if (seen.has(keyId)) continue;
+        seen.add(keyId);
+        out.push(c);
+        if (out.length >= 10) break;
+      }catch(e){ continue; }
+    }
+    return out;
+  }catch(e){ return []; }
+}
 
 export class TwelveDataMarketDataProvider implements MarketDataProvider {
   private apiKey: string;
@@ -70,18 +457,26 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
         // Normalize: values[0] is newest — drop today's incomplete candle if present
         const items = values.slice();
         // Build (date, close) pairs, filter invalid/negative prices
-        const pairs: { date: string; close: number }[] = [];
-        for (const it of items){
-          const rawDate = (it.datetime || it.date || it.timestamp || '').toString();
-          const closeRaw = it.close ?? it.c ?? it.value ?? null;
-          const close = typeof closeRaw === 'string' ? Number(closeRaw) : Number(closeRaw);
-          if (!rawDate || !Number.isFinite(close) || close <= 0) continue;
-          // Normalize to YYYY-MM-DD (first 10 chars) if possible
-          const cand = rawDate.length >= 10 ? rawDate.slice(0,10) : rawDate;
-          // Accept only valid YYYY-MM-DD strings
-          if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(cand)) continue;
-          pairs.push({ date: cand, close });
-        }
+              // Build (date, close, volume?) pairs, filter invalid/negative prices; accept numeric strings for close/volume
+              const pairs: { date: string; close: number; volume?: number | null }[] = [];
+              for (const it of items){
+                const rawDate = (it.datetime || it.date || it.timestamp || '').toString();
+                const closeRaw = it.close ?? it.c ?? it.value ?? null;
+                const volumeRaw = it.volume ?? it.v ?? it.vol ?? null;
+                const close = typeof closeRaw === 'string' ? Number(closeRaw) : Number(closeRaw);
+                let volume: number | null = null;
+                if (volumeRaw !== null && volumeRaw !== undefined){
+                  const parsed = typeof volumeRaw === 'string' ? Number(volumeRaw) : Number(volumeRaw);
+                  if (Number.isFinite(parsed) && parsed >= 0) volume = parsed;
+                  else volume = null;
+                }
+                if (!rawDate || !Number.isFinite(close) || close <= 0) continue; // ignore rows without valid close
+                // Normalize to YYYY-MM-DD (first 10 chars) if possible
+                const cand = rawDate.length >= 10 ? rawDate.slice(0,10) : rawDate;
+                // Accept only valid YYYY-MM-DD strings
+                if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(cand)) continue;
+                pairs.push({ date: cand, close, volume });
+              }
 
         if (pairs.length === 0) throw Object.assign(new Error('No valid historical values'), { code: 'INSUFFICIENT_HISTORY' });
 
@@ -95,15 +490,20 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
         });
 
         // Remove duplicates keeping the last seen (newest) for a date, then sort oldest->newest
-        const byDate = new Map<string, number>();
-        for (const p of filtered){ byDate.set(p.date, p.close); }
-        const sortedDates = Array.from(byDate.keys()).sort((a,b)=> a < b ? -1 : a > b ? 1 : 0);
-        const closes = sortedDates.map(d => byDate.get(d) as number);
+        const byDateClose = new Map<string, number>();
+        const byDateVolume = new Map<string, number | null>();
+        for (const p of filtered){ byDateClose.set(p.date, p.close); byDateVolume.set(p.date, (p.volume !== undefined ? p.volume : null)); }
+        const sortedDates = Array.from(byDateClose.keys()).sort((a,b)=> a < b ? -1 : a > b ? 1 : 0);
+        const closes = sortedDates.map(d => byDateClose.get(d) as number);
+        const volumes = sortedDates.map(d => byDateVolume.has(d) ? (byDateVolume.get(d) as number | null) : null);
 
         // Ensure at least 20 completed days after filtering
         if (closes.length < 20) throw Object.assign(new Error(`Insufficient history: have ${closes.length}`), { code: 'INSUFFICIENT_HISTORY' });
 
-        const out = { symbol: sym, closes, dates: sortedDates, source: 'twelve-data', fetchedAt: new Date().toISOString() };
+        // Only return volumes if we have enough valid lined volume values (all entries must be valid numbers)
+        const validVolumeCount = volumes.filter(v => Number.isFinite(v) && (v as number) >= 0).length;
+        const out: any = { symbol: sym, closes, dates: sortedDates, source: 'twelve-data', fetchedAt: new Date().toISOString() };
+        if (validVolumeCount === volumes.length && validVolumeCount >= 10){ out.volumes = volumes.map(v => Number(v)); }
         this.histCache.set(key, { expires: Date.now() + this.histTtlMs, v: out });
         return out;
       }finally{ this.histPending.delete(key); }
@@ -146,64 +546,7 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
     return null;
   }
 
-  private parseQuoteResponse(raw: any, instrumentId: string): MarketQuote {
-    // raw expected to include price/close/previous_close etc.
-    const price = Number(raw.price ?? raw.close ?? raw.last_price ?? NaN);
-    const prev = Number(raw.previous_close ?? raw.prev_close ?? raw.close_prev ?? raw.close ?? NaN);
-    if (!this.isValidNumber(price) || price <= 0) throw new Error('Invalid price from provider');
-    const change = this.isValidNumber(raw.change) ? Number(raw.change) : (this.isValidNumber(price) && this.isValidNumber(prev) ? price - prev : 0);
-    const changePct = this.isValidNumber(raw.percent_change) ? Number(raw.percent_change) : (this.isValidNumber(prev) && prev !== 0 ? (price - prev) / prev * 100 : 0);
-    const sym = String(raw.symbol || raw.ticker || '').toUpperCase();
-    const exchange = String(raw.exchange || raw.exchange_short || '').toUpperCase() || 'UNKNOWN';
-    const name = String(raw.name || '');
-    const currency = String(raw.currency || raw.currency_base || raw.currency_quote || '').toUpperCase() || 'UNKNOWN';
-    // Prefer the freshest timestamp candidates from Twelve Data:
-    // 1) last_quote_at, 2) last_trade_time, 3) updated_at, 4) timestamp, then other fallbacks
-    const tsRaw = raw.last_quote_at ?? raw.last_trade_time ?? raw.updated_at ?? raw.timestamp ?? raw.datetime ?? raw.status_time ?? raw.ts ?? raw.datetime_utc ?? null;
-    // Normalize timestamp: try candidates in priority order and fall through invalid values
-    const tsCandidates = [raw.last_quote_at, raw.last_trade_time, raw.updated_at, raw.timestamp, raw.datetime, raw.status_time, raw.ts, raw.datetime_utc];
-    let tsDate: Date | null = null;
-    for (const cand of tsCandidates){
-      if (cand === null || cand === undefined || cand === '') continue;
-      try{
-        let candidateDate: Date;
-        if (typeof cand === 'number') candidateDate = new Date(cand < 1e12 ? Math.floor(cand * 1000) : cand);
-        else if (/^[0-9]+$/.test(String(cand))) { const n = Number(cand); candidateDate = new Date(n < 1e12 ? Math.floor(n * 1000) : n); }
-        else candidateDate = new Date(String(cand));
-        if (isFinite(candidateDate.getTime())){ tsDate = candidateDate; break; }
-      }catch(e){ /* try next candidate */ }
-    }
-    if (!tsDate) tsDate = new Date();
-    const timestamp = tsDate.toISOString();
-    const isStale = (()=>{
-      try{ const ageSec = (Date.now() - tsDate.getTime())/1000; return ageSec > 120; }catch(e){ return true; }
-    })();
-    // Determine data status: prefer explicit provider hint, otherwise unknown
-    const dataStatus: 'REALTIME' | 'DELAYED' | 'UNKNOWN' = ((): any => {
-      try{
-        if (raw.is_market_open === true) return 'REALTIME';
-        if (raw.is_market_open === false) return 'DELAYED';
-        if (raw.is_realtime === true || raw.is_realtime === 'true') return 'REALTIME';
-        return 'UNKNOWN';
-      }catch(e){ return 'UNKNOWN'; }
-    })();
 
-    return {
-      instrumentId,
-      symbol: sym || instrumentId,
-      exchange,
-      name,
-      price: price,
-      previousClose: Number(prev) || 0,
-      change: Number(change) || 0,
-      changePercent: Number(changePct) || 0,
-      currency,
-      timestamp,
-      source: 'twelve-data',
-      isStale,
-      dataStatus,
-    };
-  }
 
   private cacheSet(key: string, v: MarketQuote){ this.cache.set(key, { expires: Date.now() + this.ttlMs, v }); }
   private cacheGet(key: string){ const e = this.cache.get(key); if (!e) return undefined; if (e.expires < Date.now()){ this.cache.delete(key); return undefined; } return e.v; }
@@ -232,11 +575,72 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
 
         // fetch quote
         const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(providerSymbol)}&apikey=${this.apiKey}`;
-        const res = await this.fetchWithTimeout(url);
+        const diagBase: any = { requestedSymbol: providerSymbol, providerSymbol, instrumentId, timestamp: new Date().toISOString() };
+        let httpStatus: number | null = null;
+        let providerErrorCode: string | null = null;
+        let providerErrorMessage: string | null = null;
+        let responseFieldNames: string[] = [];
+        let rawPriceValue: any = null;
+        let parsedPrice: number | null = null;
+        let rawTimestampValue: any = null;
+        let parsedTimestamp: string | null = null;
+        let timestampUnitDetected: string | null = null;
+        let quoteAgeSeconds: number | null = null;
+        let stale = true;
+        let finalRuntimeKey: string | null = providerSymbol;
+        let accepted = false;
+
+        const res = await this.fetchWithTimeout(url).catch(e=>{ throw e; });
+        httpStatus = res && typeof res.status === 'number' ? res.status : null;
+        let data: any = null;
+        try{ data = await res.json(); }catch(e){ data = null; }
+        if (data && typeof data === 'object') responseFieldNames = Object.keys(data);
+        // Avoid logging full payload. Extract candidate price/timestamp fields only
+        rawPriceValue = data ? (data.price ?? data.close ?? data.last_price ?? data.close_price ?? null) : null;
+        rawTimestampValue = data ? (data.last_quote_at ?? data.last_trade_time ?? data.updated_at ?? data.timestamp ?? data.datetime ?? data.ts ?? null) : null;
+
+        // detect timestamp unit
+        try{
+          if (rawTimestampValue !== null && rawTimestampValue !== undefined){
+            if (typeof rawTimestampValue === 'number'){
+              if (rawTimestampValue > 1e12) timestampUnitDetected = 'milliseconds';
+              else if (rawTimestampValue > 1e9) timestampUnitDetected = 'seconds';
+              else timestampUnitDetected = 'seconds';
+              const ms = (timestampUnitDetected === 'milliseconds') ? Number(rawTimestampValue) : Math.floor(Number(rawTimestampValue) * 1000);
+              const dt = new Date(ms);
+              if (isFinite(dt.getTime())){ parsedTimestamp = dt.toISOString(); quoteAgeSeconds = Math.round((Date.now()-dt.getTime())/1000); stale = quoteAgeSeconds > 120; }
+            } else {
+              const dt = new Date(String(rawTimestampValue));
+              if (isFinite(dt.getTime())){ parsedTimestamp = dt.toISOString(); quoteAgeSeconds = Math.round((Date.now()-dt.getTime())/1000); stale = quoteAgeSeconds > 120; timestampUnitDetected = 'iso'; }
+            }
+          }
+        }catch(e){ /* swallow */ }
+
+        // parse numerical price candidate
+        try{ parsedPrice = rawPriceValue === null || rawPriceValue === undefined ? null : Number(rawPriceValue); if (parsedPrice !== null && (!Number.isFinite(parsedPrice) || parsedPrice <= 0)) parsedPrice = null; }catch(e){ parsedPrice = null; }
+
+        // evaluate acceptance
+        accepted = parsedPrice !== null && parsedPrice > 0 && parsedTimestamp !== null && stale === false && typeof httpStatus === 'number' && httpStatus >= 200 && httpStatus < 300;
+
+        // capture provider-level errors
+        if (!res.ok){ providerErrorMessage = `HTTP ${res.status}`; providerErrorCode = 'HTTP_ERROR'; }
+        if (data && data.status === 'error'){ providerErrorCode = (data.code && String(data.code)) || providerErrorCode || 'PROVIDER_ERROR'; providerErrorMessage = String(data.message || JSON.stringify(data)); }
+
+        // append diagnostic only for NVDA instrument to avoid noise
+        try{
+          if (String(instrumentId).toLowerCase() === 'nvidia' || String(providerSymbol).toUpperCase() === 'NVDA'){
+            const diag = Object.assign({}, diagBase, { httpStatus, providerErrorCode, providerErrorMessage, responseFieldNames, rawPriceValue, parsedPrice, rawTimestampValue, parsedTimestamp, timestampUnitDetected, quoteAgeSeconds, stale: !!stale, instrumentId, finalRuntimeKey, accepted });
+            const outPath = path.join(process.cwd(),'src','data','twelve-diagnostics.json');
+            let cur: any[] = [];
+            try{ if (fs.existsSync(outPath)){ const raw = fs.readFileSync(outPath,'utf8'); cur = JSON.parse(raw || '[]'); if (!Array.isArray(cur)) cur = []; } }catch(e){ cur = []; }
+            cur.push(diag);
+            try{ fs.writeFileSync(outPath, JSON.stringify(cur.slice(-200), null, 2), 'utf8'); }catch(e){}
+          }
+        }catch(e){}
+
         if (!res.ok) throw new Error(`Twelve Data quote request failed: ${res.status}`);
-        const data = await res.json();
-        if (data.status === 'error') throw new Error(String(data.message || JSON.stringify(data)));
-        const q = this.parseQuoteResponse(data, instrumentId);
+        if (data && data.status === 'error') throw new Error(String(data.message || JSON.stringify(data)));
+        const q = parseQuoteResponse(data, instrumentId);
         // mark instrument enabled once we've successfully verified a real quote
         try{ const instRef = findInstrumentById(instrumentId); if (instRef) instRef.enabled = true; }catch(e){}
         this.cacheSet(instrumentId, q);
@@ -284,29 +688,11 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
       const res = await this.fetchWithTimeout(url);
       if (res.ok){
         const data = await res.json();
-        // data may be an object per symbol or a single object; normalize
-        if (Array.isArray(data)){
-          for (const d of data){ try{ const id = Array.from(idToSymbol.entries()).find(([,s])=> s.toUpperCase() === String(d.symbol||'').toUpperCase())?.[0]; if (!id) continue; const q = this.parseQuoteResponse(d, id); this.cacheSet(id, q); out.push(q); }catch(e){}}
-        } else if (data && typeof data === 'object'){
-          // if single symbol returned
-          if (data.symbol){
-            const id = Array.from(idToSymbol.entries()).find(([,s])=> s.toUpperCase() === String(data.symbol||'').toUpperCase())?.[0];
-            if (id){ const q = this.parseQuoteResponse(data, id); this.cacheSet(id, q); out.push(q); }
-            else {
-              // map over possible keys
-              for (const [idk, sym] of idToSymbol.entries()){
-                const d = data[sym] || data[idk];
-                if (d) try{ const q = this.parseQuoteResponse(d, idk); this.cacheSet(idk, q); out.push(q); }catch(e){}
-              }
-            }
-          } else {
-            for (const [idk, sym] of idToSymbol.entries()){
-              const d = data[sym] || data[idk];
-              if (!d) continue;
-              try{ const q = this.parseQuoteResponse(d, idk); this.cacheSet(idk, q); out.push(q); }catch(e){}
-            }
-          }
-        }
+        try{
+          // Use robust batch mapping helper to extract per-instrument quotes without dropping others on errors
+          const mapped = mapProviderBatchResponse(data, idToSymbol);
+          for (const item of mapped){ this.cacheSet(item.instrumentId, item); out.push(item); }
+        }catch(e){ /* preserve fallback behavior — continue to per-id fetch below */ }
       }
     }
 

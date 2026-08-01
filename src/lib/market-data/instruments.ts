@@ -27,9 +27,20 @@ export const TRADABLE_INSTRUMENTS: TradableInstrument[] = [
   { id: 'nvidia', name: 'NVIDIA', providerSymbol: 'NVDA', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
   { id: 'amazon', name: 'Amazon', providerSymbol: 'AMZN', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
   { id: 'alphabet', name: 'Alphabet', providerSymbol: 'GOOGL', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'meta', name: 'Meta Platforms', providerSymbol: 'META', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'tesla', name: 'Tesla', providerSymbol: 'TSLA', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'amd', name: 'AMD', providerSymbol: 'AMD', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'netflix', name: 'Netflix', providerSymbol: 'NFLX', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'broadcom', name: 'Broadcom', providerSymbol: 'AVGO', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
   { id: 'telia', name: 'Telia', providerSymbol: 'TELIA', exchange: 'STO', currency: 'SEK', enabled: false, marketDataEnabled: false, tradingEnabled: false, assetType: 'STOCK', disabledReason: 'TWELVE_DATA_PLAN_RESTRICTED' },
   // Gold spot (commodity) — market data enabled, trading disabled for now
-  { id: 'xau-usd', name: 'Gold Spot', providerSymbol: 'XAU/USD', exchange: 'COMMODITY', currency: 'USD', enabled: false, marketDataEnabled: true, tradingEnabled: false, assetType: 'COMMODITY', baseAsset: 'XAU', quoteCurrency: 'USD' },
+  // Added official Forex and Metals instruments (market data only, trading disabled)
+  { id: 'EUR_USD', name: 'EUR/USD', providerSymbol: 'EUR/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'EUR', quoteCurrency: 'USD' },
+  { id: 'GBP_USD', name: 'GBP/USD', providerSymbol: 'GBP/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'GBP', quoteCurrency: 'USD' },
+  { id: 'USD_JPY', name: 'USD/JPY', providerSymbol: 'USD/JPY', exchange: 'Forex', currency: 'JPY', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'JPY' },
+  { id: 'USD_SEK', name: 'USD/SEK', providerSymbol: 'USD/SEK', exchange: 'Forex', currency: 'SEK', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'SEK' },
+  { id: 'XAU_USD', name: 'XAU/USD', providerSymbol: 'XAU/USD', exchange: 'COMMODITY', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'COMMODITY', baseAsset: 'XAU', quoteCurrency: 'USD' },
+  { id: 'XAG_USD', name: 'XAG/USD', providerSymbol: 'XAG/USD', exchange: 'COMMODITY', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'COMMODITY', baseAsset: 'XAG', quoteCurrency: 'USD' },
 ];
 
 export const findInstrumentById = (id: string) => TRADABLE_INSTRUMENTS.find(i => i.id === id) as TradableInstrument | undefined;

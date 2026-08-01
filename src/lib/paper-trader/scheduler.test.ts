@@ -188,8 +188,24 @@ describe('paper-trader scheduler', ()=>{
   });
 
   it('evaluates multiple symbols and respects one-buy-one-sell limit', async ()=>{
-    vi.useRealTimers();
     vi.resetModules();
+    vi.useRealTimers();
+
+    // Ensure deterministic instrument universe and session eligibility for this test
+    vi.doMock('../market-data/instruments', ()=>{
+      const TRADABLE_INSTRUMENTS = [
+      { id: 'microsoft', name: 'Microsoft', providerSymbol: 'MSFT', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'nvidia', name: 'NVIDIA', providerSymbol: 'NVDA', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'amazon', name: 'Amazon', providerSymbol: 'AMZN', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'apple', name: 'Apple', providerSymbol: 'AAPL', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'alphabet', name: 'Alphabet', providerSymbol: 'GOOGL', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' }
+    ];
+      const findInstrumentById = (id:any)=> TRADABLE_INSTRUMENTS.find(i=> String(i.id).toLowerCase() === String(id).toLowerCase() || (i.id === id));
+      const findInstrumentBySymbol = (sym:any)=> TRADABLE_INSTRUMENTS.find(i=> (i.providerSymbol && String(i.providerSymbol).toUpperCase() === String(sym).toUpperCase()) || String(i.id).toLowerCase() === String(sym).toLowerCase());
+      return { TRADABLE_INSTRUMENTS, findInstrumentById, findInstrumentBySymbol };
+    });
+    // Force US market to be open for deterministic session eligibility
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
 
     // Test definition: evaluationCount counts unique symbols actually evaluated. Quote-missing symbols do NOT count.
     // Symbols: MSFT (holding -> SELL but risk REJECT), NVDA (HOLD), AAPL (quote missing), AMZN (BUY accepted), GOOGL (BUY blocked by per-cycle BUY limit)
@@ -215,35 +231,38 @@ describe('paper-trader scheduler', ()=>{
       return { symbol: sym, closes, dates, source: 'twelve-data' };
     });
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
+    // Import runtime after mocks/spies
+    const runtime = await import('./demo-runtime');
+
     // Set deterministic portfolio with MSFT holding that triggers SELL
-    (dr as any).__setTestPortfolio({
+    (runtime as any).__setTestPortfolio({
       getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 10, averagePrice: 150, currentPrice: 100 }] }),
       applyExecution: async (exec:any)=> ({ availableCash: 100000 })
     });
 
     // Inject a stub trader to control accept/reject behavior and append audits for visibility
-    (dr as any).__setTestTrader({
+    (runtime as any).__setTestTrader({
       handleDecision: async (decision:any)=>{
         const sym = (decision && decision.symbol||'').toUpperCase();
         if (sym === 'MSFT'){
           // Simulate risk engine rejecting the SELL and log a REJECT audit
-          await (dr as any).__appendTestAudits([{ kind: 'REJECT', decision, reason: { code: 'RISK_REJECT', message: 'Risk blocked' }, portfolioBefore: await (dr as any).getPaperTradingState().then((s:any)=>s.availableCash), timestamp: (new Date()).toISOString(), meta: { automatic: true } }]);
+          await (runtime as any).__appendTestAudits([{ kind: 'REJECT', decision, reason: { code: 'RISK_REJECT', message: 'Risk blocked' }, portfolioBefore: await (runtime as any).getPaperTradingState().then((s:any)=>s.availableCash), timestamp: (new Date()).toISOString(), meta: { automatic: true } }]);
           return { accepted: false, code: 'RISK_REJECT' };
         }
         if (sym === 'AMZN'){
           // Accept the BUY and log EXECUTION
           const exec = { status: 'EXECUTED', executedPrice: decision.referencePrice || 80, quantity: 1, notional: decision.referencePrice || 80, fee: 0 };
-          await (dr as any).__appendTestAudits([{ kind: 'EXECUTION', decision, execution: exec, portfolioBefore: await (dr as any).getPaperTradingState().then((s:any)=>s.availableCash), timestamp: (new Date()).toISOString(), meta: { automatic: true } }]);
+          await (runtime as any).__appendTestAudits([{ kind: 'EXECUTION', decision, execution: exec, portfolioBefore: await (runtime as any).getPaperTradingState().then((s:any)=>s.availableCash), timestamp: (new Date()).toISOString(), meta: { automatic: true } }]);
           return { accepted: true, execution: exec };
         }
         // default: reject
-        await (dr as any).__appendTestAudits([{ kind: 'REJECT', decision, reason: { code: 'UNKNOWN', message: 'Default reject' }, portfolioBefore: await (dr as any).getPaperTradingState().then((s:any)=>s.availableCash), timestamp: (new Date()).toISOString(), meta: { automatic: true } }]);
+        await (runtime as any).__appendTestAudits([{ kind: 'REJECT', decision, reason: { code: 'UNKNOWN', message: 'Default reject' }, portfolioBefore: await (runtime as any).getPaperTradingState().then((s:any)=>s.availableCash), timestamp: (new Date()).toISOString(), meta: { automatic: true } }]);
         return { accepted: false, code: 'UNKNOWN' };
       }
     });
 
     // Clear existing audits to make test deterministic
-    await (dr as any).__clearAudits();
+    await (runtime as any).__clearAudits();
     const fs = require('fs');
     const path = require('path');
     const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
@@ -251,13 +270,13 @@ describe('paper-trader scheduler', ()=>{
     const beforeLen = beforeAll.length;
 
     // Pre-seed last-evaluation audits for AMZN and GOOGL so buySignal triggers
-    await (dr as any).__appendTestAudits([
+    await (runtime as any).__appendTestAudits([
       { kind: 'EVALUATION', decision: { id: 'prev_amzn_eval', symbol: 'AMZN', referencePrice: 100 }, timestamp: (new Date()).toISOString(), meta: { automatic: true } },
       { kind: 'EVALUATION', decision: { id: 'prev_googl_eval', symbol: 'GOOGL', referencePrice: 90 }, timestamp: (new Date()).toISOString(), meta: { automatic: true } }
     ]);
 
     // Run a manual cycle with deterministic override universe (allow scheduler bypass)
-    const res: any = await (dr as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: {
+    const res: any = await (runtime as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: {
       quotes: [ { symbol: 'MSFT', priceSek: 100 }, { symbol: 'NVDA', priceSek: 200 }, /* AAPL omitted to simulate quote error */ { symbol: 'AMZN', priceSek: 80 }, { symbol: 'GOOGL', priceSek: 75 } ],
       portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 10, averagePrice: 150, currentPrice: 100 }] }
     } });
@@ -473,6 +492,7 @@ describe('paper-trader scheduler', ()=>{
   });
 
   it('creates combinedAnalysis when technicalAnalysis is present (technical-only)', async ()=>{
+    vi.resetModules();
     vi.useRealTimers();
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
     const histSpy = vi.fn(async (sym:string) => ({ symbol: sym, closes: new Array(30).fill(0).map((_,i)=>100+i), dates: new Array(30).fill(0).map((_,i)=> new Date(2026,5,i+1).toISOString().slice(0,10)), source: 'twelve-data' }));
@@ -482,14 +502,16 @@ describe('paper-trader scheduler', ()=>{
     const tech = await import('../paper-trader/technical');
     const analyzeSpy = vi.spyOn(tech, 'default').mockImplementation((closes:any)=> ({ trend: 'bullish', momentumPercent: 10, volatilityPercent: 5, technicalScore: 81, signal: 'BUY', reasons: ['momentum'] }));
 
-    (dr as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
-    await (dr as any).__clearAudits();
+    const runtime = await import('./demo-runtime');
+
+    (runtime as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    await (runtime as any).__clearAudits();
     const fs = require('fs'); const path = require('path');
     const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
     const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const beforeLen = beforeAll.length;
 
-    await (dr as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    await (runtime as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
 
     const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const appended = all.slice(beforeLen);
@@ -500,22 +522,24 @@ describe('paper-trader scheduler', ()=>{
     expect(ca.overallScore).toBe(81);
     expect(ca.overallSignal).toBe('BUY');
     analyzeSpy.mockRestore();
+    try{ vi.resetModules(); }catch(_){ }
   });
 
   it('combinedAnalysis is neutral when technicalAnalysis unavailable', async ()=>{
+    vi.resetModules();
     vi.useRealTimers();
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ const err:any = new Error('Provider failed'); err.code = 'PROVIDER_ERROR'; throw err; } } }));
 
-    const drLocal = await import('./demo-runtime');
-    (drLocal as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
-    await (drLocal as any).__clearAudits();
+    const runtime = await import('./demo-runtime');
+    (runtime as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    await (runtime as any).__clearAudits();
     const fs = require('fs'); const path = require('path');
     const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
     const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const beforeLen = beforeAll.length;
 
-    await (drLocal as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    await (runtime as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
 
     const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const appended = all.slice(beforeLen);
@@ -527,6 +551,7 @@ describe('paper-trader scheduler', ()=>{
     expect(ca.overallSignal).toBe('HOLD');
     expect(ca.confidence).toBe(0);
     expect(Array.isArray(ca.reasons) && ca.reasons.length === 0).toBeTruthy();
+    try{ vi.resetModules(); }catch(_){ }
   });
 
   it('populates technicalReasons array from technicalAnalysis', async ()=>{
@@ -702,20 +727,36 @@ describe('paper-trader scheduler', ()=>{
       const dates = new Array(30).fill(0).map((_,i)=> new Date(2026,5, i+1).toISOString().slice(0,10));
       return { symbol: sym, closes, dates, source: 'twelve-data' };
     });
+    vi.resetModules();
+    vi.useRealTimers();
+    // deterministic instruments for this test
+    vi.doMock('../market-data/instruments', ()=>{
+      const TRADABLE_INSTRUMENTS = [
+      { id: 'microsoft', name: 'Microsoft', providerSymbol: 'MSFT', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'nvidia', name: 'NVIDIA', providerSymbol: 'NVDA', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'apple', name: 'Apple', providerSymbol: 'AAPL', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'amazon', name: 'Amazon', providerSymbol: 'AMZN', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'alphabet', name: 'Alphabet', providerSymbol: 'GOOGL', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' }
+    ];
+      const findInstrumentById = (id:any)=> TRADABLE_INSTRUMENTS.find(i=> String(i.id).toLowerCase() === String(id).toLowerCase() || (i.id === id));
+      const findInstrumentBySymbol = (sym:any)=> TRADABLE_INSTRUMENTS.find(i=> (i.providerSymbol && String(i.providerSymbol).toUpperCase() === String(sym).toUpperCase()) || String(i.id).toLowerCase() === String(sym).toLowerCase());
+      return { TRADABLE_INSTRUMENTS, findInstrumentById, findInstrumentBySymbol };
+    });
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
+    vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: symbols.map(s=> ({ symbol: s, priceSek: 100 })) }) }));
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
 
-    vi.resetModules();
-    const drLocal = await import('./demo-runtime');
+    const runtime = await import('./demo-runtime');
 
     // empty portfolio (no holdings) to force candidate evaluation for all symbols
     const portfolio = { availableCash: 100000, holdings: [] };
-    await (drLocal as any).__clearAudits();
+    await (runtime as any).__clearAudits();
     const fs = require('fs'); const path = require('path');
     const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
     const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const beforeLen = beforeAll.length;
 
-    const res = await (drLocal as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: symbols.map(s=> ({ symbol: s, priceSek: 100 })), portfolio } });
+    const res = await (runtime as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: symbols.map(s=> ({ symbol: s, priceSek: 100 })), portfolio } });
 
     const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const appended = all.slice(beforeLen);
@@ -737,6 +778,7 @@ describe('paper-trader scheduler', ()=>{
   });
 
   it('duplicate path: same symbol in holdings and candidate evaluated only once (one hist call, one analysis)', async ()=>{
+    vi.resetModules();
     vi.useRealTimers();
     const symbols = ['MSFT','NVDA'];
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: symbols.map(s=> ({ symbol: s, priceSek: 100 })) }) }));
@@ -746,23 +788,29 @@ describe('paper-trader scheduler', ()=>{
       return { symbol: sym, closes, dates, source: 'twelve-data' };
     });
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
+    // deterministic instruments and session helper
+    vi.doMock('../market-data/instruments', ()=>({ TRADABLE_INSTRUMENTS: [
+      { id: 'microsoft', name: 'Microsoft', providerSymbol: 'MSFT', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+      { id: 'nvidia', name: 'NVIDIA', providerSymbol: 'NVDA', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' }
+    ] }));
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
 
-    vi.resetModules();
-    const drLocal = await import('./demo-runtime');
-
+    // Spy on technical BEFORE importing runtime so runtime uses the spied module
     const tech = await import('../paper-trader/technical');
     const analyzeSpy = vi.spyOn(tech, 'default');
 
-    (drLocal as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    const runtime = await import('./demo-runtime');
 
-    await (drLocal as any).__clearAudits();
+    (runtime as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+
+    await (runtime as any).__clearAudits();
     const fs = require('fs'); const path = require('path');
     const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
     const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const beforeLen = beforeAll.length;
 
 
-    const res = await (drLocal as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: symbols.map(s=> ({ symbol: s, priceSek: 100 })), portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    const res = await (runtime as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: symbols.map(s=> ({ symbol: s, priceSek: 100 })), portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
 
     const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const appended = all.slice(beforeLen);
@@ -843,18 +891,19 @@ describe('paper-trader scheduler', ()=>{
   it('strength mapping: score 75 => HIGH', async ()=>{ await runStrengthTest(75, 'HIGH'); });
   it('strength mapping: score 49 => LOW', async ()=>{ await runStrengthTest(49, 'LOW'); });
   it('strength mapping: unavailable => LOW', async ()=>{
+    vi.resetModules();
     // simulate provider failure to get unavailable
     vi.useRealTimers();
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ const err:any = new Error('Provider failed'); err.code = 'PROVIDER_ERROR'; throw err; } } }));
-    const drLocal = await import('./demo-runtime');
-    (drLocal as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
-    await (drLocal as any).__clearAudits();
+    const runtime = await import('./demo-runtime');
+    (runtime as any).__setTestPortfolio({ getPortfolio: async ()=> ({ availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] }), applyExecution: async (exec:any)=> ({ availableCash: 100000 }) });
+    await (runtime as any).__clearAudits();
     const fs = require('fs'); const path = require('path');
     const auditPath = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
     const beforeAll = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const beforeLen = beforeAll.length;
-    await (drLocal as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
+    await (runtime as any).runManualPaperTradingCycle({ allowWhenScheduler: true, overrideUniverse: { quotes: [ { symbol: 'MSFT', priceSek: 100 } ], portfolio: { availableCash: 100000, holdings: [{ id: 'h_MSFT', symbol: 'MSFT', quantity: 1, averagePrice: 100, currentPrice: 100 }] } } });
     const all = JSON.parse(fs.readFileSync(auditPath, 'utf8')) || [];
     const appended = all.slice(beforeLen);
     const msEval = appended.find((a:any)=> a && a.raw && a.raw.kind==='EVALUATION' && a.raw.decision && a.raw.decision.symbol === 'MSFT');
@@ -862,11 +911,21 @@ describe('paper-trader scheduler', ()=>{
     const dc = msEval.raw.meta.decisionContext;
     expect(dc).toBeDefined();
     expect(dc.recommendationStrength).toBe('LOW');
+    try{ vi.resetModules(); }catch(_){ }
   });
 
   it('overallDecisionConfidence: success without conflict => unchanged', async ()=>{
     // technicalConfidence 82, signal == action => overallDecisionConfidence 82
+    vi.resetModules();
     vi.useRealTimers();
+    // deterministic instruments and open session
+    vi.doMock('../market-data/instruments', ()=>{
+      const TRADABLE_INSTRUMENTS = [ { id: 'microsoft', name: 'Microsoft', providerSymbol: 'MSFT', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' } ];
+      const findInstrumentById = (id:any)=> TRADABLE_INSTRUMENTS.find(i=> String(i.id).toLowerCase() === String(id).toLowerCase() || (i.id === id));
+      const findInstrumentBySymbol = (sym:any)=> TRADABLE_INSTRUMENTS.find(i=> (i.providerSymbol && String(i.providerSymbol).toUpperCase() === String(sym).toUpperCase()) || String(i.id).toLowerCase() === String(sym).toLowerCase());
+      return { TRADABLE_INSTRUMENTS, findInstrumentById, findInstrumentBySymbol };
+    });
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
     const histSpy = vi.fn(async (sym:string) => ({ symbol: sym, closes: new Array(30).fill(0).map((_,i)=>100+i), dates: new Array(30).fill(0).map((_,i)=> new Date(2026,5,i+1).toISOString().slice(0,10)), source: 'twelve-data' }));
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ return histSpy(String(sym)); } } }));
@@ -892,6 +951,8 @@ describe('paper-trader scheduler', ()=>{
     expect(dc.overallDecisionConfidence).toBe(82);
     expect(dc.executiveSummary).toBe('Strong technical setup with no conflicting signals.');
     analyzeSpy.mockRestore();
+    try{ vi.restoreAllMocks(); vi.doUnmock('../market-data/instruments'); vi.doUnmock('../../lib/us-market'); }catch(_){ }
+    try{ vi.resetModules(); }catch(_){ }
   });
 
   it('overallDecisionConfidence: success with conflict => reduced by 20', async ()=>{
@@ -923,7 +984,10 @@ describe('paper-trader scheduler', ()=>{
   });
 
   it('overallDecisionConfidence: unavailable => 0', async ()=>{
+    vi.resetModules();
     vi.useRealTimers();
+    vi.doMock('../market-data/instruments', ()=>({ TRADABLE_INSTRUMENTS: [ { id: 'microsoft', name: 'Microsoft', providerSymbol: 'MSFT', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' } ] }));
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ const err:any = new Error('Provider failed'); err.code = 'PROVIDER_ERROR'; throw err; } } }));
     const drLocal = await import('./demo-runtime');
@@ -941,11 +1005,21 @@ describe('paper-trader scheduler', ()=>{
     const dc = msEval.raw.meta.decisionContext;
     expect(dc.overallDecisionConfidence).toBe(0);
     expect(dc.executiveSummary).toBe('Technical analysis unavailable.');
+    try{ vi.restoreAllMocks(); vi.doUnmock('../market-data/instruments'); vi.doUnmock('../../lib/us-market'); }catch(_){ }
+    try{ vi.resetModules(); }catch(_){ }
   });
 
   it('decisionComparison via runtime: strategy BUY + aggregator BUY => matches true', async ()=>{
-    vi.useRealTimers();
     vi.resetModules();
+    vi.useRealTimers();
+    // deterministic instruments and open session
+    vi.doMock('../market-data/instruments', ()=>{
+      const TRADABLE_INSTRUMENTS = [ { id: 'amazon', name: 'Amazon', providerSymbol: 'AMZN', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' } ];
+      const findInstrumentById = (id:any)=> TRADABLE_INSTRUMENTS.find(i=> String(i.id).toLowerCase() === String(id).toLowerCase() || (i.id === id));
+      const findInstrumentBySymbol = (sym:any)=> TRADABLE_INSTRUMENTS.find(i=> (i.providerSymbol && String(i.providerSymbol).toUpperCase() === String(sym).toUpperCase()) || String(i.id).toLowerCase() === String(sym).toLowerCase());
+      return { TRADABLE_INSTRUMENTS, findInstrumentById, findInstrumentBySymbol };
+    });
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
     // Ensure deterministic provider and analyzer
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'AMZN', priceSek: 100 } ] }) }));
     const histSpy = vi.fn(async (sym:string) => ({ symbol: sym, closes: new Array(30).fill(0).map((_,i)=>100+i), dates: new Array(30).fill(0).map((_,i)=> new Date(2026,5,i+1).toISOString().slice(0,10)), source: 'twelve-data' }));
@@ -978,6 +1052,8 @@ describe('paper-trader scheduler', ()=>{
     expect(dc.aggregatorSignal).toBe('BUY');
     expect(dc.matches).toBe(true);
     analyzeSpy.mockRestore();
+    try{ vi.restoreAllMocks(); vi.doUnmock('../market-data/instruments'); vi.doUnmock('../../lib/us-market'); }catch(_){ }
+    try{ vi.resetModules(); }catch(_){ }
   });
 
   it('decisionComparison via runtime: strategy HOLD + aggregator BUY => matches false', async ()=>{
@@ -1165,6 +1241,15 @@ describe('paper-trader scheduler', ()=>{
     // Make provider throw for historical data to hit error branches
     vi.mock('../market-data/quotes-service', ()=>({ getNormalizedQuotes: async ()=> ({ quotes: [ { symbol: 'MSFT', priceSek: 100 } ] }) }));
     vi.doMock('../market-data/twelve-data', ()=>({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(sym:number|any, size?:number){ const err:any = new Error('Provider failed'); err.code = 'PROVIDER_ERROR'; throw err; } } }));
+
+    // Ensure deterministic instruments and session eligibility so candidate path runs
+    vi.doMock('../market-data/instruments', ()=>{
+      const TRADABLE_INSTRUMENTS = [ { id: 'microsoft', name: 'Microsoft', providerSymbol: 'MSFT', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' } ];
+      const findInstrumentById = (id:any)=> TRADABLE_INSTRUMENTS.find(i=> String(i.id).toLowerCase() === String(id).toLowerCase() || (i.id === id));
+      const findInstrumentBySymbol = (sym:any)=> TRADABLE_INSTRUMENTS.find(i=> (i.providerSymbol && String(i.providerSymbol).toUpperCase() === String(sym).toUpperCase()) || String(i.id).toLowerCase() === String(sym).toLowerCase());
+      return { TRADABLE_INSTRUMENTS, findInstrumentById, findInstrumentBySymbol };
+    });
+    vi.doMock('../../lib/us-market', ()=>({ getNextNYOpenInstant: (_now?: any)=> ({ open: true }) }));
 
     const drLocal = await import('./demo-runtime');
     const fs = require('fs'); const path = require('path');

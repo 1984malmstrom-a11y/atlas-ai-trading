@@ -1,4 +1,8 @@
 import { Portfolio, Holding } from '../../domain/portfolio/types';
+import type { DecisionEvidence } from './evidence-aggregator';
+import type { EvidenceConsistency } from './evidence-consistency-analyzer';
+import type { EvidenceInformedDecision } from './evidence-informed-decision-policy';
+import type { HistoricalContext } from './historical-context-engine';
 // Note: TradeEvaluation defined below to avoid circular type-only import issues
 
 export type TradeAction = 'BUY' | 'SELL' | 'HOLD';
@@ -15,6 +19,11 @@ export type PaperTradeDecision = {
   risk?: RiskReport;
   // Optional array of signal identifiers produced by decision engines
   signals?: string[];
+  // Optional evidence fields (enriched by runtime before execution)
+  decisionEvidence?: DecisionEvidence | null;
+  evidenceConsistency?: EvidenceConsistency | null;
+  evidenceInformedDecision?: EvidenceInformedDecision | null;
+  historicalContext?: HistoricalContext | null;
 };
 
 export type PaperTraderConfig = {
@@ -116,7 +125,7 @@ export type SimulatedExecution = {
 export type AuditEntry = {
   id: string;
   timestamp: string;
-  kind: 'RECEIVED' | 'HOLD' | 'REJECT' | 'EXECUTION' | 'EVALUATION';
+  kind: 'RECEIVED' | 'HOLD' | 'REJECT' | 'EXECUTION' | 'EVALUATION' | 'DECISION_SUMMARY' | 'TRADE_FEEDBACK' | 'ADAPTIVE_DECISION_CONTEXT' | 'CYCLE_INTELLIGENCE_SNAPSHOT';
   decision?: PaperTradeDecision;
   reason?: { code: string; message: string };
   execution?: SimulatedExecution;
@@ -200,6 +209,129 @@ export type PerformanceReflection = {
 export type PerformanceProfile = {
   summary: PerformanceSummary;
   reflection: PerformanceReflection;
+};
+
+// Strategy-specific performance profiles mapping can be added later
+// when the project defines a concrete `TradingStrategy` type.
+
+export type DecisionSummary = {
+  cycleId: string;
+  timestamp: string;
+  analyzedSymbols: string[];
+  eligibleSymbols: string[];
+  skippedSymbols: string[];
+  decisions: Array<{ id: string; symbol: string; action: string; confidence?: number; expectedReturnPercent?: number | null; risk?: RiskReport | null }>;
+  executedTrades: Array<{ id?: string; symbol: string; side: string; quantity?: number; executedPrice?: number; notional?: number }>;
+  rejectedTradesCount: number;
+  confidenceAverage?: number | null;
+  topReason?: string | null;
+  riskBlocks?: Record<string, number> | null;
+  overallConclusion: 'EXECUTED' | 'REJECTED' | 'NO_ACTION';
+  marketSession?: { marketOpen: boolean | null; nextOpenInstant?: string | null } | null;
+  cycleDurationMs?: number | null;
+  skippedReasonsBySymbol?: Record<string, string[]> | null;
+  confidenceDistribution?: Record<string, number> | null;
+  strongestBullishReason?: string | null;
+  strongestBearishReason?: string | null;
+  cashBefore?: number | null;
+  cashAfter?: number | null;
+  portfolioValueBefore?: number | null;
+  portfolioValueAfter?: number | null;
+  decisionReasons?: DecisionReason[] | null;
+  shadowDecisionSummary?: {
+    evaluatedCount: number;
+    agreementCount: number;
+    disagreementCount: number;
+    agreementRate: number; // 0-100
+    recommendedActionDistribution: { BUY: number; SELL: number; HOLD: number };
+    disagreementByTransition: Record<string, number> | {};
+  } | null;
+  shadowPerformanceSummary?: {
+    evaluatedCount: number;
+    shadowBetterCount: number;
+    actualBetterCount: number;
+    equalCount: number;
+    notEvaluableCount: number;
+    shadowBetterRate: number;
+    actualBetterRate: number;
+    netShadowAdvantage: number;
+    actualTotalScore: number;
+    shadowTotalScore: number;
+    assessment: 'SHADOW_SIGNIFICANTLY_BETTER'|'SHADOW_SLIGHTLY_BETTER'|'EQUAL_PERFORMANCE'|'ACTUAL_SLIGHTLY_BETTER'|'ACTUAL_SIGNIFICANTLY_BETTER'|'INSUFFICIENT_DATA';
+  } | null;
+};
+
+export type DecisionReason = {
+  symbol: string;
+  action: 'BUY' | 'SELL' | 'HOLD' | string;
+  confidence?: number | null;
+  primaryReason?: string | null;
+  supportingReasons?: string[] | null;
+  riskWarnings?: string[] | null;
+  marketSessionReason?: string | null;
+  rejectedByRiskEngine?: boolean;
+  rejectedByMarketHours?: boolean;
+  rejectedByFreshness?: boolean;
+  rejectedByPositionLimits?: boolean;
+};
+
+export type TradeFeedback = {
+  cycleId: string;
+  tradeId: string;
+  symbol: string;
+  action: 'BUY' | 'SELL' | string;
+  confidenceAtExecution?: number | null;
+  expectedDirection?: string | null;
+  executedPrice?: number | null;
+  executedAt?: string | null;
+  evaluationStatus: 'PENDING' | 'COMPLETE';
+  evaluationDueAt: string | null;
+  decisionReasons?: DecisionReason[] | null;
+};
+
+export type OutcomeEvaluation = {
+  tradeId: string;
+  evaluatedAt: string;
+  currentPrice?: number | null;
+  priceChangePercent?: number | null;
+  absolutePnL?: number | null;
+  expectedDirectionCorrect: boolean;
+  confidenceAccurate: boolean;
+  evaluationResult: 'WIN' | 'LOSS' | 'NEUTRAL';
+  outcomeReason?: string | null;
+};
+
+export type LessonCategory = 'CONFIDENCE_TOO_HIGH' | 'CONFIDENCE_TOO_LOW' | 'RISK_TOO_AGGRESSIVE' | 'RISK_TOO_CONSERVATIVE' | 'CORRECT_DECISION' | 'NEUTRAL';
+
+export type LearningSignal = {
+  tradeId: string;
+  symbol?: string | null;
+  generatedAt: string;
+  evaluationResult: 'WIN' | 'LOSS' | 'NEUTRAL';
+  confidenceAtExecution?: number | null;
+  confidenceAccurate: boolean;
+  expectedDirectionCorrect: boolean;
+  lessonCategory: LessonCategory;
+  suggestedConfidenceAdjustment?: number | null; // additive percentage points
+  suggestedRiskAdjustment?: number | null; // positive => increase risk tolerance, negative => reduce
+  summary?: string | null;
+};
+
+// Minimal standardized types for future market news data
+export type MarketNewsItem = {
+  id: string;
+  symbol: string;
+  headline: string;
+  source: string;
+  publishedAt: string; // ISO timestamp
+  fetchedAt: string; // ISO timestamp when ingested
+  url?: string;
+};
+
+export type MarketNewsSnapshot = {
+  symbol: string;
+  items: MarketNewsItem[];
+  fetchedAt: string; // ISO timestamp for snapshot
 };
 
 export type CycleResult = {

@@ -5,9 +5,11 @@ import { PaperTraderConfig, PaperTradeDecision, SimulatedExecution, AuditEntry, 
 import { calculatePerformance } from './performance-analytics';
 import { evaluatePerformanceReflection } from './reflection-engine';
 import * as DecisionEngine from './decision-engine';
+import analyzeMarket from '../market-analysis';
+import buildMarketSignals from '../victor-signals';
 import { evaluateTrade } from './trade-evaluation';
 import { resolveSingleEntryForReview } from './trade-review-entry';
-import { createTradeFeedback } from './trade-feedback';
+import { createTradeFeedback, summarizeFeedbackBySignal } from './trade-feedback';
 import { buildTradeReview } from './trade-review-builder';
 // defer loading of technical analysis and instruments so tests can mock them before use
 import { combineAnalyses } from './analysis-aggregator';
@@ -20,10 +22,18 @@ import buildDecisionConfidenceExplanation from './decision-confidence-explainer'
 import buildDecisionEvidence from './evidence-aggregator';
 import analyzeEvidenceConsistency from './evidence-consistency-analyzer';
 import buildEvidenceInformedDecision from './evidence-informed-decision-policy';
+import type { DecisionEvidence } from './evidence-aggregator';
+import type { EvidenceConsistency } from './evidence-consistency-analyzer';
+import type { EvidenceInformedDecision } from './evidence-informed-decision-policy';
+import type { HistoricalContext } from './historical-context-engine';
 import evaluateShadowDecisionOutcome from './shadow-decision-outcome-evaluator';
 import aggregateShadowDecisionPerformance from './shadow-decision-performance-aggregator';
 import { TRADABLE_INSTRUMENTS } from '../market-data/instruments';
 import { TwelveDataMarketDataProvider } from '../market-data/twelve-data';
+import { fetchAndBuildFundamentalIntelligence } from '../paper-trader/fundamental-data';
+import { buildMacroSignalsMock, buildMacroSignals, buildMacroSnapshotFromInstruments } from './macro-signals';
+import { buildSectorStrengthSummaries, createSectorStrengthSignalForInstrument } from './sector-signals';
+import { buildVolumeSignal, buildTrendQualitySignal, buildSupportResistanceSignal } from './market-structure-signals';
 import fs from 'fs';
 import path from 'path';
 import computeNextPortfolioState from './portfolio-mutation';
@@ -31,6 +41,8 @@ import { Portfolio } from '../../domain/portfolio/types';
 import { createSupabasePortfolioAdapter } from './supabase-portfolio-adapter';
 import { SupabaseAuditAdapter } from './supabase-audit-adapter';
 import { acquireRunCycleLockWithOwner, releaseRunCycleLock } from './run-cycle-lock';
+import { createMarketNewsIntelligenceSummary, MarketNewsIntelligenceSummary } from './cycle-intelligence-snapshot';
+import { createMarketNewsActivity, MarketNewsActivity } from './market-news-activity';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
 
@@ -42,8 +54,11 @@ type RuntimeState = {
   auditStore: any;
   latestDecision?: PaperTradeDecision | null;
   latestCycle?: any;
+  latestMarketNewsActivity?: MarketNewsActivity | undefined;
   lastUpdated?: string;
   autonomousEnabled: boolean;
+  latestDecisionIntelligenceBySymbol?: Record<string, any>;
+  latestFundamentalIntelligenceBySymbol?: Record<string, any>;
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -51,6 +66,174 @@ type RuntimeState = {
 const START_CAPITAL = 100000;
 
 function nowIso(){ return new Date().toISOString(); }
+
+// max allowed age (calendar days) for historical daily candle used by TECHNICAL_MOMENTUM
+// Chosen as 5 to cover normal weekend + occasional long holiday gaps (Thu -> Tue = 5 days).
+const TECHNICAL_MOMENTUM_MAX_AGE_DAYS = 5;
+
+// WATCHLIST Engine v1: default watchlist (reuses TRADABLE_INSTRUMENTS when possible)
+export const DEFAULT_WATCHLIST = ['NVDA','MSFT','AAPL','META','AMZN','GOOGL','TSLA','AMD','NFLX','AVGO'];
+
+// Return array of watchlist symbols that are present and enabled in eligibleInstruments
+export function getWatchlistSymbols(eligibleInstruments: any[], watchlist = DEFAULT_WATCHLIST){
+  try{
+    if (!Array.isArray(eligibleInstruments)) return [];
+    const allowed = new Set((watchlist||[]).map((s:string)=> String(s).toUpperCase()));
+    const res: string[] = [];
+    for (const i of eligibleInstruments){
+      try{
+        const p = (i && (i.providerSymbol || i.id)) ? String(i.providerSymbol || i.id).toUpperCase() : null;
+        if (p && allowed.has(p)) res.push(p);
+      }catch(_){ }
+    }
+    // dedupe and return
+    return Array.from(new Set(res));
+  }catch(_){ return []; }
+}
+
+// Create a per-cycle fundamental resolver factory (testable, no globals)
+export function createPerCycleFundamentalResolver(opts: { fetchFundamental: (o:{symbol:string})=>Promise<any>, instruments?: any[], timeoutMs?: number, appendAudit?: (a:any)=>Promise<void>, updateState?: (s:string,r:any)=>void }){
+  const map = new Map<string, Promise<any>>();
+  const fetchFund = opts.fetchFundamental;
+  const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 3000;
+  const instruments = Array.isArray(opts.instruments) ? opts.instruments : TRADABLE_INSTRUMENTS;
+  async function resolve({ cycleId, symbol, assetType, analyzed }: { cycleId?: string; symbol: string; assetType?: string; analyzed?: boolean }){
+    const sym = String(symbol || '').toUpperCase();
+    if (!sym) return null;
+    // Normalize assetType from instruments list when not provided
+    let at = typeof assetType === 'string' ? String(assetType).toUpperCase() : undefined;
+    if (!at){ try{ const inst = Array.isArray(instruments) ? instruments.find((i:any)=> String((i.providerSymbol||i.id||'')).toUpperCase() === sym) : null; at = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK'; }catch(e){ at = 'STOCK'; } }
+    // Only fetch for STOCK and when analyzed === true
+    if (at !== 'STOCK') return { skipped: true, reason: 'NOT_STOCK' };
+    if (analyzed === false) return { skipped: true, reason: 'NOT_ANALYZED' };
+    if (map.has(sym)) return map.get(sym);
+    const p = (async ()=>{
+      try{
+        const res = await Promise.race([ fetchFund({ symbol: sym }), new Promise(resolve => setTimeout(()=> resolve(null), timeoutMs)) ]);
+        // append audit and update state via callbacks (best-effort)
+        try{ if (opts.appendAudit && res && res.snapshot){ opts.appendAudit(res).catch(()=>{}); } }catch(_){ }
+        try{ if (opts.updateState && res){ opts.updateState(sym, res); } }catch(_){ }
+        return res;
+      }catch(e){ return null; }
+    })();
+    map.set(sym, p);
+    return p;
+  }
+  return { resolve };
+}
+
+// Select single best candidate: prefer SELL over BUY. Rank by confidence desc, then abs(expectedReturnPercent) desc, then symbol asc
+export function selectBestCandidate(candidates: any[]){
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const sells = candidates.filter(c=> String(c.action||'').toUpperCase() === 'SELL');
+  const buys = candidates.filter(c=> String(c.action||'').toUpperCase() === 'BUY');
+  const cmp = (a:any,b:any)=>{
+    const ca = typeof a.confidence === 'number' ? a.confidence : 0;
+    const cb = typeof b.confidence === 'number' ? b.confidence : 0;
+    if (ca !== cb) return cb - ca; // desc
+    const ea = Math.abs(typeof a.expectedReturnPercent === 'number' ? a.expectedReturnPercent : 0);
+    const eb = Math.abs(typeof b.expectedReturnPercent === 'number' ? b.expectedReturnPercent : 0);
+    if (ea !== eb) return eb - ea; // desc
+    const sa = String(a.symbol || '').toUpperCase();
+    const sb = String(b.symbol || '').toUpperCase();
+    return sa.localeCompare(sb);
+  };
+  if (sells.length > 0){ sells.sort(cmp); return sells[0]; }
+  if (buys.length > 0){ buys.sort(cmp); return buys[0]; }
+  return null;
+}
+
+// Freshness helper for TECHNICAL_MOMENTUM historical data
+// API:
+//   checkHistoricalFreshness(historicalLastDate?: string, now?: Date, maxAgeDays = 5)
+// Returns: { valid: boolean; historicalLastDate?: string; historicalDataAgeDays?: number; reason?: 'MISSING_DATE'|'INVALID_DATE'|'FUTURE_DATE'|'STALE_DATE' }
+// Notes:
+// - Deterministic and pure: no FS or API calls.
+// - Parses YYYY-MM-DD in UTC by appending T00:00:00.000Z when appropriate.
+// - Uses UTC date-only arithmetic so timezones do not affect calendar-day age.
+// - Default maxAgeDays = 5 to cover normal weekend + occasional long holiday gaps.
+export function checkHistoricalFreshness(historicalLastDate?: string | null, now?: Date, maxAgeDays = 5){
+  const res: { valid: boolean; historicalLastDate?: string; historicalDataAgeDays?: number; reason?: 'MISSING_DATE'|'INVALID_DATE'|'FUTURE_DATE'|'STALE_DATE' } = { valid: false };
+  if (!historicalLastDate){ res.reason = 'MISSING_DATE'; return res; }
+  // Normalize input to string
+  const raw = String(historicalLastDate).trim();
+  if (!raw){ res.reason = 'MISSING_DATE'; return res; }
+  // Parse defensively: accept YYYY-MM-DD or full ISO; force UTC date-only by using Date.UTC
+  let parsed: Date | null = null;
+  try{
+    // If string matches YYYY-MM-DD exactly, append Z to ensure UTC midnight
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)){
+      parsed = new Date(raw + 'T00:00:00.000Z');
+    } else {
+      parsed = new Date(String(raw));
+    }
+    if (!parsed || !isFinite(parsed.getTime())){ parsed = null; }
+  }catch(_){ parsed = null; }
+  if (!parsed){ res.reason = 'INVALID_DATE'; return res; }
+  const nowDate = now instanceof Date ? now : new Date();
+  // Convert both to UTC date-only
+  const toDateOnly = (d: Date) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const lastDateOnly = toDateOnly(parsed);
+  const nowDateOnly = toDateOnly(nowDate);
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const ageDays = Math.floor((nowDateOnly.getTime() - lastDateOnly.getTime()) / msPerDay);
+  if (ageDays < 0){ res.reason = 'FUTURE_DATE'; return res; }
+  if (ageDays > maxAgeDays){ res.reason = 'STALE_DATE'; res.historicalDataAgeDays = ageDays; res.historicalLastDate = raw; return res; }
+  // allowed when ageDays <= maxAgeDays
+  res.valid = true;
+  res.historicalLastDate = raw;
+  res.historicalDataAgeDays = ageDays;
+  return res;
+}
+
+// Factory: create TECHNICAL_MOMENTUM signal when techMeta passes freshness check
+export function createTechnicalSignalIfFresh(techMeta: any, symbol: string, now?: Date, maxAgeDays = 5){
+  try{
+    if (!techMeta || techMeta.technicalAnalysisStatus !== 'success' || typeof techMeta.historicalDataPoints !== 'number' || techMeta.historicalDataPoints < 20) return null;
+    const techSig = (techMeta.technicalSignal || '').toString().toUpperCase();
+    let direction: 'BULLISH'|'BEARISH'|'NEUTRAL' = 'NEUTRAL';
+    if (techSig === 'BUY') direction = 'BULLISH'; else if (techSig === 'SELL') direction = 'BEARISH';
+    if (direction === 'NEUTRAL') return null;
+    const freshness = checkHistoricalFreshness(techMeta.historicalLastDate, now, maxAgeDays);
+    if (!freshness.valid) return null;
+    const evidence = { momentumPercent: techMeta.technicalMomentumPercent, technicalScore: techMeta.technicalScore, technicalSignal: techMeta.technicalSignal, historicalDataPoints: techMeta.historicalDataPoints, historicalLastDate: freshness.historicalLastDate, historicalDataAgeDays: freshness.historicalDataAgeDays, generatedAt: (now instanceof Date ? now : new Date()).toISOString() } as any;
+    const techSignal = { id: `technical_${symbol}`, type: 'TECHNICAL_MOMENTUM', origin: 'SYMBOL_PRICE_SERIES', direction, severity: 'INFO', title: 'Technical: Momentum', description: 'Historical price series momentum', symbols: [symbol], evidence } as any;
+    return techSignal;
+  }catch(_){ return null; }
+}
+
+// Create a symbol-specific RELATIVE_STRENGTH signal comparing symbol changePercent
+// against the market average changePercent for comparable instruments in the same cycle.
+// Rules:
+// - Use only valid, non-stale instruments with numeric changePercent
+// - Require at least MIN_COMPARABLES comparable instruments to compute a stable average
+// - Require an absolute difference >= RELATIVE_STRENGTH_MIN_DIFF_PERCENT to emit
+// Thresholds chosen conservatively to avoid noise: 5 comparables, 0.7 percentage points.
+export function createRelativeStrengthSignalForInstrument(instr: any, allInstruments: any[], now?: Date, opts?: { minComparables?: number; minDiffPercent?: number }){
+  try{
+    if (!instr || typeof instr.changePercent !== 'number') return null;
+    if (instr.dataStatus === 'UNAVAILABLE' || instr.isStale) return null;
+    const MIN_COMPARABLES = typeof (opts && opts.minComparables) === 'number' ? (opts as any).minComparables : 5;
+    const RELATIVE_STRENGTH_MIN_DIFF_PERCENT = typeof (opts && opts.minDiffPercent) === 'number' ? (opts as any).minDiffPercent : 0.7; // absolute percent
+    // filter comparables: valid numeric changePercent, not stale, not unavailable
+    const comps = Array.isArray(allInstruments) ? allInstruments.filter((i:any)=> i && typeof i.changePercent === 'number' && i.dataStatus !== 'UNAVAILABLE' && !i.isStale) : [];
+    if (!Array.isArray(comps) || comps.length < Math.max(MIN_COMPARABLES, 2)) return null;
+    // compute market average excluding the instrument itself for stability
+    const others = comps.filter((c:any)=> String(c.symbol).toUpperCase() !== String(instr.symbol).toUpperCase());
+    if (!Array.isArray(others) || others.length < MIN_COMPARABLES) return null;
+    const avg = others.reduce((s:any,c:any)=> s + Number(c.changePercent||0), 0) / others.length;
+    if (!Number.isFinite(avg)) return null;
+    const rel = Number(instr.changePercent) - avg;
+    if (!Number.isFinite(rel)) return null;
+    if (Math.abs(rel) < RELATIVE_STRENGTH_MIN_DIFF_PERCENT) return null;
+    const dir = rel > 0 ? 'BULLISH' : 'BEARISH';
+    const norm = String(instr.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    const id = `relative_strength_${norm}`;
+    const evidence = { symbolChangePercent: Number(instr.changePercent), marketAverageChangePercent: Number(Number(avg).toFixed(2)), relativeStrengthPercent: Number(Number(rel).toFixed(2)), generatedAt: (now instanceof Date ? now : new Date()).toISOString() } as any;
+    const sig = { id, type: 'RELATIVE_STRENGTH', origin: 'MARKET_QUOTES_AGGREGATE', direction: dir, severity: 'INFO', title: 'Relative Strength', description: 'Symbol vs market average', symbols: [String(instr.symbol).toUpperCase()], evidence } as any;
+    return sig;
+  }catch(_){ return null; }
+}
 
 // Helper: simple evaluation rules (module-scope so tests can import)
 export function evaluateHoldingActionPublic(h:any, q:any){
@@ -70,8 +253,119 @@ export function decideBuySignalFromLastRef(usePrice: number, lastRef: number | n
   return { buySignal: false, reason: 'No dip' };
 }
 
+// Exported helper: pick up to two supporting market signal ids of distinct types for a given symbol and desired action
+export function pickSupportingSignalIds(marketSignals: any, symbol: string | undefined, desiredAction: 'BUY'|'SELL'){
+  try{
+    if (!marketSignals || !Array.isArray(marketSignals.signals) || marketSignals.signals.length === 0) return [];
+    const sigs = marketSignals.signals as any[];
+    const sym = symbol ? String(symbol).toUpperCase() : null;
+    // Determine which signals actually support the symbol and desired action
+    const supporting: any[] = [];
+    for (const s of sigs){
+      if (!s || !s.id || !s.type) continue;
+      let supports = false;
+      // Symbol-specific signals
+      if (Array.isArray((s as any).symbols) && sym){
+        const listed = (s as any).symbols.map((x:any)=> String(x).toUpperCase());
+        if (listed.includes(sym)){
+          // If the signal carries an explicit direction field (e.g. TECHNICAL_MOMENTUM), prefer it
+          if ((s as any).direction){
+            const dir = String((s as any).direction).toUpperCase();
+            if (dir === 'BULLISH' && desiredAction === 'BUY') supports = true;
+            if (dir === 'BEARISH' && desiredAction === 'SELL') supports = true;
+            // do not infer further from evidence when explicit direction present
+            if (supports) { supporting.push(s); continue; }
+          }
+          // If we have explicit evidence.changePercent for this symbol, use its sign
+          if (s.evidence && typeof s.evidence.changePercent === 'number'){
+            if (desiredAction === 'BUY' && s.evidence.changePercent > 0) supports = true;
+            if (desiredAction === 'SELL' && s.evidence.changePercent < 0) supports = true;
+          } else {
+            // infer from type: LEADER -> BUY, LAGGARD -> SELL; otherwise cannot infer
+            if (String(s.type).toUpperCase() === 'LEADER' && desiredAction === 'BUY') supports = true;
+            if (String(s.type).toUpperCase() === 'LAGGARD' && desiredAction === 'SELL') supports = true;
+          }
+        }
+      }
+      // Global signals (no symbol list)
+      if (!supports && (!Array.isArray((s as any).symbols) || (s as any).symbols.length === 0)){
+        const t = String(s.type).toUpperCase();
+        if (t === 'MARKET_TREND'){
+          // Expect evidence.marketSentiment only; do not fallback to id text
+          const msent = s.evidence && s.evidence.marketSentiment ? String(s.evidence.marketSentiment).toUpperCase() : null;
+          if (msent){ if (desiredAction === 'BUY' && msent === 'BULLISH') supports = true; if (desiredAction === 'SELL' && msent === 'BEARISH') supports = true; }
+        } else if (t === 'MARKET_BREADTH'){
+          // Use advancing/declining counts if present
+          const adv = s.evidence && typeof s.evidence.advancing === 'number' ? s.evidence.advancing : undefined;
+          const dec = s.evidence && typeof s.evidence.declining === 'number' ? s.evidence.declining : undefined;
+          if (typeof adv === 'number' && typeof dec === 'number'){
+            if (desiredAction === 'BUY' && adv > dec) supports = true;
+            if (desiredAction === 'SELL' && dec > adv) supports = true;
+          }
+        }
+      }
+      if (supports) supporting.push(s);
+    }
+
+    // Prefer symbol-specific supporting signals first, then global ones; choose up to two distinct types
+    const symbolSpecific = supporting.filter(s => Array.isArray((s as any).symbols) && (s as any).symbols.length > 0);
+    const global = supporting.filter(s => !Array.isArray((s as any).symbols) || (s as any).symbols.length === 0);
+    const ordered = symbolSpecific.concat(global);
+    const chosen: any[] = [];
+    const seenTypes = new Set<string>();
+    for (const s of ordered){ if (!seenTypes.has(String(s.type))){ chosen.push(s); seenTypes.add(String(s.type)); if (chosen.length >= 2) break; } }
+    return chosen.map(s=> String(s.id));
+  }catch(_){ return []; }
+}
+
+// Build compact supporting signal metadata for audits.
+// Returns sanitized { signalIds, supportingSignals } given a list of chosen ids and the full marketSignals payload.
+export function buildSupportingSignalAuditMetadata(chosenIds: any[] | undefined, marketSignals: any){
+  try{
+    const ids = Array.isArray(chosenIds) ? Array.from(new Set(chosenIds.map((x:any)=> String(x)))) : [];
+    const available = marketSignals && Array.isArray(marketSignals.signals) ? marketSignals.signals : [];
+    const supporting: Array<{id:string;type:string;origin:string}> = [];
+    for (const id of ids){
+      try{
+        const obj = available.find((s:any)=> s && String(s.id) === String(id));
+        if (!obj || !obj.id) continue;
+        const entry = { id: String(obj.id), type: String(obj.type || ''), origin: String(obj.origin || '') };
+        if (!supporting.some(ss => ss.id === entry.id)) supporting.push(entry);
+      }catch(_){ continue; }
+    }
+    return { signalIds: ids, supportingSignals: supporting };
+  }catch(_){ return { signalIds: [], supportingSignals: [] }; }
+}
+
+// Sanitize Decision Intelligence snapshot for inclusion in runtime state / UI
+export function sanitizeDecisionIntelligenceForState(snap: any){
+  try{
+    if (!snap || typeof snap !== 'object') return null;
+    const allowed: any = {
+      cycleId: snap.cycleId || null,
+      symbol: snap.symbol || null,
+      generatedAt: snap.generatedAt || null,
+      direction: snap.direction || null,
+      bullishScore: typeof snap.bullishScore === 'number' ? snap.bullishScore : null,
+      bearishScore: typeof snap.bearishScore === 'number' ? snap.bearishScore : null,
+      hasConflict: !!snap.hasConflict,
+      hasIndependentBullishSupport: !!snap.hasIndependentBullishSupport,
+      hasIndependentBearishSupport: !!snap.hasIndependentBearishSupport,
+      analysisQuality: snap.analysisQuality || null,
+      strongestBullish: snap.strongestBullish || null,
+      strongestBearish: snap.strongestBearish || null,
+      selectedSupportingSignals: Array.isArray(snap.selectedSupportingSignals) ? snap.selectedSupportingSignals.map((s:any)=> ({ id: s.id, type: s.type, origin: s.origin })) : [],
+      warnings: Array.isArray(snap.warnings) ? snap.warnings.slice(0,10) : [],
+      reasoning: Array.isArray(snap.reasoning) ? snap.reasoning.slice(0,5) : [],
+      schemaVersion: snap.schemaVersion || null,
+      source: snap.source || null
+    };
+    return allowed;
+  }catch(_){ return null; }
+}
+
 // Build compact trade feedback summary from auditStore (if any). Returns undefined when none.
-async function computeTradeFeedbackSummary(auditStore: any){
+export async function computeTradeFeedbackSummary(auditStore: any){
   try{
     const audits = await auditStore.list();
     if (!Array.isArray(audits) || audits.length === 0) return undefined;
@@ -100,7 +394,17 @@ async function computeTradeFeedbackSummary(auditStore: any){
     const avgPnl = rows.reduce((s,r)=> s + r.pnlSek, 0) / rows.length;
     rows.sort((a,b)=> (a.ts || '') > (b.ts || '') ? 1 : -1);
     const last = rows[rows.length-1];
-    return { winRate: wins / rows.length, avgPnlSek: avgPnl, evaluatedCount: rows.length, lastVerdict: last.verdict };
+
+    // Build per-signal summary using existing helper which respects decision.signals and dedup rules
+    let bySignal: Array<{ signalId: string; evaluatedCount: number; winRate: number; avgPnlSek: number }> = [];
+    try{
+      const sigs = summarizeFeedbackBySignal(audits as any);
+      if (Array.isArray(sigs) && sigs.length > 0){
+        bySignal = sigs.map(s=> ({ signalId: s.signalId, evaluatedCount: s.evaluatedCount, winRate: s.winRate, avgPnlSek: s.avgPnlSek }));
+      }
+    }catch(_){ bySignal = []; }
+
+    return { winRate: wins / rows.length, avgPnlSek: avgPnl, evaluatedCount: rows.length, lastVerdict: last.verdict, bySignal };
   }catch(_){ return undefined; }
 }
 
@@ -297,13 +601,33 @@ export async function __appendTestAudits(entries: any[]){
   try{
     for (const e of entries){ await auditStore.append(e); }
   }catch(e){ }
-
-  // Per-run cycle id for correlation (one-per-cycle)
-  try{
-    (auditStore as any).entries = [];
-    try{ (auditStore as any).persistSync(); }catch(_){ /* ignore */ }
-  }catch(e){}
 }
+
+// Clear persisted/in-memory audit entries for test isolation.
+export async function __clearAudits(){
+  try{
+    // If underlying store exposes an entries array (FileAuditStore or InMemoryAuditStore), clear it
+    try{
+      if ((auditStore as any) && Array.isArray((auditStore as any).entries)){
+        (auditStore as any).entries = [];
+      }
+    }catch(_){ }
+
+    // If store provides a persistSync method (file-backed), persist empty state
+    try{ if ((auditStore as any) && typeof (auditStore as any).persistSync === 'function') (auditStore as any).persistSync(); }catch(_){ }
+
+    // If store exposes an async clear() helper, call it
+    try{ if ((auditStore as any) && typeof (auditStore as any).clear === 'function') await (auditStore as any).clear(); }catch(_){ }
+  }catch(_){ }
+}
+
+// Test helper: expose raw audit entries for verification
+export async function __listAudits(){
+  try{ const all = await auditStore.list(); return Array.isArray(all) ? all : []; }catch(_){ return []; }
+}
+
+// Test helper: expose internal runtime for assertions in unit tests
+
 
 const config: PaperTraderConfig = {
   enabled: true,
@@ -327,8 +651,10 @@ const runtime: RuntimeState = {
   auditStore,
   latestDecision: null,
   latestCycle: null,
+  latestMarketNewsActivity: undefined,
   lastUpdated: nowIso(),
   autonomousEnabled: true,
+  latestDecisionIntelligenceBySymbol: {},
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -344,6 +670,8 @@ type SchedulerState = {
   lastAutomaticEvaluationCount?: number | null;
   lastAutomaticAuditCountBefore?: number | null;
   lastAutomaticAuditCountAfter?: number | null;
+  // optional diagnostics when lock acquisition or automatic run is skipped
+  lastAutomaticLockDiagnostics?: any | null;
   // dynamic callback that can be replaced on hot-reload without replacing timer
   runTick?: (() => Promise<void>) | null;
 };
@@ -468,7 +796,7 @@ export function anyNonStockInstrumentsEligible(now?: Date){
 
 // Implementation used as the dynamic runTick that can be swapped on hot-reload
 async function runAutomaticCycleImplementation(){
-  const sched = getGlobalScheduler();
+    const sched = getGlobalScheduler();
   // If another run is in progress at the scheduler level, return early
   if (sched.inProgress) return { ran: false, reason: 'already_running' } as any;
 
@@ -504,21 +832,49 @@ async function runAutomaticCycleImplementation(){
 
   // Acquire distributed lock to ensure single execution across processes
   const GLOBAL_RUN_CYCLE_LOCK_KEY = 'paper-trader:cycle:default';
+  const LOCK_TTL_SECONDS = 900; // 15 minutes default (see run-cycle-lock.ts)
   let ownerToken: string | null = null;
   try{
-    const lockRes = await acquireRunCycleLockWithOwner(GLOBAL_RUN_CYCLE_LOCK_KEY);
+    // Create a local attempt token for diagnostic correlation (not a secret)
+    const attemptOwnerToken = (()=>{ try{ if (typeof (global as any).crypto !== 'undefined' && typeof (global as any).crypto.randomUUID === 'function') return (global as any).crypto.randomUUID(); }catch(_){ } return `t_${Date.now()}_${Math.random().toString(36).slice(2,9)}` })();
+    const lockRes = await acquireRunCycleLockWithOwner(GLOBAL_RUN_CYCLE_LOCK_KEY, LOCK_TTL_SECONDS);
+    const lockBackend = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) ? 'upstash' : 'local';
+    const lockFullKey = `atlas:paper-trader:run-cycle:${GLOBAL_RUN_CYCLE_LOCK_KEY}`;
+
     if (lockRes.status === 'DUPLICATE'){
       sched.lastAutomaticRunStatus = 'skipped'; sched.lastAutomaticRunMessage = 'duplicate_lock';
       try{ sched.lastRunAt = Date.now(); }catch(_){ sched.lastRunAt = null; }
-      return { ran: false, reason: 'duplicate_lock' } as any;
+      // attach machine-readable lock diagnostics for troubleshooting
+      const diag = {
+        skipReasonCode: 'DUPLICATE_LOCK',
+        skipStage: 'run_cycle_lock',
+        lockBackend,
+        lockKey: lockFullKey,
+        lockTtlMs: Number(LOCK_TTL_SECONDS) * 1000,
+        lockOwnerId: (lockRes as any).ownerToken || attemptOwnerToken,
+        lockDeniedAt: new Date().toISOString(),
+      } as any;
+      try{ sched.lastAutomaticLockDiagnostics = diag; }catch(_){ }
+      try{ console.debug && console.debug('runAutomaticCycleImplementation: duplicate lock', diag); }catch(_){ }
+      return { ran: false, reason: 'duplicate_lock', duplicate: true, ...diag } as any;
     }
     if (lockRes.status === 'UNAVAILABLE'){
       sched.lastAutomaticRunStatus = 'skipped'; sched.lastAutomaticRunMessage = 'lock_unavailable';
       try{ sched.lastRunAt = Date.now(); }catch(_){ sched.lastRunAt = null; }
-      return { ran: false, reason: 'lock_unavailable' } as any;
+      const diag = {
+        skipReasonCode: 'LOCK_UNAVAILABLE',
+        skipStage: 'run_cycle_lock',
+        lockBackend,
+        lockKey: lockFullKey,
+        lockTtlMs: Number(LOCK_TTL_SECONDS) * 1000,
+        lockOwnerId: (lockRes as any).ownerToken || null,
+        lockDeniedAt: new Date().toISOString(),
+      } as any;
+      try{ sched.lastAutomaticLockDiagnostics = diag; }catch(_){ }
+      return { ran: false, reason: 'lock_unavailable', ...diag } as any;
     }
     ownerToken = (lockRes as any).ownerToken || null;
-  }catch(e){ sched.lastAutomaticRunStatus = 'skipped'; sched.lastAutomaticRunMessage = 'lock_error'; try{ sched.lastRunAt = Date.now(); }catch(_){ sched.lastRunAt = null; } return { ran: false, reason: 'lock_error' } as any; }
+  }catch(e){ sched.lastAutomaticRunStatus = 'skipped'; sched.lastAutomaticRunMessage = 'lock_error'; try{ sched.lastRunAt = Date.now(); }catch(_){ sched.lastRunAt = null; } const diag = { skipReasonCode: 'LOCK_ERROR', skipStage: 'run_cycle_lock', lockBackend: (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) ? 'upstash' : 'local', lockKey: `atlas:paper-trader:run-cycle:${GLOBAL_RUN_CYCLE_LOCK_KEY}`, lockTtlMs: Number(LOCK_TTL_SECONDS) * 1000, lockOwnerId: null, lockDeniedAt: new Date().toISOString() }; try{ const s = getGlobalScheduler(); s.lastAutomaticLockDiagnostics = diag; }catch(_){ } return { ran: false, reason: 'lock_error', ...diag } as any; }
 
   // mark running
   sched.inProgress = true;
@@ -735,6 +1091,7 @@ export async function getPaperTradingState(){
     out.lastAutomaticEvaluationCount = typeof sched.lastAutomaticEvaluationCount === 'number' ? sched.lastAutomaticEvaluationCount : null;
     out.lastAutomaticAuditCountBefore = typeof sched.lastAutomaticAuditCountBefore === 'number' ? sched.lastAutomaticAuditCountBefore : null;
     out.lastAutomaticAuditCountAfter = typeof sched.lastAutomaticAuditCountAfter === 'number' ? sched.lastAutomaticAuditCountAfter : null;
+    out.lastAutomaticLockDiagnostics = sched.lastAutomaticLockDiagnostics || null;
   }catch(e){
     out.autonomousEnabled = !!runtime.autonomousEnabled;
     out.schedulerRunning = false;
@@ -747,6 +1104,38 @@ export async function getPaperTradingState(){
   // Include quote fetch diagnostics when fetch failed
   if (!quoteFetchOk){ out.quoteFetch = { ok: false, message: quoteFetchMessage || 'Quote fetch failed, using stored prices' }; }
   else { out.quoteFetch = { ok: true }; }
+    // Expose latest sanitized Decision Intelligence per symbol for UI
+    try{
+      const rawMap = runtime.latestDecisionIntelligenceBySymbol || {};
+      const safeMap: Record<string, any> = {};
+      for (const k of Object.keys(rawMap || {})){
+        try{ const v = (rawMap as any)[k]; if (v) safeMap[k] = sanitizeDecisionIntelligenceForState(v); }catch(_){ }
+      }
+      out.latestDecisionIntelligenceBySymbol = safeMap;
+    }catch(_){ out.latestDecisionIntelligenceBySymbol = {}; }
+    // Expose latest sanitized Fundamental Intelligence per symbol for UI
+    try{
+      const rawMapF = runtime.latestFundamentalIntelligenceBySymbol || {};
+      const safeFund: Record<string, any> = {};
+      for (const k of Object.keys(rawMapF || {})){
+        try{ const v = (rawMapF as any)[k]; if (!v) continue; safeFund[k] = { snapshot: v.snapshot ? { schemaVersion: v.snapshot.schemaVersion, source: v.snapshot.source, symbol: v.snapshot.symbol, fetchedAt: v.snapshot.fetchedAt, dataStatus: v.snapshot.dataStatus, availableCategories: Array.isArray(v.snapshot.availableCategories) ? v.snapshot.availableCategories.slice() : [], missingCapabilities: Array.isArray(v.snapshot.missingCapabilities) ? v.snapshot.missingCapabilities.slice() : [], } : null, quality: v.quality ? { level: v.quality.level, score: v.quality.score, positiveFactors: Array.isArray(v.quality.positiveFactors) ? v.quality.positiveFactors.slice() : [], negativeFactors: Array.isArray(v.quality.negativeFactors) ? v.quality.negativeFactors.slice() : [], warnings: Array.isArray(v.quality.warnings) ? v.quality.warnings.slice(0,10) : [] } : null }; }catch(_){ }
+      }
+      out.latestFundamentalIntelligenceBySymbol = safeFund;
+    }catch(_){ out.latestFundamentalIntelligenceBySymbol = {}; }
+  // Expose latest market news activity from the most recent CYCLE_INTELLIGENCE_SNAPSHOT audit (if any)
+  try{
+    let latestActivity: MarketNewsActivity | undefined = undefined;
+    if (Array.isArray(allAudits)){
+      for (const a of allAudits){
+        try{
+          const raw = a && (a as any).raw ? (a as any).raw : a;
+          if (raw && raw.kind === 'CYCLE_INTELLIGENCE_SNAPSHOT' && raw.marketNewsActivity){ latestActivity = raw.marketNewsActivity; break; }
+        }catch(_){ }
+      }
+    }
+    out.latestMarketNewsActivity = latestActivity;
+    try{ runtime.latestMarketNewsActivity = latestActivity; }catch(_){ }
+  }catch(_){ out.latestMarketNewsActivity = undefined; }
 
   return out;
 }
@@ -831,10 +1220,58 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // Per-run cycle id for correlation (one-per-cycle)
   const cycleId = `cycle_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
   const cycleStartMs = Date.now();
+  // Helper to attach optional market news intelligence summary to a snapshot
+  const attachMarketNewsSummary = (snapshot: any) => {
+    try{
+      const maybeNews = opts && opts.overrideUniverse && (opts.overrideUniverse as any).marketNewsSnapshot;
+      if (!maybeNews) return;
+      // Use the centralized creator to produce the exact saved summary shape.
+      const summary = createMarketNewsIntelligenceSummary(maybeNews as any, Date.now());
+      snapshot.marketNewsIntelligenceSummary = summary as MarketNewsIntelligenceSummary;
+    }catch(_){ }
+  };
+  // Helper to attach market news fields to an audit object based on snapshot
+  const attachMarketNewsAuditFields = (auditObj: any, snapshot: any) => {
+    try{
+      if (!snapshot || !(snapshot as any).marketNewsIntelligenceSummary) return;
+      auditObj.marketNewsIntelligenceSummary = (snapshot as any).marketNewsIntelligenceSummary;
+      try{ auditObj.marketNewsActivity = createMarketNewsActivity((snapshot as any).marketNewsIntelligenceSummary); }catch(_){ }
+    }catch(_){ }
+  };
   // Local AuditStore wrapper that injects cycleId into every appended entry without mutating caller object
   const cycleAuditStore: import('./types').AuditStore = {
     append: async (entry: import('./types').AuditEntry) => {
-      const payload = Object.assign({}, entry, { cycleId });
+      // Build a sanitized payload copy and ensure supporting signal metadata follows the decision
+      const payload: any = Object.assign({}, entry, { cycleId });
+      try{
+        const helper = (p: any) : { signalIds: string[]; supportingSignals: Array<{id:string;type:string;origin:string}> } => {
+          const res = { signalIds: [] as string[], supportingSignals: [] as Array<{id:string;type:string;origin:string}> };
+          try{
+            const sigIds = Array.isArray(p.decision && p.decision.signals) ? p.decision.signals.map((x:any)=> String(x)) : [];
+            res.signalIds = sigIds;
+            if (sigIds.length === 0) return res;
+            // Try to locate a marketSignals payload on the audit object in a few common places
+            const ms = (p.marketSignals && Array.isArray(p.marketSignals.signals) ? p.marketSignals.signals : (p.meta && p.meta.marketSignals && Array.isArray(p.meta.marketSignals.signals) ? p.meta.marketSignals.signals : (p.decision && p.decision.marketSignals && Array.isArray(p.decision.marketSignals.signals) ? p.decision.marketSignals.signals : [])));
+            const existingSupporting = Array.isArray(p.supportingSignals) ? p.supportingSignals : (Array.isArray(p.decision && p.decision.supportingSignals) ? p.decision.supportingSignals : []);
+            const candidatesPool = Array.isArray(ms) ? ms.concat(existingSupporting) : Array.isArray(existingSupporting) ? existingSupporting : [];
+            for (const id of sigIds){
+              const found = candidatesPool.find((s:any)=> s && String(s.id) === String(id));
+              if (found && found.id){
+                const entrySig = { id: String(found.id), type: String(found.type || ''), origin: String(found.origin || '') };
+                if (!res.supportingSignals.some(ss => ss.id === entrySig.id)) res.supportingSignals.push(entrySig);
+              }
+            }
+            return res;
+          }catch(_){ return res; }
+        };
+        const meta = helper(payload);
+        // Attach supportingSignals only when we have at least one matching metadata entry
+        if (Array.isArray(meta.signalIds) && meta.signalIds.length > 0){
+          // Ensure decision.signals exists and is deduped & ordered
+          try{ payload.decision = payload.decision || {}; payload.decision.signals = Array.from(new Set(meta.signalIds)); }catch(_){ }
+          if (Array.isArray(meta.supportingSignals) && meta.supportingSignals.length > 0){ payload.supportingSignals = meta.supportingSignals; }
+        }
+      }catch(_){ /* Do not fail audit append on metadata construction errors */ }
       return auditStore.append(payload as import('./types').AuditEntry);
     },
     list: auditStore.list.bind(auditStore),
@@ -846,10 +1283,39 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // Build simple deterministic demo decision set
   // Determine eligible instruments for this cycle using per-instrument session rules.
   const nowForCycle = new Date();
+
+  // Fetch quotes early so we can treat instruments with fresh market data as eligible
+  // even when a simple time-based rule would mark the market closed.
+  // Only use provider-fetched quotes for early eligibility checks. When callers
+  // provide `overrideUniverse.quotes` (typically tests), respect the configured
+  // time-based rules and do not short-circuit eligibility based on the override
+  // payload.
+  const _earlyQuotes = (opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes)) ? null : await fetchQuotes();
+
   // Determine eligible instruments for this cycle using module-scoped TRADABLE_INSTRUMENTS.
   const eligibleInstruments = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.filter(i => {
     const enabled = (i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true);
     if (!enabled) return false;
+    // If this is a FOREX/COMMODITY instrument and we have a fresh quote, prefer that
+    // over the simple time-based session check. This allows recently-fetched
+    // market data to drive eligibility during edge cases (e.g. just before/after
+    // session boundaries or when provider data indicates liquidity).
+    try{
+      const type = i && i.assetType ? String(i.assetType).toUpperCase() : 'STOCK';
+      if ((type === 'FOREX' || type === 'COMMODITY') && Array.isArray(_earlyQuotes)){
+        const sym = (i.providerSymbol || i.id || '').toUpperCase();
+        const normSym = String(sym).replace(/[^A-Z0-9]/g, '');
+        const q = _earlyQuotes.find((qq:any) => {
+          const candidate = String((qq.symbol||qq.providerSymbol||'')).toUpperCase();
+          const normCandidate = candidate.replace(/[^A-Z0-9]/g, '');
+          return normCandidate === normSym;
+        });
+        if (q){
+          const price = q.price ?? q.priceSek ?? q.priceUsd ?? q.priceUSD ?? q.lastPrice;
+          if (price !== undefined && price !== null) return true;
+        }
+      }
+    }catch(_){ }
     return isInstrumentTradableNow(i, nowForCycle);
   }) : [];
 
@@ -862,7 +1328,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     return { skipped: true, code: 'NO_ELIGIBLE_INSTRUMENTS' } as any;
   }
 
-  const symbols = eligibleInstruments.map(i => (i.providerSymbol || i.id).toUpperCase());
+  // For BUY candidates, analyze the configured watchlist (filtered by eligible instruments)
+  const symbols = getWatchlistSymbols(eligibleInstruments);
   const quotes = opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes) ? opts.overrideUniverse.quotes : await fetchQuotes();
 
   // --- RUNTIME QUOTES SNAPSHOT (transient diagnostic for cycle troubleshooting) ---
@@ -904,6 +1371,67 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       await cycleAuditStore.append({ kind: 'RECEIVED', id: `runtime_snapshot_${Date.now()}`, timestamp: fetchedAt, snapshot: snap, meta: { automatic: true } } as any);
     }catch(e){ /* swallow */ }
   }catch(e){ /* do not impact runtime when diagnostics fail */ }
+  // Build per-cycle instruments array and macro snapshot/signals once to reuse for BUY/SELL
+  let cycleMacroSnapshot: any = undefined;
+  let cycleMacroSignals: any[] | undefined = undefined;
+  let cycleSectorSummaries: any[] | undefined = undefined;
+  try{
+    const instrumentsForMacro: any[] = Array.isArray(quotes) ? (quotes as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, providerSymbol: q.providerSymbol, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+    // Build local snapshot from instruments (GOLD/OIL)
+    const localSnapshot = buildMacroSnapshotFromInstruments(instrumentsForMacro, new Date().toISOString());
+    // Build sector summaries once per cycle
+    try{ cycleSectorSummaries = buildSectorStrengthSummaries(instrumentsForMacro, new Date().toISOString()); }catch(_){ cycleSectorSummaries = undefined; }
+    // Fetch supported macro indicators (VIX/DXY/US10Y) once per cycle
+    try{
+      const macroFetch = await import('./macro-signals');
+      const fetched = await macroFetch.fetchMacroSnapshot();
+        // merge fetched values into local snapshot without overwriting local GOLD/OIL
+        cycleMacroSnapshot = Object.assign({}, localSnapshot, fetched.snapshot);
+        // attach macro data status and diagnostics to the cycle snapshot
+        try{
+          // Ensure we include local-derived availability (e.g. GOLD/OIL) when fetched results
+          // only cover VIX/DXY/US10Y. Merge defaults so keys exist for all indicators.
+          const defaultsStatus = { vix: 'UNSUPPORTED', dxy: 'UNSUPPORTED', us10y: 'UNSUPPORTED', oil: (localSnapshot && typeof (localSnapshot as any).oil === 'number') ? 'OK' : 'MISSING' } as any;
+          const defaultsDiag = { vix: { configured: false, status: 'UNSUPPORTED', hasValue: false, hasTimestamp: false, isFresh: false }, dxy: { configured: false, status: 'UNSUPPORTED', hasValue: false, hasTimestamp: false, isFresh: false }, us10y: { configured: false, status: 'UNSUPPORTED', hasValue: false, hasTimestamp: false, isFresh: false }, oil: { configured: false, status: (localSnapshot && typeof (localSnapshot as any).oil === 'number') ? 'OK' : 'MISSING', hasValue: !!(localSnapshot && typeof (localSnapshot as any).oil === 'number'), hasTimestamp: false, isFresh: !!(localSnapshot && typeof (localSnapshot as any).oil === 'number') } } as any;
+          const mergedStatus = Object.assign({}, defaultsStatus, (fetched && fetched.statusByIndicator) ? fetched.statusByIndicator : {});
+          const mergedDiag = Object.assign({}, defaultsDiag, (fetched && fetched.diagnosticsByIndicator) ? fetched.diagnosticsByIndicator : {});
+          (cycleMacroSnapshot as any).macroDataStatus = { fetchedAt: fetched.fetchedAt, statusByIndicator: mergedStatus, diagnosticsByIndicator: mergedDiag };
+        }catch(_){ (cycleMacroSnapshot as any).macroDataStatus = { fetchedAt: fetched.fetchedAt, statusByIndicator: fetched.statusByIndicator, diagnosticsByIndicator: fetched.diagnosticsByIndicator }; }
+        cycleMacroSignals = buildMacroSignals(cycleMacroSnapshot as any);
+
+        // Emit a single sanitized macro snapshot audit per cycle. This audit MUST NOT
+        // include provider symbols, raw provider payloads, API keys, URLs or secrets.
+        try{
+          const snap = cycleMacroSnapshot as any;
+          const now = new Date().toISOString();
+          const snapshotAudit = {
+            kind: 'MACRO_DATA_SNAPSHOT',
+            id: `macro_snapshot_${cycleId}`,
+            timestamp: now,
+            cycleId,
+            fetchedAt: (snap && snap.macroDataStatus && snap.macroDataStatus.fetchedAt) ? snap.macroDataStatus.fetchedAt : now,
+            statusByIndicator: (snap && snap.macroDataStatus && snap.macroDataStatus.statusByIndicator) ? snap.macroDataStatus.statusByIndicator : undefined,
+            diagnosticsByIndicator: (snap && snap.macroDataStatus && snap.macroDataStatus.diagnosticsByIndicator) ? snap.macroDataStatus.diagnosticsByIndicator : undefined,
+            // snapshotAvailability: indicate which indicators have valid values (boolean map)
+            snapshotAvailability: {
+              vix: snap && typeof snap.vix === 'number',
+              dxy: snap && typeof snap.dxy === 'number',
+              us10y: snap && typeof snap.us10y === 'number',
+              gold: snap && typeof snap.gold === 'number',
+              oil: snap && typeof snap.oil === 'number'
+            },
+            // compact signals: include only id, type, origin, direction, strength, isPlaceholder
+            signals: Array.isArray(cycleMacroSignals) ? cycleMacroSignals.map((s:any) => ({ id: s && s.id ? s.id : null, type: s && s.type ? s.type : null, origin: s && s.origin ? s.origin : null, direction: s && s.direction ? s.direction : null, strength: (s && (typeof s.strength === 'number' ? s.strength : undefined)), isPlaceholder: Boolean(s && s.isPlaceholder) })) : [],
+            meta: { automatic: true }
+          } as any;
+          try{ await cycleAuditStore.append(snapshotAudit as any); }catch(_){ }
+        }catch(_){ }
+    }catch(e){
+      // fallback to local-only snapshot if fetch fails
+      cycleMacroSnapshot = localSnapshot;
+      cycleMacroSignals = buildMacroSignals(cycleMacroSnapshot as any);
+    }
+  }catch(_){ cycleMacroSnapshot = undefined; cycleMacroSignals = undefined; }
   // Per-cycle diagnostics collected for each evaluated symbol
   const diagnosticsBySymbol = new Map<string, any>();
   function ensureDiag(sym: string){
@@ -1014,6 +1542,146 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     return analysisResultsBySymbol.get(sym) as Promise<any>;
   }
 
+  // Helper: fetch raw historical series (deduped per-cycle). Returns provider-normalized object
+  async function getHistoricalForSymbol(symbol: string){
+    const sym = String(symbol).toUpperCase();
+    if (!historicalRequestsBySymbol.has(sym)){
+      try{
+        const provider = new TwelveDataMarketDataProvider();
+        const histP = provider.getHistoricalDailyCloses(sym, 100);
+        historicalRequestsBySymbol.set(sym, histP);
+      }catch(e){
+        // If provider creation fails, store a rejected promise to avoid retries
+        historicalRequestsBySymbol.set(sym, Promise.reject(e));
+      }
+    }
+    return historicalRequestsBySymbol.get(sym) as Promise<any>;
+  }
+
+  // Per-cycle cache for built signal packages (dedupe building of market-structure + related signals)
+  const signalsBySymbol = new Map<string, Promise<any[]>>();
+  // Per-cycle cache for confluence summaries
+  const confluenceBySymbol = new Map<string, Promise<any>>();
+  // Per-cycle cache for fundamental intelligence packages (used by resolver)
+  const fundamentalBySymbol = new Map<string, Promise<any>>();
+  const perCycleFundResolver = createPerCycleFundamentalResolver({ fetchFundamental: async ({ symbol }: any) => await fetchAndBuildFundamentalIntelligence({ symbol, now: new Date().toISOString() }).catch(()=>null), instruments: TRADABLE_INSTRUMENTS, timeoutMs: 3000, appendAudit: async (res:any) => {/* noop here, append below */}, updateState: (s:string, r:any) => { try{ runtime.latestFundamentalIntelligenceBySymbol = runtime.latestFundamentalIntelligenceBySymbol || {}; runtime.latestFundamentalIntelligenceBySymbol[s] = { snapshot: r.snapshot, quality: r.quality }; }catch(_){ } } });
+
+  // Per-cycle decision intelligence resolver (created once per cycle)
+  let decisionIntelligenceResolver: any = null;
+
+  // Helper: build or return cached confluence summary for a symbol
+  async function getOrBuildConfluence(symbol: string, marketSignals: any, ts?: string){
+    const sym = String(symbol).toUpperCase();
+    if (!sym) return null;
+    if (confluenceBySymbol.has(sym)) return confluenceBySymbol.get(sym) as Promise<any>;
+    const p = (async ()=>{
+      try{
+        const mod = await import('./signal-confluence');
+        const summary = mod.buildSignalConfluenceSummary(sym, marketSignals, ts || new Date().toISOString());
+        // also compute quality once and attach to summary object for reuse
+        try{ const quality = mod.buildAnalysisQualitySummary(summary); (summary as any)._analysisQuality = quality; }catch(_){ }
+        return summary;
+      }catch(_){ return null; }
+    })();
+    confluenceBySymbol.set(sym, p);
+    return p;
+  }
+
+  // Create per-cycle decision intelligence resolver
+  try{
+    const qc = await import('./signal-confluence');
+    decisionIntelligenceResolver = qc.createPerCycleDecisionIntelligenceResolver({ cycleId, generatedAt: new Date().toISOString(), buildSummary: async (sym:string, marketSignals?: any) => {
+      // Use existing per-cycle confluence builder (deduped)
+      const s = await getOrBuildConfluence(sym, marketSignals, new Date().toISOString());
+      return s as any;
+    }, buildQuality: qc.buildAnalysisQualitySummary, buildReasoning: qc.buildConfluenceReasoning, appendAudit: async (payload:any) => {
+      // append a sanitized DECISION_INTELLIGENCE_SNAPSHOT audit and update runtime state
+      try{
+        const primary = Object.assign({}, payload, { kind: 'DECISION_INTELLIGENCE_SNAPSHOT', schemaVersion: qc.DECISION_INTELLIGENCE_SCHEMA_VERSION, source: qc.DECISION_INTELLIGENCE_SOURCE });
+        try{ await cycleAuditStore.append(primary); }catch(_){ }
+        try{
+          const sym = primary && primary.symbol ? String(primary.symbol).toUpperCase() : null;
+          if (sym){ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; runtime.latestDecisionIntelligenceBySymbol[sym] = sanitizeDecisionIntelligenceForState(primary); }
+        }catch(_){ }
+      }catch(_){ }
+      // Fetch and append fundamental intelligence audit (best-effort, per-cycle cached) via resolver
+      try{
+        const sym = String(payload && payload.symbol || '').toUpperCase();
+        if (!sym) return;
+        // Use resolver: only STOCK and analyzed symbols will be fetched
+        const res = await perCycleFundResolver.resolve({ cycleId, symbol: sym, analyzed: true });
+        if (!res || !res.snapshot) return;
+        const snap = res.snapshot;
+        const audit = {
+          kind: 'FUNDAMENTAL_INTELLIGENCE_SNAPSHOT',
+          id: `fundamental_${sym}_${cycleId}`,
+          timestamp: new Date().toISOString(),
+          cycleId,
+          schemaVersion: 1,
+          source: 'TWELVE_DATA_FUNDAMENTALS',
+          symbol: sym,
+          fetchedAt: snap.fetchedAt,
+          dataStatus: snap.dataStatus,
+          availableCategories: Array.isArray(snap.availableCategories) ? snap.availableCategories.slice() : [],
+          missingCapabilities: Array.isArray(snap.missingCapabilities) ? snap.missingCapabilities.slice() : [],
+          quality: { level: res.quality && res.quality.level ? res.quality.level : null, score: typeof res.quality?.score === 'number' ? res.quality.score : null, positiveFactors: Array.isArray(res.quality?.positiveFactors) ? res.quality.positiveFactors.slice() : [], negativeFactors: Array.isArray(res.quality?.negativeFactors) ? res.quality.negativeFactors.slice() : [], warnings: Array.isArray(res.quality?.warnings) ? res.quality.warnings.slice(0,10) : [] },
+          selectedMetrics: (function(){ const m:any = {}; const s = snap as any; if (typeof s.profitability?.revenueGrowthPercent === 'number') m.revenueGrowthPercent = s.profitability.revenueGrowthPercent; if (typeof s.profitability?.netIncomeGrowthPercent === 'number') m.netIncomeGrowthPercent = s.profitability.netIncomeGrowthPercent; if (typeof s.profitability?.operatingMarginPercent === 'number') m.operatingMarginPercent = s.profitability.operatingMarginPercent; if (typeof s.profitability?.netMarginPercent === 'number') m.netMarginPercent = s.profitability.netMarginPercent; if (typeof s.financialHealth?.debtToEquity === 'number') m.debtToEquity = s.financialHealth.debtToEquity; if (typeof s.financialHealth?.currentRatio === 'number') m.currentRatio = s.financialHealth.currentRatio; if (typeof s.cashFlow?.freeCashFlow === 'number') m.freeCashFlow = s.cashFlow.freeCashFlow; if (typeof s.cashFlow?.freeCashFlowMarginPercent === 'number') m.freeCashFlowMarginPercent = s.cashFlow.freeCashFlowMarginPercent; if (typeof s.valuation?.trailingPe === 'number') m.trailingPe = s.valuation.trailingPe; if (typeof s.valuation?.forwardPe === 'number') m.forwardPe = s.valuation.forwardPe; if (typeof s.earnings?.epsGrowthPercent === 'number') m.epsGrowthPercent = s.earnings.epsGrowthPercent; return m; })(),
+          meta: { automatic: true }
+        } as any;
+        try{ await cycleAuditStore.append(audit); }catch(_){ }
+      }catch(_){ }
+      // Also append a legacy SIGNAL_CONFLUENCE_SNAPSHOT built from the cached summary (marked legacy)
+      try{
+        const sym = String(payload && payload.symbol || '').toUpperCase();
+        if (sym){
+          const summary = await getOrBuildConfluence(sym, undefined, payload.generatedAt || undefined);
+          if (summary){
+            try{
+              const legacy = qc.buildConfluenceAuditPayload(cycleId, summary, payload && payload.reasoning ? payload.reasoning : undefined) as any;
+              legacy.legacy = true;
+              legacy.supersededBy = 'DECISION_INTELLIGENCE_SNAPSHOT';
+              if (!legacy.id) legacy.id = `legacy_confluence_${sym}_${Date.now()}`;
+              if (!legacy.timestamp) legacy.timestamp = new Date().toISOString();
+              try{ await cycleAuditStore.append(legacy); }catch(_){ }
+            }catch(_){ }
+          }
+        }
+      }catch(_){ }
+    } });
+  }catch(_){ decisionIntelligenceResolver = null; }
+
+  // Build (once per symbol per cycle) the ordered list of signals to append.
+  async function buildSignalsForSymbol(opts: { symbol: string; instEntry?: any; instruments?: any[]; prices?: number[]; volumes?: number[]; techMeta?: any; sectorSummaries?: any; macros?: any[] }){
+    const sym = String(opts.symbol || '').toUpperCase();
+    if (!sym) return [];
+    if (signalsBySymbol.has(sym)) return signalsBySymbol.get(sym) as Promise<any[]>;
+    const p = (async ()=>{
+      const out: any[] = [];
+      try{
+        const { instEntry, instruments, prices: pIn, volumes: vIn, techMeta, sectorSummaries, macros } = opts;
+        // Normalize arrays (do not mutate originals)
+        const prices = Array.isArray(pIn) ? pIn.slice() : (instEntry && Array.isArray(instEntry.prices) ? instEntry.prices.slice() : (instEntry && typeof instEntry.price === 'number' ? [instEntry.price] : []));
+        const volumes = Array.isArray(vIn) ? vIn.slice() : (instEntry && Array.isArray(instEntry.volumes) ? instEntry.volumes.slice() : []);
+
+        // 1-4: Technical momentum, Relative Strength, Sector Strength (these are observation-only and safe to build first)
+        try{ if (techMeta){ const techSig = createTechnicalSignalIfFresh(techMeta, sym, new Date(), TECHNICAL_MOMENTUM_MAX_AGE_DAYS); if (techSig) out.push(techSig); } }catch(_){ }
+        try{ const instrEntry = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === sym) : instEntry; const relSig = createRelativeStrengthSignalForInstrument(instrEntry, instruments || [], new Date()); if (relSig) out.push(relSig); }catch(_){ }
+        try{ const sectorSig = createSectorStrengthSignalForInstrument({ symbol: sym }, sectorSummaries, new Date().toISOString()); if (sectorSig) out.push(sectorSig); }catch(_){ }
+
+        // 5-7: Volume, Trend Quality, Supply/Demand (market-structure builders)
+        try{ const vs = buildVolumeSignal(sym, volumes, prices); if (vs) out.push(vs); }catch(_){ }
+        try{ const tq = buildTrendQualitySignal(sym, prices); if (tq) out.push(tq); }catch(_){ }
+        try{ const sd = buildSupportResistanceSignal(sym, prices); if (sd) out.push(sd); }catch(_){ }
+
+        // 8: Macro signals appended last
+        try{ if (Array.isArray(macros)){ for (const m of macros){ if (m && m.id && !out.some(o=> String(o.id) === String(m.id))) out.push(m); } } }catch(_){ }
+      }catch(_){ }
+      return out;
+    })();
+    signalsBySymbol.set(sym, p);
+    return p;
+  }
+
   // Helper to build meta object for appendEvaluation that may include fundamentalAnalysis
   const getMetaForSymbol = (symbol: string, techMeta: any) => {
     const meta: any = { automatic: true, technicalAnalysis: techMeta };
@@ -1024,6 +1692,9 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     }catch(_){ }
     return meta;
   };
+
+  // Helper: pick up to two supporting market signal ids of distinct types for a given symbol and desired action
+  // pickSupportingSignalIds is implemented at module scope and exported above
 
   // use module-scope helpers exported for tests
 
@@ -1036,7 +1707,9 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           const sym = (x && x.symbol) ? String(x.symbol).toUpperCase() : null;
           const iid = (x && x.instrumentId) ? String(x.instrumentId).toUpperCase() : null;
           const pSym = (x && x.providerSymbol) ? String(x.providerSymbol).toUpperCase() : null;
-          return (sym && sym === symbol) || (iid && iid === symbol) || (pSym && pSym === symbol);
+          const normalize = (s: string| null) => s ? String(s).toUpperCase().replace(/[^A-Z0-9]/g, '') : null;
+          const nSymbol = normalize(symbol);
+          return (sym && (sym === symbol || normalize(sym) === nSymbol)) || (iid && (iid === symbol || normalize(iid) === nSymbol)) || (pSym && (pSym === symbol || normalize(pSym) === nSymbol));
         }catch(e){ return false; }
       }) : null;
       const evalRes = evaluateHoldingActionPublic(h,q);
@@ -1057,6 +1730,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       // Attach centralized technical analysis (observe-only) using historical daily closes
       let _techMeta_for_holding: any = null;
       try{
+
         _techMeta_for_holding = await fetchAndAnalyze(symbol);
         try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, _techMeta_for_holding) } as any, cycleAuditStore); }catch(e){}
       }catch(_){
@@ -1078,12 +1752,123 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               }
             }catch(_){ /* ignore estimate failures and proceed without expectedReturnPercent for SELL */ }
 
-            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: expectedReturnForDecision, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext } as any;
+            // Build typed marketSignals from available quotes/analysis and attach to DecisionEngine input
+            let marketSignalsForDecision: any = undefined;
+            try{
+              const instruments: any[] = Array.isArray(quotes) ? (quotes as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+              const validInstruments = instruments.filter(i=> i.price !== null && i.changePercent !== null && i.dataStatus !== 'UNAVAILABLE');
+              const instrumentCount = instruments.length;
+              const advancing = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent > 0).length;
+              const declining = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent < 0).length;
+              const unchanged = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent === 0).length;
+              const unavailable = instruments.filter(i=> i.price === null || i.changePercent === null).length;
+              const avg = validInstruments.length > 0 ? Number((validInstruments.reduce((s,n)=> s + (Number(n.changePercent)||0),0)/validInstruments.length).toFixed(2)) : 0;
+              const strongest = validInstruments.length > 0 ? validInstruments.reduce((best,cur)=> (cur.changePercent > (best.changePercent||-Infinity) ? cur : best)) : null;
+              const weakest = validInstruments.length > 0 ? validInstruments.reduce((worst,cur)=> (cur.changePercent < (worst.changePercent||Infinity) ? cur : worst)) : null;
+              const warnings: string[] = [];
+              if ((quotes || []).some((qq:any)=> qq.dataStatus === 'DELAYED')) warnings.push('Marknadsdata är fördröjd.');
+              const summary = { instrumentCount, advancing, declining, unchanged, unavailable, averageChangePercent: avg };
+              const ctx = { generatedAt: new Date().toISOString(), marketDataStatus: (validInstruments.length === instruments.length && instruments.length > 0) ? 'READY' : (validInstruments.length > 0 ? 'PARTIAL' : 'UNAVAILABLE'), summary, strongest, weakest, instruments, warnings } as any;
+              try{ const analysis = analyzeMarket(ctx as any); marketSignalsForDecision = buildMarketSignals(ctx as any, analysis as any); }catch(_){ marketSignalsForDecision = undefined; }
+              // Append TECHNICAL_MOMENTUM signal from historical price analysis when available
+              try{
+                const techSignalObj = createTechnicalSignalIfFresh(_techMeta_for_holding, symbol, new Date(), TECHNICAL_MOMENTUM_MAX_AGE_DAYS);
+                if (techSignalObj && marketSignalsForDecision && Array.isArray(marketSignalsForDecision.signals)){
+                  marketSignalsForDecision.signals.push(techSignalObj);
+                }
+              }catch(_){ }
+              // Try to create and append a RELATIVE_STRENGTH signal using same fresh quotes universe
+              try{
+                if (marketSignalsForDecision && Array.isArray(marketSignalsForDecision.signals)){
+                  const instrEntry = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(symbol).toUpperCase()) : null;
+                  const relSig = createRelativeStrengthSignalForInstrument(instrEntry, instruments, new Date());
+                  if (relSig && !marketSignalsForDecision.signals.some((s:any)=> s && s.id === relSig.id)){
+                    marketSignalsForDecision.signals.push(relSig);
+                  }
+                }
+              }catch(_){ }
+              // Try to create and append a RELATIVE_STRENGTH signal using same fresh quotes universe
+              // (sector and macros will be appended via per-symbol build to preserve ordering)
+              // Append market-structure and related signals once per symbol using per-cycle cache
+              try{
+                if (marketSignalsForDecision && Array.isArray(marketSignalsForDecision.signals)){
+                  const inst = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(symbol).toUpperCase()) : null;
+                  let prices = Array.isArray((inst && inst.prices) ? inst.prices : []) ? inst.prices.slice() : (inst && typeof inst.price === 'number' ? [inst.price] : []);
+                  let volumes = Array.isArray((inst && inst.volumes) ? inst.volumes : []) ? (inst.volumes as any[]).slice() : [];
+                  // If no per-instrument series provided, fetch deduped per-cycle historical series
+                  if ((!Array.isArray(prices) || prices.length < 2) || (!Array.isArray(volumes) || volumes.length === 0)){
+                    try{
+                      const hist = await getHistoricalForSymbol(symbol);
+                      if (hist && Array.isArray(hist.closes) && hist.closes.length) prices = hist.closes.slice();
+                      // provider does not return volumes in current implementation
+                      if (hist && Array.isArray((hist as any).volumes) && (hist as any).volumes.length) volumes = (hist as any).volumes.slice();
+                    }catch(_){ /* tolerate provider errors */ }
+                  }
+                  const built = await buildSignalsForSymbol({ symbol, instEntry: inst, instruments, prices, volumes, techMeta: _techMeta_for_holding, sectorSummaries: cycleSectorSummaries, macros: cycleMacroSignals });
+                  for (const s of Array.isArray(built) ? built : []){
+                    try{ if (s && s.id && !marketSignalsForDecision.signals.some((x:any)=> x && x.id === s.id)) marketSignalsForDecision.signals.push(s); }catch(_){ }
+                  }
+                }
+              }catch(_){ }
+            }catch(_){ marketSignalsForDecision = undefined; }
+
+            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, performanceProfile: profile || undefined, expectedReturnPercent: expectedReturnForDecision, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext, marketSignals: marketSignalsForDecision } as any;
+              // Ensure decision.signals references actual marketSignals ids (at least two distinct types when available)
+            let _chosenSupportingSignalIdsForDecision: string[] | undefined = undefined;
+            // Build analysis snapshot (resolve analysis) using per-cycle resolver if available
+            try{
+              if (decisionIntelligenceResolver){
+                try{
+                  const snap = await decisionIntelligenceResolver.resolveAnalysis({ symbol, marketSignals: marketSignalsForDecision });
+                  try{ const d = ensureDiag(symbol); if (d) d.decisionIntelligence = { direction: snap.direction, bullishScore: snap.bullishScore, bearishScore: snap.bearishScore, hasConflict: snap.hasConflict, hasIndependentBullishSupport: snap.hasIndependentBullishSupport, hasIndependentBearishSupport: snap.hasIndependentBearishSupport, analysisQuality: snap.analysisQuality, selectedSupportingSignals: snap.selectedSupportingSignals, warnings: snap.warnings, reasoning: snap.reasoning }; }catch(_){ }
+                }catch(_){ }
+              } else {
+                const confluence = await getOrBuildConfluence(symbol, marketSignalsForDecision, cycleId);
+                try{ const d = ensureDiag(symbol); if (d) d.confluence = confluence; }catch(_){ }
+              }
+            }catch(_){ }
+            try{
+              const picked = pickSupportingSignalIds(marketSignalsForDecision, symbol, 'SELL');
+              if (Array.isArray(picked) && picked.length > 0) {
+                _chosenSupportingSignalIdsForDecision = Array.from(new Set(picked.map((id:any)=> String(id))));
+                (decInput.decision as PaperTradeDecision).signals = _chosenSupportingSignalIdsForDecision;
+              }
+              // If we have >=2 supporting ids of distinct types and no expectedReturnPercent, set a conservative default
+              try{
+                const ids = Array.isArray((decInput.decision as any).signals) ? (decInput.decision as any).signals as string[] : [];
+                const idToType = new Map((marketSignalsForDecision && Array.isArray(marketSignalsForDecision.signals) ? marketSignalsForDecision.signals : []).map((s:any)=> [String(s.id), String(s.type)]));
+                const types = new Set(ids.map(id => idToType.get(String(id))));
+                // Do not fabricate expectedReturnPercent; leave undefined if missing
+              }catch(_){ }
+            }catch(_){ }
+            // Finalize intelligence snapshot with selected supporting ids (append audit once)
+            try{
+              if (decisionIntelligenceResolver){
+                try{
+                  const finalSnap = await decisionIntelligenceResolver.finalizeSnapshot({ symbol, selectedSupportingSignalIds: _chosenSupportingSignalIdsForDecision || [] });
+                  try{ const d = ensureDiag(symbol); if (d) d.decisionIntelligence = { direction: finalSnap.direction, bullishScore: finalSnap.bullishScore, bearishScore: finalSnap.bearishScore, hasConflict: finalSnap.hasConflict, hasIndependentBullishSupport: finalSnap.hasIndependentBullishSupport, hasIndependentBearishSupport: finalSnap.hasIndependentBearishSupport, analysisQuality: finalSnap.analysisQuality, selectedSupportingSignals: finalSnap.selectedSupportingSignals, warnings: finalSnap.warnings, reasoning: finalSnap.reasoning }; }catch(_){ }
+                }catch(_){ }
+              }
+            }catch(_){ }
             const decRes = DecisionEngine.evaluateDecision(decInput);
-            const cand = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso(), requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0), tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect } as any;
+            const candBase: PaperTradeDecision = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() } as any;
+            const candExtras: any = { requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0), tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect };
+            const cand = Object.assign({}, candBase, candExtras) as any;
+            // Persist selected supporting signal ids on candidate (if any)
+            try{
+              if (Array.isArray(_chosenSupportingSignalIdsForDecision) && _chosenSupportingSignalIdsForDecision.length > 0){
+                (cand as PaperTradeDecision).signals = _chosenSupportingSignalIdsForDecision;
+                try{
+                  const meta = buildSupportingSignalAuditMetadata(_chosenSupportingSignalIdsForDecision, marketSignalsForDecision);
+                  if (Array.isArray(meta.supportingSignals) && meta.supportingSignals.length > 0) (cand as any).supportingSignals = meta.supportingSignals;
+                }catch(_){ }
+              }
+            }catch(_){ }
             // attach risk and reflection for auditability (reuse same reflection object)
             if (typeof expectedReturnForDecision === 'number') (cand as any).expectedReturnPercent = expectedReturnForDecision;
             cand.risk = decRes.risk;
+            // If DecisionEngine returned a macroSummary, copy only the safe fields into the candidate audit
+            try{ if (decRes && decRes.macroSummary && typeof decRes.macroSummary === 'object'){ const ms = decRes.macroSummary; (cand as any).macroSummary = { bullishStrength: ms.bullishStrength, bearishStrength: ms.bearishStrength, adjustment: ms.adjustment, signalCount: ms.signalCount }; } }catch(_){ }
             if (perCycleReflection) cand.performanceReflection = perCycleReflection;
             // Build market regime observation (observation-only, deterministic)
             try{
@@ -1095,6 +1880,34 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               const volumeStrength = typeof tech.volumeStrength === 'number' ? tech.volumeStrength : undefined;
               try{ (cand as any).marketRegime = classifyMarketRegime({ trendStrength, momentum, volatility, priceVsMovingAverage, volumeStrength }); }catch(_){ /* classification must not fail cycle */ }
             }catch(_){ }
+
+            // Enrich candidate with evidence objects built from available per-cycle info
+            try{
+              // collect recent audits for historical context (best-effort)
+              const allAuditsForHist = Array.isArray(await auditStore.list()) ? await auditStore.list() : [];
+              const completed = (allAuditsForHist || []).map((a:any)=> a && a.raw ? a.raw : a).filter(Boolean).map((r:any)=>{
+                if (r.kind === 'TRADE_FEEDBACK' && r.feedback) return { symbol: r.feedback && r.feedback.symbol ? String(r.feedback.symbol).toUpperCase() : null, returnPercent: typeof r.feedback.pnlPercent === 'number' ? r.feedback.pnlPercent : (typeof r.feedback.returnPercent === 'number' ? r.feedback.returnPercent : null), marketRegime: r.feedback && r.feedback.marketRegime ? r.feedback.marketRegime : null, marketContextAdvice: r.feedback && r.feedback.marketContextAdvice ? r.feedback.marketContextAdvice : null } as any;
+                if (r.kind === 'EVALUATION' && r.evaluation) return { symbol: r.evaluation && r.evaluation.symbol ? String(r.evaluation.symbol).toUpperCase() : null, returnPercent: typeof r.evaluation.returnPercent === 'number' ? r.evaluation.returnPercent : null, marketRegime: r.evaluation && r.evaluation.marketRegime ? r.evaluation.marketRegime : null, marketContextAdvice: r.evaluation && r.evaluation.marketContextAdvice ? r.evaluation.marketContextAdvice : null } as any;
+                return null;
+              }).filter(Boolean);
+
+              const hist: HistoricalContext = buildHistoricalContext({ marketRegime: (cand as any).marketRegime, marketContextAdvice: (cand as any).marketContextAdvice, completedTradeEvaluations: completed });
+
+              const drCandidate = { symbol: cand.symbol, action: cand.action, confidence: cand.confidence, marketRegime: (cand as any).marketRegime, marketContextAdvice: (cand as any).marketContextAdvice } as any;
+
+              const expl = buildDecisionConfidenceExplanation({ decisionReason: drCandidate, marketRegime: (cand as any).marketRegime, marketContextAdvice: (cand as any).marketContextAdvice, historicalContext: hist, adaptiveDecisionContext }) as any;
+              const ev: DecisionEvidence = buildDecisionEvidence({ decisionReason: drCandidate, marketRegime: (cand as any).marketRegime, marketContextAdvice: (cand as any).marketContextAdvice, historicalContext: hist, adaptiveDecisionContext, decisionConfidenceExplanation: expl });
+              const ec: EvidenceConsistency = analyzeEvidenceConsistency({ decisionEvidence: ev });
+              const sid: EvidenceInformedDecision = buildEvidenceInformedDecision({ currentAction: cand.action, currentConfidence: cand.confidence, decisionEvidence: ev, evidenceConsistency: ec });
+
+              // Attach enriched objects on candidate passed to engine and audits
+              (cand as any).historicalContext = hist;
+              (cand as any).decisionConfidenceExplanation = expl;
+              (cand as any).decisionEvidence = ev;
+              (cand as any).evidenceConsistency = ec;
+              (cand as any).evidenceInformedDecision = sid;
+            }catch(_){ }
+
             candidates.push(cand);
             try{ const d2 = ensureDiag(symbol); d2.decision = cand.action; d2.signal = d2.signal || 'SELL'; d2.confidence = typeof cand.confidence === 'number' ? cand.confidence : d2.confidence; }catch(_){ }
           }catch(e:any){
@@ -1129,17 +1942,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       const currency = q.currency || null;
       let sekPrice = (typeof q.priceSek === 'number' && Number.isFinite(q.priceSek) && q.priceSek > 0) ? q.priceSek : null;
       const rawPrice = (typeof q.price === 'number' && Number.isFinite(q.price) && q.price > 0) ? q.price : null;
-      if (currency && currency.toUpperCase() === 'USD' && sekPrice === null){
-        // Attempt deterministic conversion using provider
+      if (currency && String(currency).toUpperCase() !== 'SEK' && sekPrice === null){
+        // Attempt deterministic conversion to SEK using provider for non-SEK quoted instruments
         try{
           const md = await import('../market-data');
           const provider = md && typeof md.getMarketDataProvider === 'function' ? md.getMarketDataProvider() : (md && md.default) || null;
           if (provider && typeof (provider as any).getFxRate === 'function'){
-            const rawFx = await (provider as any).getFxRate('USD','SEK');
+            const fromCur = String(currency).toUpperCase();
+            const rawFx = await (provider as any).getFxRate(fromCur,'SEK');
             let rate: number | null = null;
             if (rawFx === null || rawFx === undefined) rate = null;
             else if (typeof rawFx === 'number') rate = Number(rawFx);
-            else if (rawFx && typeof rawFx === 'object' && rawFx.rate) rate = Number(rawFx.rate);
+            else if (rawFx && typeof rawFx === 'object' && (rawFx.rate || rawFx.rate === 0)) rate = Number(rawFx.rate);
             if (rate && Number.isFinite(rate) && rate > 0 && rawPrice && Number.isFinite(Number(rawPrice))){
               sekPrice = Number(rawPrice) * Number(rate);
             }
@@ -1167,6 +1981,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         let _techMeta_for_buy: any = null;
         try{
             try{
+
               _techMeta_for_buy = await fetchAndAnalyze(s);
               try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${s}_${Date.now()}`, symbol: s, action: 'HOLD', confidence: 0, referencePrice: usePrice, generatedAt: nowIso() }, reason: { action: 'HOLD', reason: 'Buy candidate observed', score: 0 }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(s, _techMeta_for_buy) } as any, cycleAuditStore); }catch(e){}
             }catch(e:any){
@@ -1194,12 +2009,113 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             continue;
           }
 
-          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, expectedReturnPercent: estimateForBuy.expectedReturnPercent, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext } as any;
+          // Build typed marketSignals from available quotes/analysis and attach to DecisionEngine input for BUY
+          let marketSignalsForBuy: any = undefined;
+          try{
+            const instruments: any[] = Array.isArray(quotes) ? (quotes as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+            const validInstruments = instruments.filter(i=> i.price !== null && i.changePercent !== null && i.dataStatus !== 'UNAVAILABLE');
+            const instrumentCount = instruments.length;
+            const advancing = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent > 0).length;
+            const declining = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent < 0).length;
+            const unchanged = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent === 0).length;
+            const unavailable = instruments.filter(i=> i.price === null || i.changePercent === null).length;
+            const avg = validInstruments.length > 0 ? Number((validInstruments.reduce((s,n)=> s + (Number(n.changePercent)||0),0)/validInstruments.length).toFixed(2)) : 0;
+            const strongest = validInstruments.length > 0 ? validInstruments.reduce((best,cur)=> (cur.changePercent > (best.changePercent||-Infinity) ? cur : best)) : null;
+            const weakest = validInstruments.length > 0 ? validInstruments.reduce((worst,cur)=> (cur.changePercent < (worst.changePercent||Infinity) ? cur : worst)) : null;
+            const warnings: string[] = [];
+            if ((quotes || []).some((qq:any)=> qq.dataStatus === 'DELAYED')) warnings.push('Marknadsdata är fördröjd.');
+            const summary = { instrumentCount, advancing, declining, unchanged, unavailable, averageChangePercent: avg };
+            const ctx = { generatedAt: new Date().toISOString(), marketDataStatus: (validInstruments.length === instruments.length && instruments.length > 0) ? 'READY' : (validInstruments.length > 0 ? 'PARTIAL' : 'UNAVAILABLE'), summary, strongest, weakest, instruments, warnings } as any;
+            try{ const analysis = analyzeMarket(ctx as any); marketSignalsForBuy = buildMarketSignals(ctx as any, analysis as any); }catch(_){ marketSignalsForBuy = undefined; }
+              // Append TECHNICAL_MOMENTUM for buy candidates when technical meta is available
+              try{
+                const techSignalObj = createTechnicalSignalIfFresh(_techMeta_for_buy, s, new Date(), TECHNICAL_MOMENTUM_MAX_AGE_DAYS);
+                if (techSignalObj && marketSignalsForBuy && Array.isArray(marketSignalsForBuy.signals)){
+                  marketSignalsForBuy.signals.push(techSignalObj);
+                }
+              }catch(_){ }
+              // Append RELATIVE_STRENGTH for BUY path using same instruments universe
+              try{
+                if (marketSignalsForBuy && Array.isArray(marketSignalsForBuy.signals)){
+                  const instrEntry = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(s).toUpperCase()) : null;
+                  const relSig = createRelativeStrengthSignalForInstrument(instrEntry, instruments, new Date());
+                  if (relSig && !marketSignalsForBuy.signals.some((ss:any)=> ss && ss.id === relSig.id)){
+                    marketSignalsForBuy.signals.push(relSig);
+                  }
+                }
+              }catch(_){ }
+              // Append related market-structure and sector/macros via per-symbol build to preserve ordering
+              try{
+                if (marketSignalsForBuy && Array.isArray(marketSignalsForBuy.signals)){
+                  const inst = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(s).toUpperCase()) : null;
+                  let prices = Array.isArray((inst && inst.prices) ? inst.prices : []) ? (inst.prices as any[]).slice() : (inst && typeof inst.price === 'number' ? [inst.price] : []);
+                  let volumes = Array.isArray((inst && inst.volumes) ? inst.volumes : []) ? (inst.volumes as any[]).slice() : [];
+                  if ((!Array.isArray(prices) || prices.length < 2) || (!Array.isArray(volumes) || volumes.length === 0)){
+                    try{ const hist = await getHistoricalForSymbol(s); if (hist && Array.isArray(hist.closes) && hist.closes.length) prices = hist.closes.slice(); if (hist && Array.isArray((hist as any).volumes) && (hist as any).volumes.length) volumes = (hist as any).volumes.slice(); }catch(_){ }
+                  }
+                  const built = await buildSignalsForSymbol({ symbol: s, instEntry: inst, instruments, prices, volumes, techMeta: _techMeta_for_buy, sectorSummaries: cycleSectorSummaries, macros: cycleMacroSignals });
+                  for (const ss of Array.isArray(built) ? built : []){ try{ if (ss && ss.id && !marketSignalsForBuy.signals.some((x:any)=> x && x.id === ss.id)) marketSignalsForBuy.signals.push(ss); }catch(_){ } }
+                }
+              }catch(_){ }
+          }catch(_){ marketSignalsForBuy = undefined; }
+
+          const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, performanceProfile: profile || undefined, expectedReturnPercent: estimateForBuy.expectedReturnPercent, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext, marketSignals: marketSignalsForBuy } as any;
+          // Ensure decision.signals references actual marketSignals ids (at least two distinct types when available)
+            let _chosenSupportingSignalIdsForBuy: string[] | undefined = undefined;
+            // Build confluence summary for BUY path (once per symbol per cycle)
+            try{
+              try{
+                const confluence = await getOrBuildConfluence(s, marketSignalsForBuy, cycleId);
+                try{ const d = ensureDiag(s); if (d) d.confluence = confluence; }catch(_){ }
+                try{
+                  if (confluence){
+                    const auditObj: any = { kind: 'SIGNAL_CONFLUENCE_SNAPSHOT', cycleId, symbol: s, generatedAt: confluence.generatedAt, direction: confluence.direction, bullishScore: confluence.bullishScore, bearishScore: confluence.bearishScore, bullishSignalCount: confluence.bullishSignalCount, bearishSignalCount: confluence.bearishSignalCount, usableSignalCount: confluence.usableSignalCount, placeholderCount: confluence.placeholderCount, distinctTypes: confluence.distinctTypes, distinctOrigins: confluence.distinctOrigins, hasIndependentBullishSupport: confluence.hasIndependentBullishSupport, hasIndependentBearishSupport: confluence.hasIndependentBearishSupport, hasConflict: confluence.hasConflict, strongestBullish: confluence.strongestBullish ? { id: confluence.strongestBullish.id, type: confluence.strongestBullish.type, origin: confluence.strongestBullish.origin, strength: confluence.strongestBullish.strength } : undefined, strongestBearish: confluence.strongestBearish ? { id: confluence.strongestBearish.id, type: confluence.strongestBearish.type, origin: confluence.strongestBearish.origin, strength: confluence.strongestBearish.strength } : undefined, warnings: Array.isArray(confluence.warnings) ? confluence.warnings.slice() : [] };
+                    try{ await cycleAuditStore.append(auditObj as any); }catch(_){ }
+                  }
+                }catch(_){ }
+              }catch(_){ }
+            }catch(_){ }
+            try{
+              const picked = pickSupportingSignalIds(marketSignalsForBuy, s, 'BUY');
+              if (Array.isArray(picked) && picked.length > 0){
+                _chosenSupportingSignalIdsForBuy = Array.from(new Set(picked.map((id:any)=> String(id))));
+                (decInput.decision as PaperTradeDecision).signals = _chosenSupportingSignalIdsForBuy;
+              }
+            // If we have >=2 supporting ids of distinct types and no expectedReturnPercent, set a conservative default
+            try{
+              const ids = Array.isArray((decInput.decision as any).signals) ? (decInput.decision as any).signals as string[] : [];
+              const idToType = new Map((marketSignalsForBuy && Array.isArray(marketSignalsForBuy.signals) ? marketSignalsForBuy.signals : []).map((s:any)=> [String(s.id), String(s.type)]));
+              const types = new Set(ids.map(id => idToType.get(String(id))));
+              // Do not fabricate expectedReturnPercent; leave undefined if missing
+            }catch(_){ }
+          }catch(_){ }
           const decRes = DecisionEngine.evaluateDecision(decInput);
-          const cand = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso(), reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000, tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect } as any;
+          const candBase: PaperTradeDecision = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso() } as any;
+          const candExtras: any = { reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000, tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect };
+          const cand = Object.assign({}, candBase, candExtras) as any;
+          // Persist chosen supporting signal ids on candidate (if any)
+          try{
+            if (Array.isArray(_chosenSupportingSignalIdsForBuy) && _chosenSupportingSignalIdsForBuy.length > 0){
+              (cand as PaperTradeDecision).signals = _chosenSupportingSignalIdsForBuy;
+              try{
+                const available = Array.isArray(marketSignalsForBuy && marketSignalsForBuy.signals) ? marketSignalsForBuy.signals : [];
+                const supporting = [] as Array<{id:string;type:string;origin:string}>;
+                for (const id of _chosenSupportingSignalIdsForBuy){
+                  const obj = available.find((s2:any)=> s2 && String(s2.id) === String(id));
+                  if (obj && obj.id){
+                    const entry = { id: String(obj.id), type: String(obj.type || ''), origin: String(obj.origin || '') };
+                    if (!supporting.some(ss => ss.id === entry.id)) supporting.push(entry);
+                  }
+                }
+                if (supporting.length > 0) (cand as any).supportingSignals = supporting;
+              }catch(_){ }
+            }
+          }catch(_){ }
           // persist estimate on candidate for auditability
           if (estimateForBuy && typeof estimateForBuy.expectedReturnPercent === 'number') (cand as any).expectedReturnPercent = estimateForBuy.expectedReturnPercent;
           cand.risk = decRes.risk;
+          // If DecisionEngine returned a macroSummary, copy only the safe fields into the candidate audit
+          try{ if (decRes && decRes.macroSummary && typeof decRes.macroSummary === 'object'){ const ms = decRes.macroSummary; (cand as any).macroSummary = { bullishStrength: ms.bullishStrength, bearishStrength: ms.bearishStrength, adjustment: ms.adjustment, signalCount: ms.signalCount }; } }catch(_){ }
           if (perCycleReflection) cand.performanceReflection = perCycleReflection;
           // Attach market regime classification as observation-only metadata
           try{
@@ -1268,7 +2184,12 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         try{ runtime.latestCycle = { ...runtime.latestCycle, adaptiveDecisionContext: adaptiveContext2, victorReview: victorReview2 }; }catch(_){ }
         try{
           const snapshot3 = buildCycleIntelligenceSnapshot(decisionSummary, victorReview2, adaptiveContext2);
-          try{ await cycleAuditStore.append({ kind: 'CYCLE_INTELLIGENCE_SNAPSHOT', id: `cycle_intel_${cycleId}`, timestamp: nowIso(), snapshot: snapshot3, meta: { automatic: true } } as any); }catch(_){ }
+          try{ attachMarketNewsSummary(snapshot3); }catch(_){ }
+          try{
+            const auditObj: any = { kind: 'CYCLE_INTELLIGENCE_SNAPSHOT', id: `cycle_intel_${cycleId}`, timestamp: nowIso(), snapshot: snapshot3, meta: { automatic: true } };
+            try{ attachMarketNewsAuditFields(auditObj, snapshot3); }catch(_){ }
+            await cycleAuditStore.append(auditObj as any);
+          }catch(_){ }
           try{ runtime.latestCycle = { ...runtime.latestCycle, cycleIntelligenceSnapshot: snapshot3 }; }catch(_){ }
         }catch(_){ }
       }catch(_){ }
@@ -1300,10 +2221,13 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     return { ...runtime.latestCycle, evaluationCount };
   }
 
-  // Try candidates sequentially. If a BUY is rejected with POSITION_LIMIT, mark and continue.
+  // Select a single candidate to attempt execution this cycle (Watchlist Engine v1)
+  const selected = selectBestCandidate(candidates);
+  const candidatesToProcess = selected ? [selected] : [];
+  // Try the selected candidate only. Maintain counters similar to previous behavior.
   let processed = 0; let executed = 0; let rejects = 0; let finalDecision: any = null;
   let executedBuy = 0; let executedSell = 0;
-  for (const cand of candidates){
+  for (const cand of candidatesToProcess){
     processed++;
     runtime.latestDecision = cand;
     // mark this symbol as evaluated once per cycle (if not already counted)
@@ -1350,7 +2274,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       try{ (cand as any).originalConfidence = origConf; }catch(_){ }
       try{ (cand as any).confidence = applyAdaptiveConfidencePolicy(origConf, adaptiveCtx); }catch(_){ }
     }catch(_){ }
-    const res = await cycleTrader.handleDecision(cand as any);
+    const res = await cycleTrader.handleDecision(cand);
     try{ const dd = ensureDiag(sSym); dd.executionAttempted = true; }catch(_){ }
     if (res && res.accepted){
       try{ const dd = ensureDiag(sSym); dd.executed = true; dd.rejectionReason = null; }catch(_){ }
@@ -1678,7 +2602,12 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         try{ runtime.latestCycle = { ...runtime.latestCycle, adaptiveDecisionContext: adaptiveDecisionContext, victorReview }; }catch(_){ }
         try{
           const snapshot = buildCycleIntelligenceSnapshot(summary, victorReview, adaptiveDecisionContext);
-          try{ await cycleAuditStore.append({ kind: 'CYCLE_INTELLIGENCE_SNAPSHOT', id: `cycle_intel_${cycleId}`, timestamp: nowIso(), snapshot, meta: { automatic: true } } as any); }catch(_){ }
+          try{ attachMarketNewsSummary(snapshot); }catch(_){ }
+          try{
+            const auditObj: any = { kind: 'CYCLE_INTELLIGENCE_SNAPSHOT', id: `cycle_intel_${cycleId}`, timestamp: nowIso(), snapshot, meta: { automatic: true } };
+              try{ attachMarketNewsAuditFields(auditObj, snapshot); }catch(_){ }
+              await cycleAuditStore.append(auditObj as any);
+          }catch(_){ }
           try{ runtime.latestCycle = { ...runtime.latestCycle, cycleIntelligenceSnapshot: snapshot }; }catch(_){ }
         }catch(_){ }
       }catch(_){ /* tolerate failures */ }
@@ -1707,7 +2636,12 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           try{ runtime.latestCycle = { ...runtime.latestCycle, adaptiveDecisionContext: adaptiveContext2, victorReview: victorReview2 }; }catch(_){ }
           try{
             const snapshot2 = buildCycleIntelligenceSnapshot(decisionSummary, victorReview2, adaptiveContext2);
-            try{ await cycleAuditStore.append({ kind: 'CYCLE_INTELLIGENCE_SNAPSHOT', id: `cycle_intel_${cycleId}`, timestamp: nowIso(), snapshot: snapshot2, meta: { automatic: true } } as any); }catch(_){ }
+            try{ attachMarketNewsSummary(snapshot2); }catch(_){ }
+            try{
+              const auditObj: any = { kind: 'CYCLE_INTELLIGENCE_SNAPSHOT', id: `cycle_intel_${cycleId}`, timestamp: nowIso(), snapshot: snapshot2, meta: { automatic: true } };
+                try{ attachMarketNewsAuditFields(auditObj, snapshot2); }catch(_){ }
+                await cycleAuditStore.append(auditObj as any);
+            }catch(_){ }
             try{ runtime.latestCycle = { ...runtime.latestCycle, cycleIntelligenceSnapshot: snapshot2 }; }catch(_){ }
           }catch(_){ }
         }catch(_){ /* ignore */ }
@@ -2453,3 +3387,5 @@ try{
 }catch(e){}
 
 export default { getPaperTradingState, runManualPaperTradingCycle, setPaperTradingEnabled, getPerformanceSummary, getPerformanceProfile };
+export { buildMacroSignalsMock, SUPPORTED_MACRO_SIGNALS } from './macro-signals';
+export type { MacroSignal } from './macro-signals';

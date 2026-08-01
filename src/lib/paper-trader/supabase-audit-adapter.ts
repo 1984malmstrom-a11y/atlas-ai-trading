@@ -49,15 +49,22 @@ export class SupabaseAuditAdapter implements AuditStore {
   async append(entry: AuditEntry): Promise<void> {
     const payload = entry as unknown as Record<string, unknown>;
 
+    // Ensure we always have a non-empty id for Supabase insertion. Tests and
+    // the in-memory FileAuditStore may generate ids implicitly, but the
+    // Supabase REST API layer requires an explicit id string. Generate a
+    // stable-ish id when missing.
+    const ensuredId = (typeof entry.id === 'string' && entry.id.trim() !== '') ? String(entry.id) : `audit_${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
+    const idempotency = (typeof entry.id === 'string' && entry.id.trim() !== '') ? String(entry.id) : null;
+
     const input: AppendVictorAuditInput = {
-      id: entry.id,
+      id: ensuredId,
       portfolioId: entry.portfolioAfter?.id ?? entry.portfolioBefore?.id ?? null,
       source: 'atlas_runtime',
       kind: entry.kind,
       executionId: entry.execution?.id ?? null,
       occurredAt: entry.timestamp,
       payload,
-      idempotencyKey: entry.id,
+      idempotencyKey: idempotency,
     };
 
     const res = await appendVictorAudit(input);

@@ -1,5 +1,6 @@
 import { Portfolio } from '../../domain/portfolio/types';
 import { SimulatedExecution } from './types';
+import { findInstrumentById } from '../market-data/instruments';
 
 function round2(n: number){ return Math.round(n * 100)/100; }
 
@@ -20,7 +21,20 @@ export function computeNextPortfolioState(
       found.currentPrice = exec.executedPrice;
       found.marketValue = round2(found.quantity * found.currentPrice);
     } else {
-      state.holdings.push({ id: `h_${sym}`, symbol: sym, name: sym, assetType: 'Stock', quantity: exec.quantity, averagePrice: exec.executedPrice, currentPrice: exec.executedPrice, marketValue: round2(exec.quantity * exec.executedPrice), unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+      // Attempt to look up instrument metadata to derive assetType and name
+      const instr = findInstrumentById(exec.symbol) || findInstrumentById(exec.symbol.toLowerCase());
+      const mapAssetType = (t:any) => {
+        if (!t) return 'Stock';
+        switch (t){
+          case 'STOCK': return 'Stock';
+          case 'FOREX': return 'Forex';
+          case 'COMMODITY': return 'Commodity';
+          default: return 'Stock';
+        }
+      };
+      const assetType = instr ? mapAssetType(instr.assetType) : 'Stock';
+      const name = instr ? instr.name : sym;
+      state.holdings.push({ id: `h_${sym}`, symbol: sym, name, assetType, quantity: exec.quantity, averagePrice: exec.executedPrice, currentPrice: exec.executedPrice, marketValue: round2(exec.quantity * exec.executedPrice), unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
     }
   } else {
     const found = state.holdings.find((h:any)=> h.symbol === sym);

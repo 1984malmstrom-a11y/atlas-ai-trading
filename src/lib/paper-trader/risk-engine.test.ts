@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateRisk, PortfolioSnapshot, TradeDecision } from './risk-engine';
+import { evaluateRisk, PortfolioSnapshot, TradeDecision, mapAssetTypeToCategory, detectAssetCategory } from './risk-engine';
 
 describe('RiskEngine basic rules', ()=>{
   it('rejects when position would exceed 10% cap', ()=>{
@@ -109,5 +109,45 @@ describe('RiskEngine basic rules', ()=>{
     const res = evaluateRisk({ portfolio, decision });
     expect(res.allowed).toBe(false);
     expect(res.reasons).toContain('INVALID_RISK_INPUT');
+  });
+
+  it('maps asset types to categories and preserves risk behavior for stocks', ()=>{
+    // Stock mapping
+    expect(mapAssetTypeToCategory('Stock')).toBe('Stock');
+    expect(mapAssetTypeToCategory('ETF')).toBe('Stock');
+
+    // Forex mapping
+    expect(mapAssetTypeToCategory('Forex')).toBe('Forex');
+
+    // Commodity mapping
+    expect(mapAssetTypeToCategory('Commodity')).toBe('Commodity');
+
+    // Unknown mapping
+    expect(mapAssetTypeToCategory('SomethingElse')).toBe('Unknown');
+
+    // Detect from portfolio holdings
+    const portfolio: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [ { symbol: 'EUR_USD', quantity: 1000, averagePrice: 1.2, currentPrice: 1.2, marketValue: 1200, /* assetType present */ } as any ] };
+    // attach assetType dynamically to simulate holdings with assetType
+    (portfolio.holdings![0] as any).assetType = 'Forex';
+    expect(detectAssetCategory(portfolio, 'EUR_USD')).toBe('Forex');
+
+    // Commodity detection
+    const p2: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [ { symbol: 'XAU_USD', quantity: 1, averagePrice: 2000, currentPrice: 2000, marketValue: 2000 } as any ] };
+    (p2.holdings![0] as any).assetType = 'Commodity';
+    expect(detectAssetCategory(p2, 'XAU_USD')).toBe('Commodity');
+
+    // Unknown when no holding
+    const p3: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [] };
+    expect(detectAssetCategory(p3, 'NOPE')).toBe('Unknown');
+
+    // Regression: ensure risk result for a stock scenario remains consistent
+    const portStock: PortfolioSnapshot = { availableCash: 100000, totalValue: 100000, holdings: [{ symbol: 'ABC', quantity: 10, currentPrice: 500, marketValue: 5000, } as any] };
+    (portStock.holdings![0] as any).assetType = 'Stock';
+    const decision = { side: 'BUY' as const, symbol: 'ABC', requestedNotionalSek: 6000 };
+    const res = evaluateRisk({ portfolio: portStock, decision, maxPositionPercent: 0.10 });
+    expect(res.allowed).toBe(false);
+    expect(res.reasons).toContain('POSITION_SIZE_EXCEEDS_LIMIT');
+    expect(res.score).toBe(60);
+    expect(res.level).toBe('MEDIUM');
   });
 });

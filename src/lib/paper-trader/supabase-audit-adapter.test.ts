@@ -99,4 +99,15 @@ describe('SupabaseAuditAdapter', ()=>{
     const r0 = res[0] as AuditStoreEnvelope;
     expect(r0.raw.evaluation && typeof r0.raw.evaluation.pnlSek === 'number').toBeTruthy();
   });
+
+  it('append generates id when missing and forwards payload', async ()=>{
+    const entry: AuditEntry = { timestamp: new Date().toISOString(), kind: 'RECEIVED' } as any;
+    const spy = vi.spyOn(store, 'appendVictorAudit').mockResolvedValue({ status: 'INSERTED', record: { id: 'gen', portfolioId: null, source: 'atlas_runtime', kind: 'RECEIVED', executionId: null, occurredAt: entry.timestamp, payload: entry, idempotencyKey: null, createdAt: entry.timestamp } as any });
+    const adapter = new SupabaseAuditAdapter();
+    await adapter.append(entry as any);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const called = spy.mock.calls[0][0];
+    expect(typeof called.id).toBe('string');
+    expect(called.payload).toEqual(entry);
+  });
 });

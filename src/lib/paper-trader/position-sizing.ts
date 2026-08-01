@@ -4,6 +4,9 @@ export type PositionSizingInput = {
   requestedNotionalSek?: number;
   maxPositionPercent?: number; // fraction, default 0.10
   confidence?: number; // 0-100 — optional scaling factor from Decision Engine
+  // Optional asset type string (e.g. 'Stock','Forex','Commodity') to enable
+  // asset-aware sizing in future. When absent, category resolves to 'Unknown'.
+  assetType?: string;
 };
 
 export type PositionSizingResult = {
@@ -14,6 +17,17 @@ export type PositionSizingResult = {
 
 export function calculatePositionSize(input: PositionSizingInput): PositionSizingResult {
   const { availableCash, totalValue } = input;
+
+  // --- asset category detection (internal) ---
+  // Determine asset category first so future category-specific sizing can be
+  // applied without changing callers. Currently all categories use the same
+  // sizing logic (preserves legacy behaviour).
+  const assetCategory = mapAssetTypeToCategory(input.assetType);
+
+  // TODO: When we add asset-specific sizing rules, branch on `assetCategory` below.
+  // Example:
+  // if (assetCategory === 'Forex') { /* forex sizing adjustments */ }
+  // if (assetCategory === 'Commodity') { /* commodity sizing adjustments */ }
   const maxPositionPercent = (typeof input.maxPositionPercent === 'number' && Number.isFinite(input.maxPositionPercent)) ? input.maxPositionPercent : 0.10;
 
   // Validate numeric inputs conservatively
@@ -43,3 +57,27 @@ export function calculatePositionSize(input: PositionSizingInput): PositionSizin
 }
 
 export default {} as any;
+
+export type AssetCategory = 'Stock' | 'Forex' | 'Commodity' | 'Unknown';
+
+export function mapAssetTypeToCategory(assetType?: string): AssetCategory{
+  if (!assetType) return 'Unknown';
+  const t = String(assetType).toUpperCase();
+  if (t.includes('FOREX')) return 'Forex';
+  if (t.includes('COMMODITY')) return 'Commodity';
+  if (t.includes('STOCK') || t.includes('ETF')) return 'Stock';
+  return 'Unknown';
+}
+
+// Detect asset category from a portfolio snapshot and symbol when available.
+export function detectAssetCategory(portfolio: any | null, symbol?: string): AssetCategory{
+  try{
+    if (!portfolio || !symbol) return 'Unknown';
+    if (!Array.isArray(portfolio.holdings)) return 'Unknown';
+    const sym = String(symbol).toUpperCase();
+    const found = portfolio.holdings.find((h:any) => (h && (h.symbol||'').toString().toUpperCase() === sym));
+    if (!found) return 'Unknown';
+    const at = (found as any).assetType;
+    return mapAssetTypeToCategory(typeof at === 'string' ? at : undefined);
+  }catch(_){ return 'Unknown'; }
+}

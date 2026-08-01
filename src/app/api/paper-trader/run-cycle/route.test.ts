@@ -196,7 +196,14 @@ describe('POST /api/paper-trader/run-cycle', ()=>{
     const req: any = { headers: { get: (k:string)=> { const m = new Map([['authorization','Bearer s3cr3t'],['idempotency-key','dup-1']]); return m.get(k.toLowerCase()) || m.get(k); } }, json: async ()=> ({}) } as any;
     const res = await POST(req as any);
     expect((res as any).status).toBe(200);
-    expect((res as any).payload && (res as any).payload.duplicate).toBe(true);
+    expect((res as any).payload && (res as any).payload.autopilot && (res as any).payload.autopilot.duplicate).toBe(true);
+    // New diagnostics: ensure skipReasonCode/skipStage and lock metadata present
+    const autop = (res as any).payload && (res as any).payload.autopilot;
+    expect(autop.skipReasonCode).toBe('DUPLICATE_LOCK');
+    expect(autop.skipStage).toBe('run_cycle_lock');
+    expect(typeof autop.lockBackend === 'string').toBeTruthy();
+    expect(typeof autop.lockKey === 'string').toBeTruthy();
+    expect(typeof autop.lockTtlMs === 'number').toBeTruthy();
     expect(mockCycle).not.toHaveBeenCalled();
   });
 

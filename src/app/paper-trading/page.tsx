@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import LeftSidebar from '../../components/dashboard-v1/LeftSidebar';
 import CompanyLogo from '../../components/CompanyLogo';
+import VictorMarketNewsCard from '../../components/paper-trading/victor-market-news-card';
 
 type Holding = any;
 
@@ -19,15 +20,44 @@ export default function Page(){
       const res = await fetch('/api/paper-trader');
       if (!res.ok){ if (!silent) setLoading(false); return; }
       const j = await res.json();
+      if (!mountedRef.current) return;
       setState(j);
     }catch(e){ console.error(e); }finally{ if (!silent) setLoading(false); }
   }
 
-  useEffect(()=>{ fetchState(); }, []);
+  // SINGLE background polling: fetch state every 12s when page is visible. No overlapping requests.
+  const mountedRef = React.useRef(true);
+  useEffect(()=>{ mountedRef.current = true; return ()=>{ mountedRef.current = false; }; }, []);
 
-  // Background polling: fetch state every 30s when page is visible. No overlapping requests.
+  // Shared countdown string (computed once at page level and passed down).
+  const [sharedCountdown, setSharedCountdown] = useState<string | null>(null);
+
+  function formatCountdown(sec:number){
+    const s = Number(sec);
+    if (!Number.isFinite(s)) return '—';
+    if (s < 60) return `${s} sek`;
+    const m = Math.floor(s/60); const r = s%60;
+    return `${m} min ${String(r).padStart(2,'0')} sek`;
+  }
+
   useEffect(()=>{
-    const POLL_MS = 30_000;
+    let id: any = null;
+    function compute(){
+      const s = state;
+      if (!s){ setSharedCountdown(null); return; }
+      const next = s.nextAutomaticRunAt ? new Date(s.nextAutomaticRunAt) : (s.lastAutomaticRunAt ? new Date(new Date(s.lastAutomaticRunAt).getTime() + (Number(s.intervalMs)||0)) : null);
+      if (!next){ setSharedCountdown(null); return; }
+      const diff = Math.max(0, Math.round((next.getTime() - Date.now())/1000));
+      if (diff <= 0) setSharedCountdown('Nu');
+      else setSharedCountdown(formatCountdown(diff));
+    }
+    compute();
+    id = setInterval(() => compute(), 1000);
+    return () => { if (id) clearInterval(id); };
+  }, [state]);
+
+  useEffect(()=>{
+    const POLL_MS = 12_000;
     let interval: any = null;
 
     const tryFetch = async () => {
@@ -39,6 +69,9 @@ export default function Page(){
       }catch(e){}
       finally{ bgInFlightRef.current = false; }
     };
+
+    // immediate fetch on mount
+    void (async ()=>{ if (mountedRef.current) await fetchState(); })();
 
     // immediate fetch when becoming visible
     const onVisibility = () => { if (document.visibilityState === 'visible') void tryFetch(); };
@@ -134,6 +167,284 @@ export default function Page(){
       if (withSeconds) opts.second = '2-digit';
       return new Intl.DateTimeFormat('sv-SE', { ...opts, timeZone: 'Europe/Stockholm' }).format(d);
     }catch(e){ return String(ts); }
+  }
+
+  // Presentation mapping for internal runtime codes -> Swedish human text
+  const RUNTIME_PRESENTATION: Record<string,string> = {
+    duplicate_lock: 'En annan analys pågår redan.',
+    market_closed: 'Marknaden är stängd.',
+    cooldown: 'Victor väntar till nästa analys.',
+    quote_missing: 'Marknadsdata saknas.',
+    success: 'Analysen slutfördes.',
+    skipped: 'Analysen hoppades över.',
+    error: 'Ett fel uppstod.',
+  };
+
+  function translateRuntimeText(raw:any){
+    if (raw === null || raw === undefined) return null;
+
+    // If object with code/message (audit reasons), prefer mapping for the code
+    try{
+      if (typeof raw === 'object'){
+        const code = raw && (raw.code || raw.code === 0) ? String(raw.code) : null;
+        const msg = raw && (raw.message || raw.message === 0) ? raw.message : null;
+        if (code){
+          const norm = String(code).toLowerCase().replace(/[^a-z0-9_]/g, '_');
+          if (RUNTIME_PRESENTATION[norm]) return RUNTIME_PRESENTATION[norm] + (msg ? ` — ${String(msg)}` : '');
+          // also try underscore/uppercase variants
+          const alt = norm.replace(/-/g, '_');
+          if (RUNTIME_PRESENTATION[alt]) return RUNTIME_PRESENTATION[alt] + (msg ? ` — ${String(msg)}` : '');
+          // fallback to message text if available
+          if (msg) return String(msg);
+          return null;
+        }
+        // fallthrough to string handling for plain objects
+        if (raw && raw.toString && typeof raw.toString === 'function'){
+          const s = String(raw.toString());
+          raw = s;
+        }
+      }
+    }catch(e){ /* ignore */ }
+
+    const s = String(raw).trim();
+    if (s === '') return null;
+
+    // Normalize token-like strings (e.g. QUOTE_MISSING, quote_missing)
+    const token = s.replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+    if (token && RUNTIME_PRESENTATION[token]) return RUNTIME_PRESENTATION[token];
+
+    // Replace any known tokens embedded in a longer message
+    let out = s;
+    Object.keys(RUNTIME_PRESENTATION).forEach(k => {
+      const rx = new RegExp(k.replace(/_/g, '[_\s\-]'), 'ig');
+      if (rx.test(out)) out = out.replace(rx, RUNTIME_PRESENTATION[k]);
+      const rx2 = new RegExp(k.split('_').join(''), 'ig');
+      if (rx2.test(out)) out = out.replace(rx2, RUNTIME_PRESENTATION[k]);
+    });
+
+    // If the final result still looks like an internal token (no spaces and only letters/numbers/underscores), hide it
+    if (/^[a-z0-9_]+$/i.test(out) && !out.includes(' ')) return null;
+
+    return out;
+  }
+
+  // --- Victor Autopilot panel (compact) ---------------------------------
+  // Parent may provide a precomputed countdown string via `propsSharedCountdown`.
+  function VictorAutopilotPanel({ sharedState, propsSharedCountdown }: { sharedState: any, propsSharedCountdown?: string | null }){
+
+    // map server technical states to Swedish labels
+    function mapStatusLabel(s:any){
+      if (!s) return '—';
+      const st = s.lastAutomaticRunStatus || null;
+      if (!st){ if (s.cycleInProgress) return 'Pågår'; return '—'; }
+      const translated = translateRuntimeText(st) || (s.cycleInProgress ? 'Pågår' : '—');
+      return translated;
+    }
+
+    function mapAction(a:string | undefined | null){
+      if (!a) return null;
+      const up = String(a).toUpperCase();
+      if (up === 'HOLD') return 'Behåll';
+      if (up === 'BUY') return 'Köp';
+      if (up === 'SELL') return 'Sälj';
+      return up;
+    }
+
+    const s = sharedState || null;
+
+    // build natural Swedish activity summary
+    function naturalSummary(){
+      if (!s) return null;
+      const when = s.lastAutomaticRunAt ? formatDateTimeLocal(s.lastAutomaticRunAt) : null;
+      const sym = s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : null;
+      const act = s.latestDecision && s.latestDecision.action ? mapAction(s.latestDecision.action) : null;
+      const rawReason = s.lastAutomaticRunMessage || (s.latestDecision && Array.isArray(s.latestDecision.reasoning) ? (s.latestDecision.reasoning[0]||null) : null);
+      const reason = translateRuntimeText(rawReason);
+      const parts: string[] = [];
+      if (when) parts.push(`${when} analyserade Victor${sym ? ' ' + sym : ''}${act ? ' och valde ' + act : ''}`);
+      if (reason) parts.push(reason.charAt(0).toLowerCase() === ' ' ? reason.trim() : reason);
+      if (parts.length === 0) return null;
+      // join into a single readable sentence
+      return parts.join(' — ');
+    }
+
+    // activity feed (up to 3 lines) derived from available data
+    function activityFeed(){
+      const out: string[] = [];
+      if (!s) return out;
+      if (s.lastAutomaticRunAt) out.push(`${new Date(s.lastAutomaticRunAt).toLocaleTimeString('sv-SE', {hour:'2-digit',minute:'2-digit'})} Analys slutförd`);
+      if (s.latestDecision && s.latestDecision.symbol) out.push(`${s.latestDecision.symbol} · ${mapAction(s.latestDecision.action) || ''}`);
+              const reason = translateRuntimeText(s.lastAutomaticRunMessage || (s.latestDecision && Array.isArray(s.latestDecision.reasoning) ? s.latestDecision.reasoning[0] : null));
+      if (reason) out.push(String(reason));
+      return out.slice(0,3);
+    }
+
+    // countdown string is provided by parent via propsSharedCountdown
+
+    // ensure the natural sentence fits Swedish style and lowercases reason start
+    function formatNaturalSentence(sent:string){
+      try{
+        if (!sent) return '';
+        // lower-case first char of reason fragments after em-dash
+        return String(sent).replace(/—\s*/g, '— ').replace(/\s+\-/g, ' - ');
+      }catch(e){ return sent; }
+    }
+
+    return (
+      <div className="mt-4 bg-white rounded-xl p-5 shadow-sm border">
+        {/* Header status */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            {/* status dot: green pulsing when autonomous and no error; orange when error; gray when inactive */}
+            {(() => {
+              const hasError = !!(s && (s.lastAutomaticRunStatus === 'error' || s.lastAutomaticRunStatus === 'failed' || (s.lastAutomaticRunMessage && String(s.lastAutomaticRunMessage).toLowerCase().includes('error'))));
+              const dotCls = s && s.autonomousEnabled ? (hasError ? 'bg-amber-500' : 'bg-green-500 animate-pulse') : 'bg-gray-300';
+              return <span className={`w-3 h-3 rounded-full ${dotCls}`} />;
+            })()}
+            <div>
+              <div className="text-sm font-semibold">{s && s.autonomousEnabled ? (s.lastAutomaticRunStatus === 'error' ? 'Victor behöver uppmärksamhet' : 'Victor arbetar autonomt') : 'Victor Autopilot är inaktiv'}</div>
+              <div className="text-xs text-gray-500">Uppdateras automatiskt</div>
+            </div>
+          </div>
+          {/* three compact stat cards (large number, small label) */}
+          <div className="flex items-stretch gap-3">
+            <div className="bg-gray-50 border rounded px-4 py-3 text-center min-w-[88px]">
+              <div className="text-2xl font-bold text-gray-900">{(s && typeof s.lastAutomaticEvaluationCount === 'number') ? s.lastAutomaticEvaluationCount : (s && typeof s.evaluationCount === 'number' ? s.evaluationCount : '—')}</div>
+              <div className="text-xs text-gray-500 mt-1">Analyser idag</div>
+            </div>
+            <div className="bg-gray-50 border rounded px-4 py-3 text-center min-w-[88px]">
+              <div className="text-2xl font-bold text-gray-900">{(s && typeof s.tradesToday === 'number') ? s.tradesToday : '—'}</div>
+              <div className="text-xs text-gray-500 mt-1">Affärer idag</div>
+            </div>
+            <div className="bg-gray-50 border rounded px-4 py-3 text-center min-w-[120px]">
+              <div className="text-2xl font-bold text-gray-900">{s && s.latestDecision && s.latestDecision.action ? (function(){ const a = String(s.latestDecision.action).toUpperCase(); if (a==='HOLD') return 'Behåll'; if (a==='BUY') return 'Köp'; if (a==='SELL') return 'Sälj'; if (a==='REJECT' || a==='REJECTED') return 'Avvisad'; return a; })() : (s && s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : '—')}</div>
+              <div className="text-xs text-gray-500 mt-1">Senaste beslut</div>
+            </div>
+          </div>
+        </div>
+
+        {/* Main JUST NU area (taller, prominent) */}
+        <div className="mt-4 bg-blue-50 border rounded p-6 md:min-h-[220px]">
+          <div className="text-xs text-gray-500">JUST NU</div>
+          {(() => {
+            if (!s) return (<div className="mt-3 text-lg font-bold text-blue-900">Laddar…</div>);
+            const msg = String(s.lastAutomaticRunMessage || '');
+            const isMarketClosed = /market|closed|stängd/i.test(msg) || (s.lastAutomaticRunStatus === 'skipped' && /market|closed/i.test(msg));
+            const isCooldown = /cooldown|cool down|väntar/i.test(msg) || (s.lastAutomaticRunStatus === 'skipped' && /cooldown|cool down/i.test(msg));
+            if (s.cycleInProgress){
+              return (
+                <div className="mt-2 flex items-center justify-between">
+                  <div className="max-w-[70%]">
+                    <div className="text-2xl md:text-3xl font-bold text-blue-900">Victor analyserar marknaden</div>
+                    <div className="mt-2 text-sm text-gray-700">Victor hämtar marknadsdata och utvärderar nya möjligheter.</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm text-gray-500">Nästa analys</div>
+                    <div className="text-3xl md:text-4xl font-extrabold text-blue-900">Pågår nu</div>
+                  </div>
+                </div>
+              );
+            }
+
+            if (isMarketClosed){
+              return (
+                <div className="mt-2 flex items-center justify-between">
+                  <div className="max-w-[70%]">
+                    <div className="text-2xl md:text-3xl font-bold text-blue-900">Marknaden är stängd</div>
+                    <div className="mt-2 text-sm text-gray-700">Victor väntar tills nästa handelssession öppnar.</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm text-gray-500">Nästa analys</div>
+                    <div className="text-3xl md:text-4xl font-extrabold text-blue-900">{propsSharedCountdown ?? '—'}</div>
+                  </div>
+                </div>
+              );
+            }
+
+            if (isCooldown){
+              return (
+                <div className="mt-2 flex items-center justify-between">
+                  <div className="max-w-[70%]">
+                    <div className="text-2xl md:text-3xl font-bold text-blue-900">Victor förbereder nästa analys</div>
+                    <div className="mt-2 text-sm text-gray-700">Senaste analysen är klar. Nästa marknadsskanning startar snart.</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm text-gray-500">Nästa analys</div>
+                    <div className="text-3xl md:text-4xl font-extrabold text-blue-900">{propsSharedCountdown ?? '—'}</div>
+                  </div>
+                </div>
+              );
+            }
+
+            // normal waiting / ready
+            if (s.lastAutomaticRunStatus === 'error'){ // error state
+              const reason = s.lastAutomaticRunMessage || (s.latestDecision && Array.isArray(s.latestDecision.reasoning) ? s.latestDecision.reasoning[0] : null);
+              return (
+                <div className="mt-2 flex items-center justify-between">
+                  <div className="max-w-[70%]">
+                    <div className="text-2xl md:text-3xl font-bold text-blue-900">Victor kunde inte slutföra analysen</div>
+                    <div className="mt-2 text-sm text-gray-700">{reason || 'Ett oväntat fel inträffade under analysen.'}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm text-gray-500">Nästa analys</div>
+                    <div className="text-3xl md:text-4xl font-extrabold text-blue-900">{propsSharedCountdown ?? '—'}</div>
+                  </div>
+                </div>
+              );
+            }
+
+            // default waiting
+            return (
+              <div className="mt-2 flex items-center justify-between">
+                <div className="max-w-[70%]">
+                  <div className="text-2xl md:text-3xl font-bold text-blue-900">Väntar till nästa analys</div>
+                    <div className="mt-2 text-sm text-gray-700">Victor övervakar kontinuerligt marknaden och väntar på nästa analyscykel.</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-xs text-gray-400">Nästa analys</div>
+                  <div className="text-3xl md:text-4xl font-extrabold text-blue-900">{propsSharedCountdown ?? '—'}</div>
+                </div>
+              </div>
+            );
+          })()}
+          {/* natural summary always shows real-data sentence when available */}
+            {(() => { const ns = naturalSummary(); return ns ? (<div className="mt-4 text-sm text-gray-700">{formatNaturalSentence(ns)}</div>) : null; })()}
+            {/* Latest market news activity (compact) - only show when present */}
+            {(() => { const act = (s && (s as any).latestMarketNewsActivity) ? (s as any).latestMarketNewsActivity : null; return act ? (<VictorMarketNewsCard activity={act} latestDecision={s && s.latestDecision ? s.latestDecision : null} nextRunCountdown={sharedCountdown} />) : null; })()}
+        </div>
+
+        {/* Activity feed (timeline) */}
+        <div className="mt-4">
+          <div className="text-xs text-gray-500">SENASTE AKTIVITET</div>
+          <div className="mt-3">
+            {(() => {
+              if (!s || !s.lastAutomaticRunAt) return (<div className="text-sm text-gray-700">Victor har ännu inte slutfört någon automatisk analys.</div>);
+              const t = new Date(s.lastAutomaticRunAt);
+              const time = t.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+              const sym = s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : null;
+              const action = s.latestDecision && s.latestDecision.action ? (function(a:any){ const up = String(a).toUpperCase(); if (up==='HOLD') return 'Behåll'; if (up==='BUY') return 'Köp'; if (up==='SELL') return 'Sälj'; if (up==='REJECT' || up==='REJECTED') return 'Avvisad'; return up; })(s.latestDecision.action) : null;
+              const reason = s.lastAutomaticRunMessage || (s.latestDecision && Array.isArray(s.latestDecision.reasoning) ? s.latestDecision.reasoning[0] : null);
+              const headline = sym ? `Victor analyserade ${sym}` : 'Victor slutförde en marknadsanalys';
+              return (
+                <div className="flex items-start gap-3">
+                  <div className="text-xs text-gray-500 mt-1">{time}</div>
+                  <div className="flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-blue-400 mt-1" />
+                            <div className="text-sm font-semibold text-gray-800">{headline}</div>
+                            {action ? (<div className="ml-2 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-700">{action}</div>) : null}
+                          </div>
+                          {reason ? (<div className="mt-1 text-sm text-gray-600 flex items-start gap-2"><span className="w-2 h-2 rounded-full bg-amber-300 mt-1" /> <div>{String(reason)}</div></div>) : null}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+
+        {/* panel no longer handles fetch errors; parent preserves last valid data */}
+      </div>
+    );
   }
 
   // Determine if an audit entry represents a decision-worthy event
@@ -281,20 +592,22 @@ export default function Page(){
                 <div className="w-2 h-12 rounded bg-gradient-to-b from-[#D4AF37] to-[#B5882E]" />
                 <div className="flex-1">
                   <div className="text-sm font-semibold text-gray-800">Victor analyserar marknaden</div>
-                  <div className="text-xs text-gray-500 mt-1">0 affärer genomförda idag</div>
+                  <div className="text-xs text-gray-500 mt-1">{typeof state.tradesToday === 'number' ? `${state.tradesToday} affärer genomförda idag` : '— affärer genomförda idag'}</div>
                   <div className="text-xs text-gray-400 mt-2">Paper Trading använder samma riskmotor som framtida livehandel.</div>
                 </div>
                 <div className="text-sm text-gray-500">Demo</div>
               </div>
             </div>
             {/* Victor + Risk: moved here (compact row) */}
+            {/* Victor Autopilot visibility panel (real runtime data) */}
+            <VictorAutopilotPanel sharedState={state} propsSharedCountdown={sharedCountdown} />
             <div className="mt-3 grid grid-cols-[1.2fr_0.8fr] gap-3 items-stretch max-w-2xl">
               <div className="bg-white rounded-xl p-3 shadow-sm border flex flex-col justify-between">
                 <div>
-                  <div className="text-xs text-gray-500">VICTOR</div>
-                  <div className="mt-2 text-sm font-semibold">{loading ? 'Analyserar marknaden' : (latestDecision ? (latestDecision.type || 'Beslut fattat') : (enabled ? 'Bevakar marknaden' : 'Inaktiv'))}</div>
-                  <div className="mt-1 text-xs text-gray-500">{latestDecision && latestDecision.generatedAt ? `Senaste beslut: ${new Date(latestDecision.generatedAt).toLocaleString()}` : (normalizedAudit && normalizedAudit.length>0 ? `Senaste aktivitet: ${normalizedAudit[0].kind || ''}` : 'Ingen senaste aktivitet')}</div>
-                  <div className="mt-2 text-xs text-gray-600">{state.activeRecommendation ? state.activeRecommendation : 'Ingen aktiv rekommendation'}</div>
+                      <div className="text-xs text-gray-500">Victors bedömning</div>
+                      <div className="mt-2 text-sm font-semibold">{state.activeRecommendation ? state.activeRecommendation : (latestDecision && latestDecision.action ? (function(a:any){ const up=String(a).toUpperCase(); if(up==='HOLD') return 'Behåll'; if(up==='BUY') return 'Köp'; if(up==='SELL') return 'Sälj'; if(up==='REJECT' || up==='REJECTED') return 'Avvisad'; return a; })(latestDecision.action) : 'Ingen aktiv rekommendation')}</div>
+                      <div className="mt-1 text-xs text-gray-500">{latestDecision && latestDecision.generatedAt ? `Senaste rekommendation: ${new Date(latestDecision.generatedAt).toLocaleString()}` : ''}</div>
+                      <div className="mt-2 text-xs text-gray-600">Victor fortsätter analysera marknaden autonomt.</div>
                 </div>
               </div>
 
@@ -475,14 +788,14 @@ export default function Page(){
                       <div className="text-sm text-gray-700">{track.worst && Number.isFinite(Number(track.worst.pnl)) ? Number(track.worst.pnl).toLocaleString() + ' kr' : '—'} <span className="text-xs text-gray-500">{track.worst && Number.isFinite(Number(track.worst.pct)) ? ' • ' + Number(track.worst.pct).toFixed(2) + '%' : ''}</span></div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid grid-cols-2 gap-3">
                       <div>
                         <div className="text-xs text-gray-500">Längsta vinstsvit</div>
-                        <div className="mt-1 font-semibold">{track.longestWin ? `${track.longestWin} affärer` : '—'}</div>
+                        <div className="mt-1 font-semibold">{Number.isFinite(Number(track.longestWin)) ? `${Number(track.longestWin)} affärer` : '—'}</div>
                       </div>
                       <div>
                         <div className="text-xs text-gray-500">Längsta förlustsvit</div>
-                        <div className="mt-1 font-semibold">{track.longestLoss ? `${track.longestLoss} affärer` : '—'}</div>
+                        <div className="mt-1 font-semibold">{Number.isFinite(Number(track.longestLoss)) ? `${Number(track.longestLoss)} affärer` : '—'}</div>
                       </div>
                     </div>
 
@@ -520,12 +833,12 @@ export default function Page(){
 
                 <div className="pt-2">
                   <div className="text-xs text-gray-500">LÄNGSTA VINSTSVIT</div>
-                  <div className="mt-1 font-semibold">{track.longestWin ? `${track.longestWin} affärer` : '—'}</div>
+                  <div className="mt-1 font-semibold">{Number.isFinite(Number(track.longestWin)) ? `${Number(track.longestWin)} affärer` : '—'}</div>
                 </div>
 
                 <div>
                   <div className="text-xs text-gray-500">LÄNGSTA FÖRLUSTSVIT</div>
-                  <div className="mt-1 font-semibold">{track.longestLoss ? `${track.longestLoss} affärer` : '—'}</div>
+                  <div className="mt-1 font-semibold">{Number.isFinite(Number(track.longestLoss)) ? `${Number(track.longestLoss)} affärer` : '—'}</div>
                 </div>
 
                 <div>
@@ -822,7 +1135,7 @@ export default function Page(){
 
                   <div className="mt-4 text-xs text-gray-500">RISK OCH GENOMFÖRANDE</div>
                   <div className="mt-1 text-sm text-gray-700">
-                    <div>{selectedAudit.reason ? `${selectedAudit.reason.code || ''} ${selectedAudit.reason.message || ''}` : '—'}</div>
+                    <div>{translateRuntimeText(selectedAudit.reason) || '—'}</div>
                     <div className="mt-2">Portfölj före: {selectedAudit.portfolioBefore ? (Number(selectedAudit.portfolioBefore.totalValue||0).toLocaleString() + ' kr') : '—'}</div>
                     <div>Portfölj efter: {selectedAudit.portfolioAfter ? (Number(selectedAudit.portfolioAfter.totalValue||0).toLocaleString() + ' kr') : '—'}</div>
                     <div>Cash före: {selectedAudit.portfolioBefore ? (Number(selectedAudit.portfolioBefore.availableCash||0).toLocaleString() + ' kr') : '—'}</div>

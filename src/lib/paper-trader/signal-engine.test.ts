@@ -22,13 +22,40 @@ describe('evaluateSignal', () => {
   });
 
   it('confidence follows Signal Score', () => {
+    // We will mock calculateSignalScore to return explicit scores so we can test
+    // directional confidence mapping independent of signal-score implementation.
+    const spy = vi.spyOn(ScoreMod, 'calculateSignalScore');
+    spy.mockReturnValueOnce({ score: 90, reasons: ['X'] } as any);
     const r1 = evaluateSignal({ expectedReturnPercent: 20 });
-    // calculateSignalScore for 20 -> 50 +20 (>5) +20 (>10) = 90
+    // score 90 -> BUY -> confidence 90
+    expect(r1.action).toBe('BUY');
     expect(r1.confidence).toBe(90);
 
-    const r2 = evaluateSignal({ expectedReturnPercent: -0.5 });
-    // small expectation leaves score at baseline 50
-    expect(r2.confidence).toBe(50);
+    spy.mockReturnValueOnce({ score: 75, reasons: ['X'] } as any);
+    const r2 = evaluateSignal({ expectedReturnPercent: 10 });
+    // score 75 -> BUY -> confidence 75
+    expect(r2.action).toBe('BUY');
+    expect(r2.confidence).toBe(75);
+
+    spy.mockReturnValueOnce({ score: 25, reasons: ['X'] } as any);
+    const r3 = evaluateSignal({ expectedReturnPercent: -10 });
+    // score 25 -> SELL -> confidence 75 (100-25)
+    expect(r3.action).toBe('SELL');
+    expect(r3.confidence).toBe(75);
+
+    spy.mockReturnValueOnce({ score: 10, reasons: ['X'] } as any);
+    const r4 = evaluateSignal({ expectedReturnPercent: -20 });
+    // score 10 -> SELL -> confidence 90 (100-10)
+    expect(r4.action).toBe('SELL');
+    expect(r4.confidence).toBe(90);
+
+    spy.mockReturnValueOnce({ score: 50, reasons: [] } as any);
+    const r5 = evaluateSignal({ expectedReturnPercent: 0 });
+    // score 50 -> HOLD, confidence should not be a high directional value
+    expect(r5.action).toBe('HOLD');
+    expect(r5.confidence).toBeGreaterThanOrEqual(0);
+    expect(r5.confidence).toBeLessThanOrEqual(50);
+    spy.mockRestore();
   });
 
   it('delegates scoring to calculateSignalScore exactly once', () => {

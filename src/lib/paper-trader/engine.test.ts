@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import createPaperTrader from './engine';
+import createPaperTrader, { mapAssetTypeToCategory, detectAssetCategory } from './engine';
 import { DEFAULT_PAPER_AUTO_MANDATE } from '../../domain/trading/victor-types';
 import { PaperTradeDecision } from './types';
 
@@ -93,7 +93,7 @@ describe('PaperTrader V1', ()=>{
 
   it('HOLD is logged and not executed', async ()=>{
     const adapter = makeAdapter(makePortfolio(10000));
-    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
     const res = await trader.handleDecision(makeDecision({ action: 'HOLD' }));
     expect(res.accepted).toBe(false);
     expect(res.code).toBe('HOLD');
@@ -126,7 +126,7 @@ describe('PaperTrader V1', ()=>{
 
   it('BUY decreases cash and increases holding', async ()=>{
     const adapter = makeAdapter(makePortfolio(100000));
-    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
     const dec = makeDecision({ symbol: 'AAA', action: 'BUY', confidence: 99, referencePrice: 100, requestedNotionalSek: 10000 });
     const res = await trader.handleDecision(dec);
     expect(res.accepted).toBe(true);
@@ -138,7 +138,7 @@ describe('PaperTrader V1', ()=>{
 
   it('SELL requires holding', async ()=>{
     const adapter = makeAdapter(makePortfolio(10000));
-    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
     const res = await trader.handleDecision(makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99 }));
     expect(res.accepted).toBe(false);
     expect(res.code).toBe('NO_HOLDING');
@@ -148,7 +148,7 @@ describe('PaperTrader V1', ()=>{
     const initial = makePortfolio(10000);
     initial.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 10, averagePrice: 100, currentPrice:100, marketValue:1000, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
     const adapter = makeAdapter(initial);
-    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
     const res = await trader.handleDecision(makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99, referencePrice: 100, requestedNotionalSek: 500 }));
     expect(res.accepted).toBe(true);
     const state = adapter._getState();
@@ -158,7 +158,7 @@ describe('PaperTrader V1', ()=>{
   it('respects 10% position cap', async ()=>{
     const initial = makePortfolio(100000);
     const adapter = makeAdapter(initial);
-    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, maxPositionPercent: 0.10 } });
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, maxPositionPercent: 0.10, feesBps: 0, slippageBps: 0 } });
     const dec = makeDecision({ action: 'BUY', symbol: 'AAA', confidence: 99, referencePrice: 100, requestedNotionalSek: 50000 });
     const res = await trader.handleDecision(dec);
     expect(res.accepted).toBe(true);
@@ -169,7 +169,7 @@ describe('PaperTrader V1', ()=>{
 
   it('insufficient cash rejected', async ()=>{
     const adapter = makeAdapter(makePortfolio(100));
-    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
     const res = await trader.handleDecision(makeDecision({ action: 'BUY', symbol: 'AAA', confidence:99, referencePrice: 100, requestedNotionalSek: 10000 }));
     expect(res.accepted).toBe(false);
     expect(res.code).toBe('INSUFFICIENT_CASH');
@@ -205,6 +205,117 @@ describe('PaperTrader V1', ()=>{
     const e = res.execution!;
     expect(e.executedPrice).toBe(100 * (1 + 5/10000));
     expect(e.fee).toBeCloseTo(Math.round(e.notional * (10/10000) * 100)/100, 2);
+  });
+
+  it('asset category detection and execution parity across categories', async ()=>{
+    // mapping
+    expect(mapAssetTypeToCategory('Stock')).toBe('Stock');
+    expect(mapAssetTypeToCategory('Forex')).toBe('Forex');
+    expect(mapAssetTypeToCategory('Commodity')).toBe('Commodity');
+    expect(mapAssetTypeToCategory('Whatever')).toBe('Unknown');
+
+    // Prepare three adapters with identical numeric state but different holding.assetType
+    const initialStock = makePortfolio(100000);
+    initialStock.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 10, averagePrice: 100, currentPrice:100, marketValue:1000, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+    const initialForex = JSON.parse(JSON.stringify(initialStock)); (initialForex.holdings[0] as any).assetType = 'Forex';
+    const initialCommodity = JSON.parse(JSON.stringify(initialStock)); (initialCommodity.holdings[0] as any).assetType = 'Commodity';
+
+    const aStock = makeAdapter(initialStock);
+    const aForex = makeAdapter(initialForex);
+    const aCommodity = makeAdapter(initialCommodity);
+
+    const traderStock = createPaperTrader({ portfolioAdapter: aStock, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    const traderForex = createPaperTrader({ portfolioAdapter: aForex, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    const traderCommodity = createPaperTrader({ portfolioAdapter: aCommodity, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+
+    const sell = makeDecision({ action: 'SELL', symbol: 'AAA', confidence: 99, referencePrice: 100, requestedNotionalSek: 500 });
+    const rStock = await traderStock.handleDecision(sell);
+    const rForex = await traderForex.handleDecision(sell);
+    const rCommodity = await traderCommodity.handleDecision(sell);
+
+    expect(detectAssetCategory(await aStock.getPortfolio(), 'AAA')).toBe('Stock');
+    expect(detectAssetCategory(await aForex.getPortfolio(), 'AAA')).toBe('Forex');
+    expect(detectAssetCategory(await aCommodity.getPortfolio(), 'AAA')).toBe('Commodity');
+
+    // Execution parity: with identical numeric inputs and no category-specific logic, results must match
+    expect(rStock.accepted).toBe(true);
+    expect(rForex.accepted).toBe(true);
+    expect(rCommodity.accepted).toBe(true);
+    expect(rStock.execution).toEqual(rForex.execution);
+    expect(rStock.execution).toEqual(rCommodity.execution);
+  });
+
+  it('allows fractional quantity buys (max 6 decimals, rounded down)', async ()=>{
+    const adapter = makeAdapter(makePortfolio(100000));
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    // requestedNotional 1234 / price 100 => qty = 12.34
+    const dec = makeDecision({ action:'BUY', symbol:'AAA', confidence:99, referencePrice:100, requestedNotionalSek:1234 });
+    const res = await trader.handleDecision(dec);
+    expect(res.accepted).toBe(true);
+    const e = res.execution!;
+    expect(typeof e.quantity).toBe('number');
+    const expectedQty = Math.floor((1234 * 1e6) / (e.executedPrice || 1)) / 1e6;
+    expect(e.quantity).toBeCloseTo(expectedQty, 12);
+    // execution notional must not exceed requested notional
+    expect(e.notional).toBeLessThanOrEqual(1234);
+  });
+
+  it('quantity precision capped at 6 decimals and rounds down', async ()=>{
+    const adapter = makeAdapter(makePortfolio(100000));
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // Make price such that division yields repeating decimals
+    const dec = makeDecision({ action:'BUY', symbol:'AAA', confidence:99, referencePrice:3, requestedNotionalSek:1000 });
+    const res = await trader.handleDecision(dec);
+    expect(res.accepted).toBe(true);
+    const q = res.execution!.quantity;
+    // Should have at most 6 decimal places
+    const parts = String(q).split('.');
+    if (parts[1]) expect(parts[1].length).toBeLessThanOrEqual(6);
+    // Assert it does not exceed theoretical raw notional/price
+    expect(res.execution!.notional).toBeLessThanOrEqual(1000);
+  });
+
+  it('very small positive quantity can execute if above 1e-6', async ()=>{
+    const adapter = makeAdapter(makePortfolio(100000));
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // price large, requestedNotional small but enough to create 1e-6 quantity
+    const dec = makeDecision({ action:'BUY', symbol:'AAA', confidence:99, referencePrice:1000000, requestedNotionalSek:1 });
+    const res = await trader.handleDecision(dec);
+    expect(res.accepted).toBe(true);
+    expect(res.execution!.quantity).toBeGreaterThan(0);
+  });
+
+  it('ORDER_TOO_SMALL when computed qty is zero after quantization', async ()=>{
+    const adapter = makeAdapter(makePortfolio(100000));
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    // notional too small to produce any quantity at 6-decimal precision
+    const dec = makeDecision({ action:'BUY', symbol:'AAA', confidence:99, referencePrice:1000000, requestedNotionalSek:0.5 });
+    const res = await trader.handleDecision(dec);
+    expect(res.accepted).toBe(false);
+    expect(res.code).toBe('ORDER_TOO_SMALL');
+  });
+
+  it('integer orders still work (regression)', async ()=>{
+    const adapter = makeAdapter(makePortfolio(100000));
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true, feesBps: 0, slippageBps: 0 } });
+    const dec = makeDecision({ action:'BUY', symbol:'AAA', confidence:99, referencePrice:100, requestedNotionalSek:10000 });
+    const res = await trader.handleDecision(dec);
+    expect(res.accepted).toBe(true);
+    expect(Number.isInteger(res.execution!.quantity)).toBe(true);
+  });
+
+  it('SELL cannot sell more than holding (fractional supported)', async ()=>{
+    const initial = makePortfolio(10000);
+    // existing fractional holding 5.5
+    initial.holdings.push({ id:'h_AAA', symbol:'AAA', name:'AAA', assetType: 'Stock', quantity: 5.5, averagePrice: 100, currentPrice:100, marketValue:550, unrealizedPnl:0, unrealizedPnlPercent:0, portfolioWeight:0 });
+    const adapter = makeAdapter(initial);
+    const trader = createPaperTrader({ portfolioAdapter: adapter, clock: fixedClock, idGenerator: makeIdGen(), config: { enabled: true } });
+    // request sell notional that would otherwise produce qty > holding
+    const dec = makeDecision({ action:'SELL', symbol:'AAA', confidence:99, referencePrice:100, requestedNotionalSek:10000 });
+    const res = await trader.handleDecision(dec);
+    expect(res.accepted).toBe(true);
+    // exec qty must be <= held qty
+    expect(res.execution!.quantity).toBeLessThanOrEqual(5.5 + 1e-12);
   });
 
   it('identical inputs + fixed clock/id produce identical results', async ()=>{

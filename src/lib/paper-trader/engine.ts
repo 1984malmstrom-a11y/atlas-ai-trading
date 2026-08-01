@@ -12,6 +12,7 @@ import {
   Portfolio,
 } from './types';
 import { DEFAULT_PAPER_AUTO_MANDATE } from '../../domain/trading/victor-types';
+import { evaluateEvidenceExecutionGate } from './evidence-informed-decision-policy';
 
 const DEFAULTS: Required<Pick<PaperTraderConfig, 'enabled' | 'minimumBuyConfidence' | 'minimumSellConfidence' | 'maxPositionPercent' | 'maxOrderValueSek' | 'feesBps' | 'slippageBps' | 'cooldownMs' | 'maxTradesPerCycle'>> = {
   enabled: false,
@@ -33,6 +34,29 @@ class InMemoryAudit implements AuditStore {
   private entries: AuditEntry[] = [];
   async append(entry: AuditEntry){ this.entries.push(entry); }
   async list(){ return this.entries.slice(); }
+}
+
+export type AssetCategory = 'Stock' | 'Forex' | 'Commodity' | 'Unknown';
+
+export function mapAssetTypeToCategory(assetType?: string): AssetCategory{
+  if (!assetType) return 'Unknown';
+  const t = String(assetType).toUpperCase();
+  if (t.includes('FOREX')) return 'Forex';
+  if (t.includes('COMMODITY')) return 'Commodity';
+  if (t.includes('STOCK') || t.includes('ETF')) return 'Stock';
+  return 'Unknown';
+}
+
+export function detectAssetCategory(portfolio: Portfolio | null, symbol?: string): AssetCategory{
+  try{
+    if (!portfolio || !symbol) return 'Unknown';
+    if (!Array.isArray(portfolio.holdings)) return 'Unknown';
+    const sym = String(symbol).toUpperCase();
+    const found = portfolio.holdings.find((h:any) => (h && (h.symbol||'').toString().toUpperCase() === sym));
+    if (!found) return 'Unknown';
+    const at = (found as any).assetType;
+    return mapAssetTypeToCategory(typeof at === 'string' ? at : undefined);
+  }catch(_){ return 'Unknown'; }
 }
 
 export function createPaperTrader(opts: {
@@ -189,6 +213,14 @@ export function createPaperTrader(opts: {
 
     // pre-read portfolio
     const before = await portfolioAdapter.getPortfolio();
+    // Identify asset category for this decision early so future category-specific
+    // execution rules can be applied. Currently this only detects the category
+    // but does not change any execution logic — TODO: implement per-category
+    // execution differences for Stock/Forex/Commodity when required.
+    const assetCategory = detectAssetCategory(before, decision.symbol);
+    // TODO: Stock-specific execution hooks
+    // TODO: Forex-specific execution hooks
+    // TODO: Commodity-specific execution hooks
     const existing = before.holdings.find(h => h.symbol.toUpperCase() === decision.symbol.toUpperCase());
     const existingMarketValue = existing ? existing.marketValue : 0;
     const totalValue = before.totalValue;
@@ -262,7 +294,18 @@ export function createPaperTrader(opts: {
     }
 
     // Recompute quantity
-    let qty = Math.floor(notional / execPrice);
+    // Allow fractional quantities up to 6 decimals (do not round up)
+    const QUANTITY_PRECISION = 6;
+    const QUANTITY_MULT = Math.pow(10, QUANTITY_PRECISION);
+    function computeQtyFromNotional(n: number, p: number){
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      if (!Number.isFinite(p) || p <= 0) return 0;
+      // floor((n * mult) / price) / mult ensures qty * price <= n
+      const raw = Math.floor((n * QUANTITY_MULT) / p);
+      return raw / QUANTITY_MULT;
+    }
+
+    let qty = computeQtyFromNotional(notional, execPrice);
     if (decision.action === 'SELL'){
       const heldQty = existing ? existing.quantity : 0;
       if (heldQty <= 0){
@@ -272,9 +315,10 @@ export function createPaperTrader(opts: {
       }
       // limit quantity by holding
       if (qty <= 0) {
-        // if requestedNotional was small, allow selling at least 1 if requested notional > 0
+        // If requestedNotional was small, try to compute a fractional fallback quantity
         if (decision.requestedNotionalSek && decision.requestedNotionalSek > 0){
-          qty = Math.min(heldQty, Math.max(1, Math.floor(decision.requestedNotionalSek / execPrice)));
+          const fallback = computeQtyFromNotional(decision.requestedNotionalSek, execPrice);
+          qty = Math.min(heldQty, fallback);
         }
       }
       qty = Math.min(heldQty, qty);
@@ -310,6 +354,16 @@ export function createPaperTrader(opts: {
       fee: round2(finalNotional * (cfg.feesBps / 10000)),
       generatedAt: toIso(clock.now()),
     };
+
+    // Evidence execution gate: conservative blocking for high-quality contradictory evidence
+    try{
+      const gate = evaluateEvidenceExecutionGate(decision as any);
+      if (gate && gate.blocked){
+        const reason = { code: gate.code || 'BLOCKED_BY_CONTRADICTORY_EVIDENCE', message: gate.reason || 'Blocked by contradictory evidence', rejectReason: 'BLOCKED_BY_CONTRADICTORY_EVIDENCE', trigger: { conflictSignals: gate.conflictSignals || [], evidenceScore: gate.evidenceScore, evidenceQuality: gate.evidenceQuality, consistencyScore: gate.consistencyScore } } as any;
+        await appendAudit({ kind: 'REJECT', decision, reason, portfolioBefore: before });
+        return { accepted: false, code: reason.code, message: reason.message };
+      }
+    }catch(_){ /* do not block on gate errors */ }
 
     // 5b: acquire lock
     locks.set(k, true);
