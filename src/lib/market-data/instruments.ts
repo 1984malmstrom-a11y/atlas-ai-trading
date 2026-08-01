@@ -35,10 +35,20 @@ export const TRADABLE_INSTRUMENTS: TradableInstrument[] = [
   { id: 'telia', name: 'Telia', providerSymbol: 'TELIA', exchange: 'STO', currency: 'SEK', enabled: false, marketDataEnabled: false, tradingEnabled: false, assetType: 'STOCK', disabledReason: 'TWELVE_DATA_PLAN_RESTRICTED' },
   // Gold spot (commodity) — market data enabled, trading disabled for now
   // Added official Forex and Metals instruments (market data only, trading disabled)
-  { id: 'EUR_USD', name: 'EUR/USD', providerSymbol: 'EUR/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'EUR', quoteCurrency: 'USD' },
-  { id: 'GBP_USD', name: 'GBP/USD', providerSymbol: 'GBP/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'GBP', quoteCurrency: 'USD' },
-  { id: 'USD_JPY', name: 'USD/JPY', providerSymbol: 'USD/JPY', exchange: 'Forex', currency: 'JPY', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'JPY' },
   { id: 'USD_SEK', name: 'USD/SEK', providerSymbol: 'USD/SEK', exchange: 'Forex', currency: 'SEK', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'SEK' },
+  // Ensure full 12-pair Forex universe (majors + crosses)
+  { id: 'EUR_USD', name: 'EUR/USD', providerSymbol: 'EUR/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'FOREX', baseAsset: 'EUR', quoteCurrency: 'USD' },
+  { id: 'GBP_USD', name: 'GBP/USD', providerSymbol: 'GBP/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'FOREX', baseAsset: 'GBP', quoteCurrency: 'USD' },
+  { id: 'USD_JPY', name: 'USD/JPY', providerSymbol: 'USD/JPY', exchange: 'Forex', currency: 'JPY', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'JPY' },
+  { id: 'USD_CHF', name: 'USD/CHF', providerSymbol: 'USD/CHF', exchange: 'Forex', currency: 'CHF', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'CHF' },
+  { id: 'USD_CAD', name: 'USD/CAD', providerSymbol: 'USD/CAD', exchange: 'Forex', currency: 'CAD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'USD', quoteCurrency: 'CAD' },
+  { id: 'AUD_USD', name: 'AUD/USD', providerSymbol: 'AUD/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'FOREX', baseAsset: 'AUD', quoteCurrency: 'USD' },
+  { id: 'NZD_USD', name: 'NZD/USD', providerSymbol: 'NZD/USD', exchange: 'Forex', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'NZD', quoteCurrency: 'USD' },
+  { id: 'EUR_JPY', name: 'EUR/JPY', providerSymbol: 'EUR/JPY', exchange: 'Forex', currency: 'JPY', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'EUR', quoteCurrency: 'JPY' },
+  { id: 'GBP_JPY', name: 'GBP/JPY', providerSymbol: 'GBP/JPY', exchange: 'Forex', currency: 'JPY', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'GBP', quoteCurrency: 'JPY' },
+  { id: 'EUR_GBP', name: 'EUR/GBP', providerSymbol: 'EUR/GBP', exchange: 'Forex', currency: 'GBP', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'EUR', quoteCurrency: 'GBP' },
+  { id: 'AUD_JPY', name: 'AUD/JPY', providerSymbol: 'AUD/JPY', exchange: 'Forex', currency: 'JPY', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'AUD', quoteCurrency: 'JPY' },
+  { id: 'EUR_AUD', name: 'EUR/AUD', providerSymbol: 'EUR/AUD', exchange: 'Forex', currency: 'AUD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'FOREX', baseAsset: 'EUR', quoteCurrency: 'AUD' },
   { id: 'XAU_USD', name: 'XAU/USD', providerSymbol: 'XAU/USD', exchange: 'COMMODITY', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'COMMODITY', baseAsset: 'XAU', quoteCurrency: 'USD' },
   { id: 'XAG_USD', name: 'XAG/USD', providerSymbol: 'XAG/USD', exchange: 'COMMODITY', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: false, assetType: 'COMMODITY', baseAsset: 'XAG', quoteCurrency: 'USD' },
 ];

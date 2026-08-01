@@ -7,6 +7,8 @@ import { TRADABLE_UNIVERSE } from './tradable-universe';
 import { VictorTradingMandate, VictorTradeDecision, DEFAULT_PAPER_AUTO_MANDATE, VictorTradingMode } from './victor-types';
 import fs from 'fs/promises';
 import path from 'path';
+import { canExecuteForexOrder } from '../../lib/forex-market';
+import { resolveCurrencyToSekRate, resolveForexPriceSek, FxSekConversionResult } from '../../lib/market-data/fx-conversion';
 
 const AUDIT_PATH = path.join(process.cwd(), 'src', 'data', 'victor-trading-audit.json');
 
@@ -206,12 +208,38 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
   // limit number of symbols to fetch to avoid large batch requests; prefer a small representative set
   const allowedLimited = allowed.slice(0, 3);
   const symbols = allowedLimited.map(i => i.providerSymbol || i.name);
+  // Include USD/SEK as conversion dependency when fetching FX universe so conversion helper can use it
+  if (allowedLimited.some(i => String(i.exchange).toUpperCase() === 'FOREX')){
+    if (!symbols.map(s=>String(s).toUpperCase()).includes('USD/SEK')) symbols.push('USD/SEK');
+  }
   console.log('[victor] Selected symbols for this cycle:', symbols.map(s=>String(s)).join(', '));
   const quotes = await md.getQuotes(symbols);
 
   // Map symbol->instrumentId
   const quoteMap = new Map<string, any>();
   for (const q of quotes) quoteMap.set(q.symbol.toUpperCase(), q);
+
+  // Build per-cycle canonical quote map for conversion helper
+  const quotesByCanonicalSymbol: Record<string, any> = {};
+  const normalizeCanonicalKey = (s: string | undefined | null) => String(s||'').toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  for (const q of quotes){
+    const key = q && (q.instrumentId || q.symbol) ? normalizeCanonicalKey(String(q.instrumentId || q.symbol)) : null;
+    if (key) quotesByCanonicalSymbol[key] = q;
+  }
+
+  // Per-cycle conversion cache by currency
+  const currencyToSekByCurrency = new Map<string, FxSekConversionResult>();
+  const now = new Date();
+  const maxAgeMs = FRESH_MS;
+  for (const inst of allowed){
+    const qc = String((inst as any).quoteCurrency || inst.currency || 'USD').toUpperCase();
+    if (!currencyToSekByCurrency.has(qc)){
+      try{
+        const conv = resolveCurrencyToSekRate({ currency: qc, quotesByCanonicalSymbol, now, maxAgeMs });
+        currencyToSekByCurrency.set(qc, conv);
+      }catch(e){ currencyToSekByCurrency.set(qc, { status: 'MISSING_RATE', sourceCurrency: qc, targetCurrency: 'SEK', path: [], isFresh: false, reasons: [String(e)] }); }
+    }
+  }
 
   // Build decisions
   const decisions: VictorTradeDecision[] = [];
@@ -233,6 +261,15 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
       decisions.push({ instrumentId: inst.id, action: 'HOLD', confidence: 0, thesis: 'Stale/future timestamp', signals: [], risks: ['stale_data'], timeHorizon: 'SWING', generatedAt: nowIso() });
       continue;
     }
+
+    // Compute conversion and priceSek for this instrument's quote currency
+    const qc = String((inst as any).quoteCurrency || inst.currency || '').toUpperCase();
+    const conv = currencyToSekByCurrency.get(qc) || null;
+    let priceSekInfo: any = null;
+    try{
+      priceSekInfo = resolveForexPriceSek({ instrument: inst as any, quote: { price: q.price, marketTimestamp: q.timestamp }, conversion: conv as FxSekConversionResult, now });
+      if (priceSekInfo && priceSekInfo.priceSek) q.priceSek = priceSekInfo.priceSek;
+    }catch(e){ /* ignore; leave q.priceSek as-is */ }
 
     const d = deterministicDecisionForQuote(inst.id, q);
     decisions.push(d);
@@ -262,8 +299,21 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
     // compute order value: use mandate.maxOrderValueSek as cap and simple rule
     const orderValueSek = Math.min(mandate.maxOrderValueSek, Math.max(500, Math.round((dec.confidence || 0.6) * mandate.maxOrderValueSek)));
     if (orderValueSek < 500) continue;
-    // build request
-    const qty = Math.floor(orderValueSek / q.price) || 1;
+    // Determine SEK-normalized unit price to compute quantity/ notional
+    const priceSek = (q && typeof q.priceSek === 'number' && Number.isFinite(q.priceSek) && q.priceSek > 0) ? Number(q.priceSek) : ((q && typeof q.price === 'number' && Number.isFinite(q.price)) ? Number(q.price) : undefined);
+    if (!priceSek){
+      // Without a SEK-normalized price we cannot compute notional safely — skip
+      const auditEntry = { timestamp: nowIso(), mode: mandate.mode, mandate, account, positions, decisions: [dec], proposals: [], executed: [], reason: { code: 'FOREX_NOTIONAL_CONVERSION_UNAVAILABLE', message: 'Missing SEK-normalized price' } };
+      await appendAudit(auditEntry);
+      continue;
+    }
+    // build request: allow fractional quantity for FOREX, integer quantities for STOCK
+    let qty: number;
+    if (String((inst as any).assetType || '').toUpperCase() === 'FOREX'){
+      qty = orderValueSek / priceSek; // fractional allowed
+    } else {
+      qty = Math.floor(orderValueSek / (priceSek || (q && q.price) || 1)) || 1;
+    }
     if (qty <= 0) continue;
     const clientId = `o_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
     // If this is a BUY, require an explicit finite expectedReturnPercent from Victor's decision; otherwise skip creating a BUY order.
@@ -307,6 +357,24 @@ export async function runVictorTradingCycle(opts: { mandate?: VictorTradingManda
           }
         }
       }catch(e){ /* best-effort, fall through */ }
+
+      // For FOREX instruments enforce execution gate without changing risk/decision rules
+      try{
+        if (String((inst as any).assetType || '').toUpperCase() === 'FOREX'){
+          const qc = String((inst as any).quoteCurrency || inst.currency || '').toUpperCase();
+          const convForInst = currencyToSekByCurrency.get(qc) || null;
+          const gate = canExecuteForexOrder({ now, quote: q, instrument: inst, conversion: convForInst as FxSekConversionResult | null });
+          if (!gate.allowed){
+            executed.push({ proposal: req, result: { status: 'BLOCKED', code: gate.reasons && gate.reasons.length ? gate.reasons[0] : 'FOREX_BLOCKED', reasons: gate.reasons } });
+            tradesThisCycle++;
+            continue;
+          }
+        }
+      }catch(e){ /* best-effort: if gate fails, block safe */
+        executed.push({ proposal: req, result: { status: 'BLOCKED', code: 'FOREX_GATE_ERROR', message: String(e) } });
+        tradesThisCycle++;
+        continue;
+      }
 
       const res = await broker.placeOrder(req as any);
       executed.push({ proposal: req, result: res });

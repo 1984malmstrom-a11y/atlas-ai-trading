@@ -30,10 +30,12 @@ import evaluateShadowDecisionOutcome from './shadow-decision-outcome-evaluator';
 import aggregateShadowDecisionPerformance from './shadow-decision-performance-aggregator';
 import { TRADABLE_INSTRUMENTS } from '../market-data/instruments';
 import { TwelveDataMarketDataProvider } from '../market-data/twelve-data';
+import { getForexSessionDiagnostics } from '../forex-market';
 import { fetchAndBuildFundamentalIntelligence } from '../paper-trader/fundamental-data';
 import { buildMacroSignalsMock, buildMacroSignals, buildMacroSnapshotFromInstruments } from './macro-signals';
 import { buildSectorStrengthSummaries, createSectorStrengthSignalForInstrument } from './sector-signals';
 import { buildVolumeSignal, buildTrendQualitySignal, buildSupportResistanceSignal } from './market-structure-signals';
+import { buildForexReadinessState, ForexReadinessState } from './forex-readiness';
 import fs from 'fs';
 import path from 'path';
 import computeNextPortfolioState from './portfolio-mutation';
@@ -59,6 +61,7 @@ type RuntimeState = {
   autonomousEnabled: boolean;
   latestDecisionIntelligenceBySymbol?: Record<string, any>;
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
+  forexReadiness?: ForexReadinessState | null;
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -89,6 +92,11 @@ export function getWatchlistSymbols(eligibleInstruments: any[], watchlist = DEFA
     // dedupe and return
     return Array.from(new Set(res));
   }catch(_){ return []; }
+}
+
+// Small helper exposed for diagnostics: returns forex session status for a given instant.
+export function forexSessionStatus(now?: Date){
+  try{ return getForexSessionDiagnostics(now instanceof Date ? now : new Date()); }catch(e){ return { status: 'INVALID_DATE' }; }
 }
 
 // Create a per-cycle fundamental resolver factory (testable, no globals)
@@ -655,6 +663,7 @@ const runtime: RuntimeState = {
   lastUpdated: nowIso(),
   autonomousEnabled: true,
   latestDecisionIntelligenceBySymbol: {},
+  forexReadiness: null,
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -1371,6 +1380,11 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       await cycleAuditStore.append({ kind: 'RECEIVED', id: `runtime_snapshot_${Date.now()}`, timestamp: fetchedAt, snapshot: snap, meta: { automatic: true } } as any);
     }catch(e){ /* swallow */ }
   }catch(e){ /* do not impact runtime when diagnostics fail */ }
+  // Build and attach forex readiness snapshot for this cycle (defensive copy)
+  try{
+    const readiness = buildForexReadinessState({ now: nowForCycle, instruments: TRADABLE_INSTRUMENTS, quotes: (quotes && Array.isArray(quotes)) ? quotes : [] });
+    try{ runtime.forexReadiness = JSON.parse(JSON.stringify(readiness)); }catch(_){ runtime.forexReadiness = readiness as any; }
+  }catch(_){ runtime.forexReadiness = null; }
   // Build per-cycle instruments array and macro snapshot/signals once to reuse for BUY/SELL
   let cycleMacroSnapshot: any = undefined;
   let cycleMacroSignals: any[] | undefined = undefined;

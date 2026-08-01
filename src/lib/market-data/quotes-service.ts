@@ -1,5 +1,6 @@
 import type { MarketQuote, MarketDataProvider } from './types';
 import { TRADABLE_INSTRUMENTS } from './instruments';
+import { isForexMarketOpen } from '../forex-market';
 
 // Threshold for considering a quote stale (ms)
 export const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
@@ -65,6 +66,32 @@ export function classifyQuoteStatus(opts: { currentTime?: string|Date, marketTim
   else dataStatus = providerIsMarketOpen ? 'LIVE' : 'DELAYED';
 
   return { dataStatus, isStale: dataStatus === 'STALE' };
+}
+
+// Wrapper to classify instrument quote status with market-session-aware overrides for Forex
+export function classifyInstrumentQuoteStatus(params: { assetType?: string | null, quote?: { marketTimestamp?: string | null, price?: number | null } | null, now?: Date, provider?: unknown }){
+  const { assetType, quote, now, provider } = params;
+  const hasValidPrice = !!(quote && typeof quote.price === 'number' && Number.isFinite(quote.price) && quote.price > 0);
+  const marketTimestamp = quote && (quote as any).marketTimestamp ? String((quote as any).marketTimestamp) : null;
+
+  // For non-FOREX, fallback to existing classifier
+  if (!assetType || String(assetType).toUpperCase() !== 'FOREX'){
+    return classifyQuoteStatus({ currentTime: now, marketTimestamp, hasValidPrice, provider });
+  }
+
+  // For FOREX, enforce MARKET_CLOSED when session closed
+  const nyNow = now instanceof Date ? now : new Date();
+  const forexOpen = isForexMarketOpen(nyNow);
+
+  // First, if no valid price -> UNAVAILABLE
+  if (!hasValidPrice) return { dataStatus: 'UNAVAILABLE' as const, isStale: true, marketSession: forexOpen ? 'OPEN' : 'CLOSED' };
+
+  // Next, if market closed -> MARKET_CLOSED
+  if (!forexOpen) return { dataStatus: 'MARKET_CLOSED' as const, isStale: false, marketSession: 'CLOSED' };
+
+  // Else treat like normal classification
+  const base = classifyQuoteStatus({ currentTime: now, marketTimestamp, hasValidPrice, provider });
+  return { ...base, marketSession: 'OPEN' };
 }
 
 // Reusable function to fetch and normalize quotes. Exported so other server endpoints can reuse the exact same behavior.
@@ -180,7 +207,7 @@ export async function getNormalizedQuotes(providerOverride?: MarketDataProvider,
       changePercent: number | null;
       marketTimestamp: string | null;
       fetchedAt: string;
-      dataStatus: 'LIVE'|'DELAYED'|'STALE'|'UNAVAILABLE';
+      dataStatus: 'LIVE'|'DELAYED'|'STALE'|'UNAVAILABLE'|'MARKET_CLOSED';
       isStale: boolean;
       provider: string;
     };
@@ -305,16 +332,10 @@ export async function getNormalizedQuotes(providerOverride?: MarketDataProvider,
           isOld = false;
         }
 
-        let dataStatus: 'LIVE'|'DELAYED'|'STALE'|'UNAVAILABLE' = 'UNAVAILABLE';
-        if (price === null || !Number.isFinite(Number(price))){
-          dataStatus = 'UNAVAILABLE';
-        } else if (isOld){
-          dataStatus = 'STALE';
-        } else {
-          if (providerIsMarketOpen) dataStatus = 'LIVE';
-          else dataStatus = 'DELAYED';
-        }
-        const outIsStale = dataStatus === 'STALE';
+        // Use instrument-aware classifier (handles FOREX session semantics)
+        const classification = classifyInstrumentQuoteStatus({ assetType: inst.assetType, quote: { marketTimestamp, price }, now, provider: raw });
+        let dataStatus: NormalizedQuote['dataStatus'] = classification.dataStatus as NormalizedQuote['dataStatus'];
+        const outIsStale = !!classification.isStale;
 
         // compute optional SEK-normalized price if getFxRate provided
         let priceSek: number | undefined = undefined;

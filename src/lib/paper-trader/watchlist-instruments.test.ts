@@ -22,14 +22,21 @@ describe('Watchlist instruments and TRADABLE_INSTRUMENTS', ()=>{
   });
 
   it('C/D: FX pairs present with correct assetType and marketDataEnabled=true but tradingEnabled=false', ()=>{
-    const fxWanted = [ { id: 'EUR_USD', sym: 'EUR/USD' }, { id: 'GBP_USD', sym: 'GBP/USD' }, { id: 'USD_JPY', sym: 'USD/JPY' } ];
+    const fxWanted = [
+      { id: 'EUR_USD', sym: 'EUR/USD' }, { id: 'GBP_USD', sym: 'GBP/USD' }, { id: 'USD_JPY', sym: 'USD/JPY' },
+      { id: 'USD_CHF', sym: 'USD/CHF' }, { id: 'USD_CAD', sym: 'USD/CAD' }, { id: 'AUD_USD', sym: 'AUD/USD' },
+      { id: 'NZD_USD', sym: 'NZD/USD' }, { id: 'EUR_JPY', sym: 'EUR/JPY' }, { id: 'GBP_JPY', sym: 'GBP/JPY' },
+      { id: 'EUR_GBP', sym: 'EUR/GBP' }, { id: 'AUD_JPY', sym: 'AUD/JPY' }, { id: 'EUR_AUD', sym: 'EUR/AUD' }
+    ];
+    const enabledForTrading = new Set(['EUR_USD','GBP_USD','USD_JPY','AUD_USD']);
     for (const f of fxWanted){
       const found = TRADABLE_INSTRUMENTS.find(i => i && (i.id === f.id || String(i.providerSymbol||'').toUpperCase() === f.sym.toUpperCase()));
       expect(found).toBeTruthy();
       if (found){
         expect(String(found.assetType).toUpperCase()).toBe('FOREX');
         expect(found.marketDataEnabled).toBe(true);
-        expect(found.tradingEnabled).toBe(false);
+        const expected = enabledForTrading.has(found.id);
+        expect(Boolean(found.tradingEnabled)).toBe(expected);
       }
     }
   });
