@@ -1,10 +1,12 @@
 /* Server-side Twelve Data provider implementation */
+import path from 'path';
+import type { MarketDataProvider, MarketQuote } from './types';
+import { TRADABLE_INSTRUMENTS, findInstrumentById } from './instruments';
+import fs from 'fs';
 const _so = 'server' + '-only';
 void import(_so).catch(()=>{});
-  }
 
   // Get FX rate from `fromCurrency` to SEK. Returns positive finite number or null on failure.
-import path from 'path';
 
 // Exported small parser for Twelve Data timestamps. Kept minimal and deterministic.
 export function parseTwelveTimestamp(cand: any): Date | null {

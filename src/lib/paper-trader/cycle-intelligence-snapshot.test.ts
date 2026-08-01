@@ -58,4 +58,4 @@ describe('createMarketNewsIntelligenceSummary', () => {
     expect(res.latestPublishedAt).toBeNull();
     expect(res.symbol).toBe('X');
   });
-});\r\n
+});
