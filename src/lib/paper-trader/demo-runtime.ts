@@ -86,6 +86,7 @@ type RuntimeState = {
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
   latestBenchmarkMarketContextBySymbol?: Record<string, any>;
+  latestAutonomousRuntimeReadiness?: any;
   benchmarkDataReadiness?: any;
   externalIntelligenceReadiness?: any;
   forexReadiness?: ForexReadinessState | null;
@@ -1434,6 +1435,15 @@ export async function getPaperTradingState(){
       out.externalIntelligenceReadiness = runtime.externalIntelligenceReadiness ? JSON.parse(JSON.stringify(runtime.externalIntelligenceReadiness)) : null;
     }catch(e){ out.externalIntelligenceReadiness = null; }
   }catch(_){ out.externalIntelligenceReadiness = null; }
+  // Expose autonomous runtime readiness (diagnostic-only)
+  try{
+    const b = require('./autonomous-runtime-readiness');
+    try{
+      const built = await b.buildAutonomousRuntimeReadiness({ now: new Date(), runtimeSnapshot: runtime });
+      try{ runtime.latestAutonomousRuntimeReadiness = JSON.parse(JSON.stringify(built)); }catch(_){ runtime.latestAutonomousRuntimeReadiness = built; }
+      out.latestAutonomousRuntimeReadiness = runtime.latestAutonomousRuntimeReadiness ? JSON.parse(JSON.stringify(runtime.latestAutonomousRuntimeReadiness)) : null;
+    }catch(e){ out.latestAutonomousRuntimeReadiness = null; }
+  }catch(_){ out.latestAutonomousRuntimeReadiness = null; }
   // Expose latest market news activity from the most recent CYCLE_INTELLIGENCE_SNAPSHOT audit (if any)
   try{
     let latestActivity: MarketNewsActivity | undefined = undefined;
