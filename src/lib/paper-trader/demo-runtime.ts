@@ -16,6 +16,7 @@ import { combineAnalyses } from './analysis-aggregator';
 import estimateExpectedReturn from './expected-return';
 import analyzePriceSeries from './technical';
 import classifyMarketRegime from './market-regime-classifier';
+import { buildMarketRegimeIntelligence, buildMarketRegimeIntelligenceAudit, sanitizeIntelligenceForState } from './market-regime-intelligence';
 import buildMarketContextAdvice from './market-context-advisor';
 import buildHistoricalContext from './historical-context-engine';
 import type { HistoricalMarketContextSnapshot } from './historical-market-context';
@@ -68,6 +69,7 @@ type RuntimeState = {
   latestDecisionIntelligenceBySymbol?: Record<string, any>;
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
+  latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   forexReadiness?: ForexReadinessState | null;
   forexAutonomyArmed?: boolean;
   forexLaunchControl?: ForexLaunchControlState | null;
@@ -133,6 +135,30 @@ export function createPerCycleFundamentalResolver(opts: { fetchFundamental: (o:{
         try{ if (opts.appendAudit && res && res.snapshot){ opts.appendAudit(res).catch(()=>{}); } }catch(_){ }
         try{ if (opts.updateState && res){ opts.updateState(sym, res); } }catch(_){ }
         return res;
+      }catch(e){ return null; }
+    })();
+    map.set(sym, p);
+    return p;
+  }
+  return { resolve };
+}
+
+// Per-cycle Market Regime Intelligence resolver (diagnostic-only)
+export function createPerCycleMarketRegimeResolver(opts: { buildIntelligence: (o:{ symbol: string; historicalContext?: HistoricalMarketContextSnapshot; now?: Date })=>any, appendAudit?: (a:any)=>Promise<void>, getHistoricalSnapshot?: (s:string)=>HistoricalMarketContextSnapshot | null, updateState?: (s:string,r:any)=>void }){
+  const map = new Map<string, Promise<any>>();
+  const build = opts.buildIntelligence;
+  async function resolve({ cycleId, symbol }: { cycleId?: string; symbol: string }){
+    const sym = String(symbol || '').toUpperCase(); if (!sym) return null;
+    if (map.has(sym)) return map.get(sym);
+    const p = (async ()=>{
+      try{
+        // reuse existing historical snapshot via callback when available
+        const hist = typeof opts.getHistoricalSnapshot === 'function' ? opts.getHistoricalSnapshot(sym) : undefined;
+        const snap = build({ symbol: sym, historicalContext: hist || undefined, now: new Date() });
+        // append audit if store provided
+        try{ if (opts.appendAudit && typeof cycleId === 'string') opts.appendAudit(buildMarketRegimeIntelligenceAudit(cycleId, snap)).catch(()=>{}); }catch(_){ }
+        try{ if (opts.updateState) opts.updateState(sym, sanitizeIntelligenceForState(snap)); }catch(_){ }
+        return snap;
       }catch(e){ return null; }
     })();
     map.set(sym, p);
@@ -1238,6 +1264,34 @@ export async function getPaperTradingState(){
         }
         out.latestHistoricalMarketContextBySymbol = safeHist;
       }catch(_){ out.latestHistoricalMarketContextBySymbol = {}; }
+        // Expose latest sanitized Market Regime Intelligence per symbol for UI/state
+        try{
+          const rawMapR = runtime.latestMarketRegimeIntelligenceBySymbol || {};
+          const safeReg: Record<string, any> = {};
+          for (const k of Object.keys(rawMapR || {})){
+            try{
+              const v = (rawMapR as Record<string, any>)[k]; if (!v) continue;
+              safeReg[k] = {
+                schemaVersion: v.schemaVersion,
+                source: v.source,
+                symbol: v.symbol,
+                observedAt: v.observedAt,
+                generatedAt: v.generatedAt,
+                primaryRegime: v.primaryRegime,
+                volatilityRegime: v.volatilityRegime,
+                riskRegime: v.riskRegime,
+                confidence: typeof v.confidence === 'number' ? v.confidence : 0,
+                strength: v.strength,
+                quality: v.quality,
+                supportingSignals: Array.isArray(v.supportingSignals) ? v.supportingSignals.slice() : [],
+                conflictingSignals: Array.isArray(v.conflictingSignals) ? v.conflictingSignals.slice() : [],
+                reasoning: Array.isArray(v.reasoning) ? v.reasoning.slice(0,5) : [],
+                warnings: Array.isArray(v.warnings) ? v.warnings.slice(0,10) : []
+              };
+            }catch(_){ }
+          }
+          out.latestMarketRegimeIntelligenceBySymbol = safeReg;
+        }catch(_){ out.latestMarketRegimeIntelligenceBySymbol = {}; }
   // Expose latest market news activity from the most recent CYCLE_INTELLIGENCE_SNAPSHOT audit (if any)
   try{
     let latestActivity: MarketNewsActivity | undefined = undefined;

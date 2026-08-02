@@ -112,7 +112,7 @@ function stddev(arr: number[]): number | null {
 
 export function buildHistoricalMarketContext(input: HistoricalMarketContextInput): HistoricalMarketContext {
   const now = input.now || new Date();
-  const generatedAt = toIso(new Date());
+  const generatedAt = toIso(now);
   const symbol = String(input.symbol || '').toUpperCase();
 
   // Build records with original index to deterministically collapse duplicates
