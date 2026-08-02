@@ -86,6 +86,8 @@ type RuntimeState = {
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
   latestBenchmarkMarketContextBySymbol?: Record<string, any>;
+  latestMultiTimeframeTechnicalIntelligenceBySymbol?: Record<string, any>;
+  latestForexSessionIntelligenceBySymbol?: Record<string, any>;
   latestAutonomousRuntimeReadiness?: any;
   latestMarketEnvironmentIntelligence?: any;
   benchmarkDataReadiness?: any;
@@ -527,6 +529,18 @@ export function sanitizeDecisionIntelligenceForState(snap: any){
     try{
       if (snap && typeof snap.marketEnvironmentIntelligence === 'object' && snap.marketEnvironmentIntelligence !== null){
         try{ const mmod = require('./market-environment-intelligence'); allowed.marketEnvironmentIntelligence = mmod.sanitizeMarketEnvironmentIntelligenceForState(snap.marketEnvironmentIntelligence); }catch(_){ allowed.marketEnvironmentIntelligence = null; }
+      }
+    }catch(_){ }
+    // include sanitized Multi-Timeframe Technical Intelligence when present (diagnostic-only)
+    try{
+      if (snap && typeof snap.multiTimeframeTechnicalIntelligence === 'object' && snap.multiTimeframeTechnicalIntelligence !== null){
+        try{ const tf = require('./multi-timeframe-technical-intelligence'); allowed.multiTimeframeTechnicalIntelligence = tf.sanitizeMultiTimeframeTechnicalIntelligenceForState(snap.multiTimeframeTechnicalIntelligence); }catch(_){ allowed.multiTimeframeTechnicalIntelligence = null; }
+      }
+    }catch(_){ }
+    // include sanitized Forex Session Intelligence when present (diagnostic-only)
+    try{
+      if (snap && typeof snap.forexSessionIntelligence === 'object' && snap.forexSessionIntelligence !== null){
+        try{ const fx = require('./forex-session-intelligence'); allowed.forexSessionIntelligence = fx.sanitizeForexSessionIntelligenceForState(snap.forexSessionIntelligence); }catch(_){ allowed.forexSessionIntelligence = null; }
       }
     }catch(_){ }
     // include sanitized market event risk context when present
@@ -1371,6 +1385,24 @@ export async function getPaperTradingState(){
       }
       out.latestCompanyNewsContextBySymbol = safeMapC;
     }catch(_){ out.latestCompanyNewsContextBySymbol = {}; }
+    // Expose latest sanitized Multi-Timeframe Technical Intelligence per symbol for UI/state
+    try{
+      const rawMapT = runtime.latestMultiTimeframeTechnicalIntelligenceBySymbol || {};
+      const safeMapT: Record<string, any> = {};
+      for (const k of Object.keys(rawMapT || {})){
+        try{ const v = (rawMapT as any)[k]; if (!v) continue; safeMapT[k] = v; }catch(_){ }
+      }
+      out.latestMultiTimeframeTechnicalIntelligenceBySymbol = safeMapT;
+    }catch(_){ out.latestMultiTimeframeTechnicalIntelligenceBySymbol = {}; }
+    // Expose latest sanitized Forex Session Intelligence per symbol for UI/state
+    try{
+      const rawMapF = runtime.latestForexSessionIntelligenceBySymbol || {};
+      const safeMapF: Record<string, any> = {};
+      for (const k of Object.keys(rawMapF || {})){
+        try{ const v = (rawMapF as Record<string, any>)[k]; if (!v) continue; safeMapF[k] = v; }catch(_){ }
+      }
+      out.latestForexSessionIntelligenceBySymbol = safeMapF;
+    }catch(_){ out.latestForexSessionIntelligenceBySymbol = {}; }
       // Expose latest sanitized Historical Market Context per symbol for UI/state
       try{
         const rawMapH = runtime.latestHistoricalMarketContextBySymbol || {};
@@ -2065,6 +2097,65 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // Per-cycle decision intelligence resolver (created once per cycle)
   let decisionIntelligenceResolver: any = null;
 
+  // Per-cycle technical intelligence resolver + forex session wiring
+  let perCycleTechnicalResolver: any = null;
+  try{
+    const tfMod = await import('./multi-timeframe-technical-intelligence');
+    perCycleTechnicalResolver = tfMod.createPerCycleTechnicalIntelligenceResolver({
+      getCandles: async (symbol: string, timeframe: any) => {
+        try{
+          const prov = getMarketDataProvider();
+          // intraday support (5min|15min)
+          if (timeframe === '5min' || timeframe === '15min'){
+            try{ if (prov && typeof (prov as any).getIntradayCandles === 'function'){ const res = await (prov as any).getIntradayCandles(String(symbol).toUpperCase(), timeframe as any, 256).catch(()=>null); return res && Array.isArray((res as any).candles) ? (res as any).candles : null; } return null; }catch(_){ return null; }
+          }
+          // daily support via historical closes when available
+          if (timeframe === '1day'){
+            try{ const prov2 = new TwelveDataMarketDataProvider(); const hist = await prov2.getHistoricalDailyCloses(String(symbol).toUpperCase(), 128).catch(()=>null); if (!hist || !Array.isArray(hist.closes)) return null; const dates = Array.isArray(hist.dates) ? hist.dates : []; const candles = hist.closes.map((c:any,i:number)=> ({ timestamp: (dates[i] || (typeof c === 'number' ? new Date().toISOString().slice(0,10) : new Date().toISOString())), open: c, high: c, low: c, close: c, volume: (hist.volumes && Array.isArray(hist.volumes) && typeof hist.volumes[i] === 'number') ? hist.volumes[i] : null })); return candles;
+            }catch(_){ return null; }
+          }
+        }catch(_){ }
+        return null;
+      },
+      updateState: (s:string, snap:any) => { try{ runtime.latestMultiTimeframeTechnicalIntelligenceBySymbol = runtime.latestMultiTimeframeTechnicalIntelligenceBySymbol || {}; try{ runtime.latestMultiTimeframeTechnicalIntelligenceBySymbol[String(s).toUpperCase()] = tfMod.sanitizeMultiTimeframeTechnicalIntelligenceForState(snap); }catch(_){ runtime.latestMultiTimeframeTechnicalIntelligenceBySymbol[String(s).toUpperCase()] = snap; } }catch(_){ } }
+    });
+    try{ perCycleTechnicalResolver.build && perCycleTechnicalResolver.buildOnce && perCycleTechnicalResolver.buildOnce().catch(()=>{}); }catch(_){ }
+  }catch(_){ perCycleTechnicalResolver = null; }
+
+  // Prime per-symbol technical + forex builds (best-effort, do not await)
+  try{
+    if (Array.isArray(symbols) && symbols.length > 0){
+      for (const sym of symbols){
+        try{
+          const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find((i:any)=> String(i.providerSymbol||i.id||i.symbol||'').toUpperCase() === String(sym).toUpperCase()) : undefined;
+          const assetType = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
+          // Trigger MTTI build (deduped per-cycle)
+          try{ if (perCycleTechnicalResolver && typeof perCycleTechnicalResolver.build === 'function') perCycleTechnicalResolver.build(String(sym).toUpperCase(), assetType).catch(()=>{}); }catch(_){ }
+          // For FOREX-like instruments also build forex session intelligence (best-effort)
+          if (assetType !== 'STOCK'){
+            try{
+              const fxMod = await import('./forex-session-intelligence');
+              (async ()=>{
+                try{
+                    // Build candles for daily via TwelveData provider when possible
+                    let candles: any[] | null = null;
+                    try{ const prov2 = new TwelveDataMarketDataProvider(); const hist = await prov2.getHistoricalDailyCloses(String(sym).toUpperCase(), 128).catch(()=>null); if (hist && Array.isArray(hist.closes)){
+                      const dates = Array.isArray(hist.dates) ? hist.dates : [];
+                      candles = hist.closes.map((c:any,i:number)=> ({ timestamp: (dates[i] || new Date().toISOString()), open: c, high: c, low: c, close: c, volume: (hist.volumes && Array.isArray(hist.volumes) && typeof hist.volumes[i] === 'number') ? hist.volumes[i] : null }));
+                    } }
+                    catch(_){ candles = null; }
+                    const snap = fxMod.buildForexSessionIntelligence({ symbol: String(sym).toUpperCase(), candles: Array.isArray(candles) ? candles : undefined, now: new Date() });
+                    try{ /* Audits for forex session snapshots are skipped in this milestone to avoid unsafe casts; runtime state updated below. */ }catch(_){ }
+                    try{ runtime.latestForexSessionIntelligenceBySymbol = runtime.latestForexSessionIntelligenceBySymbol || {}; runtime.latestForexSessionIntelligenceBySymbol[String(sym).toUpperCase()] = snap ? fxMod.sanitizeForexSessionIntelligenceForState(snap) : null; }catch(_){ }
+                }catch(_){ }
+              })();
+            }catch(_){ }
+          }
+        }catch(_){ }
+      }
+    }
+  }catch(_){ }
+
   // Helper: build or return cached confluence summary for a symbol
   async function getOrBuildConfluence(symbol: string, marketSignals: any, ts?: string){
     const sym = String(symbol).toUpperCase();
@@ -2209,6 +2300,20 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       }catch(_){ }
     }, getMarketEnvironmentIntelligence: async ()=>{
       try{ if (meiResolver && typeof meiResolver.buildOnce === 'function'){ return await meiResolver.buildOnce().catch(()=>null); } return null; }catch(_){ return null; }
+    },
+    getMultiTimeframeTechnicalIntelligence: async (s?: string) => {
+      try{
+        if (!s) return null;
+        const sym = String(s).toUpperCase();
+        if (!perCycleTechnicalResolver || !perCycleTechnicalResolver.cache) return null;
+        const cache = perCycleTechnicalResolver.cache as Map<string, Promise<any>>;
+        const keys = [`${sym}|FOREX`, `${sym}|STOCK`, `${sym}|`];
+        for (const k of keys){ if (cache.has(k)){ try{ return await (cache.get(k) as Promise<any>).catch(()=>null); }catch(_){ return null; } } }
+        return null;
+      }catch(_){ return null; }
+    },
+    getForexSessionIntelligence: async (s?: string) => {
+      try{ const sym = String(s||'').toUpperCase(); if (!sym) return null; return (runtime.latestForexSessionIntelligenceBySymbol && runtime.latestForexSessionIntelligenceBySymbol[sym]) ? runtime.latestForexSessionIntelligenceBySymbol[sym] : null; }catch(_){ return null; }
     } });
   }catch(_){ decisionIntelligenceResolver = null; }
 

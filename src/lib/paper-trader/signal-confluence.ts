@@ -296,6 +296,8 @@ export type DecisionIntelligenceSnapshot = {
   companyNewsContext?: import('./company-news-context').CompanyNewsContext | null;
   marketEventRiskContext?: import('./market-event-risk-context').MarketEventRiskContext | null;
   marketEnvironmentIntelligence?: import('./market-environment-intelligence').MarketEnvironmentIntelligence | null;
+  multiTimeframeTechnicalIntelligence?: import('./multi-timeframe-technical-intelligence').MultiTimeframeTechnicalIntelligence | null;
+  forexSessionIntelligence?: import('./forex-session-intelligence').ForexSessionIntelligence | null;
 };
 
 // Market context diagnostics block added for decision intelligence (diagnostic-only)
@@ -446,7 +448,7 @@ export function buildDecisionIntelligenceSnapshot(opts: { cycleId: string; summa
   return snap;
 }
 
-export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: string; generatedAt?: string; buildSummary: (symbol: string, marketSignals?: MarketSignalsPackage) => Promise<SignalConfluenceSummary | null>; buildQuality?: (summary: SignalConfluenceSummary) => AnalysisQualitySummary; buildReasoning?: (summary: SignalConfluenceSummary) => string[]; appendAudit?: (payload: DecisionIntelligenceSnapshot) => Promise<void>; getMarketEnvironmentIntelligence?: ()=>Promise<any> | null }){
+export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: string; generatedAt?: string; buildSummary: (symbol: string, marketSignals?: MarketSignalsPackage) => Promise<SignalConfluenceSummary | null>; buildQuality?: (summary: SignalConfluenceSummary) => AnalysisQualitySummary; buildReasoning?: (summary: SignalConfluenceSummary) => string[]; appendAudit?: (payload: DecisionIntelligenceSnapshot) => Promise<void>; getMarketEnvironmentIntelligence?: (symbol?: string)=>Promise<any> | null; getMultiTimeframeTechnicalIntelligence?: (symbol?: string)=>Promise<any> | null; getForexSessionIntelligence?: (symbol?: string)=>Promise<any> | null }){
   const cycleId = opts.cycleId;
   const generatedAt = opts.generatedAt || new Date().toISOString();
   const buildQualityFn = opts.buildQuality || ((s)=> buildAnalysisQualitySummary(s));
@@ -526,6 +528,32 @@ export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: stri
           (snap as any).marketEnvironmentIntelligence = null;
         }
       }catch(_){ (snap as any).marketEnvironmentIntelligence = null; }
+      // Attach per-cycle Multi-Timeframe Technical Intelligence snapshot (diagnostic-only) when available
+      try{
+        if (typeof opts.getMultiTimeframeTechnicalIntelligence === 'function'){
+          try{
+            const maybe = opts.getMultiTimeframeTechnicalIntelligence(sym);
+            let mtti: any = null;
+            if (maybe && typeof (maybe as any).then === 'function') mtti = await (maybe as Promise<any>).catch(()=>null);
+            else mtti = maybe || null;
+            if (mtti){ try{ const tfMod = await import('./multi-timeframe-technical-intelligence'); (snap as any).multiTimeframeTechnicalIntelligence = tfMod.sanitizeMultiTimeframeTechnicalIntelligenceForState(mtti); }catch(_){ (snap as any).multiTimeframeTechnicalIntelligence = null; } }
+            else { (snap as any).multiTimeframeTechnicalIntelligence = null; }
+          }catch(_){ (snap as any).multiTimeframeTechnicalIntelligence = null; }
+        } else { (snap as any).multiTimeframeTechnicalIntelligence = null; }
+      }catch(_){ (snap as any).multiTimeframeTechnicalIntelligence = null; }
+      // Attach per-cycle Forex Session Intelligence snapshot (diagnostic-only) when available
+      try{
+        if (typeof opts.getForexSessionIntelligence === 'function'){
+          try{
+            const maybe = opts.getForexSessionIntelligence(sym);
+            let fx: any = null;
+            if (maybe && typeof (maybe as any).then === 'function') fx = await (maybe as Promise<any>).catch(()=>null);
+            else fx = maybe || null;
+            if (fx){ try{ const fxMod = await import('./forex-session-intelligence'); (snap as any).forexSessionIntelligence = fxMod.sanitizeForexSessionIntelligenceForState(fx); }catch(_){ (snap as any).forexSessionIntelligence = null; } }
+            else { (snap as any).forexSessionIntelligence = null; }
+          }catch(_){ (snap as any).forexSessionIntelligence = null; }
+        } else { (snap as any).forexSessionIntelligence = null; }
+      }catch(_){ (snap as any).forexSessionIntelligence = null; }
       if (appendAuditFn && !auditAppended.has(sym)){
         try{ await appendAuditFn(snap); auditAppended.add(sym); }catch(_){ }
       }
