@@ -30,6 +30,7 @@ import type { EvidenceInformedDecision } from './evidence-informed-decision-poli
 import type { HistoricalContext } from './historical-context-engine';
 import evaluateShadowDecisionOutcome from './shadow-decision-outcome-evaluator';
 import aggregateShadowDecisionPerformance from './shadow-decision-performance-aggregator';
+import { createPerCycleContextAwareShadowResolver, sanitizeContextAwareShadowDecisionForState } from './context-aware-shadow-decision';
 import { TRADABLE_INSTRUMENTS } from '../market-data/instruments';
 import { TwelveDataMarketDataProvider } from '../market-data/twelve-data';
 import { getForexSessionDiagnostics } from '../forex-market';
@@ -405,6 +406,31 @@ export function sanitizeDecisionIntelligenceForState(snap: any){
       schemaVersion: snap.schemaVersion || null,
       source: snap.source || null
     };
+    // include sanitized shadow decision when present
+    try{
+      if (snap && typeof snap.contextAwareShadowDecision === 'object' && snap.contextAwareShadowDecision !== null){
+        const s = snap.contextAwareShadowDecision as any;
+        const sanitizedShadow: any = {
+          schemaVersion: s.schemaVersion || null,
+          source: s.source || null,
+          symbol: s.symbol || null,
+          observedAt: s.observedAt || null,
+          generatedAt: s.generatedAt || null,
+          actualAction: s.actualAction || null,
+          actualConfidence: typeof s.actualConfidence === 'number' ? s.actualConfidence : null,
+          shadowAction: s.shadowAction || null,
+          shadowConfidence: typeof s.shadowConfidence === 'number' ? s.shadowConfidence : null,
+          actionChanged: !!s.actionChanged,
+          confidenceDelta: typeof s.confidenceDelta === 'number' ? s.confidenceDelta : null,
+          contextAlignment: s.contextAlignment || null,
+          intervention: s.intervention || null,
+          supportingReasons: Array.isArray(s.supportingReasons) ? s.supportingReasons.slice(0,5) : [],
+          conflictingReasons: Array.isArray(s.conflictingReasons) ? s.conflictingReasons.slice(0,5) : [],
+          warnings: Array.isArray(s.warnings) ? s.warnings.slice(0,5) : []
+        };
+        allowed.contextAwareShadowDecision = sanitizedShadow;
+      }
+    }catch(_){ }
     return allowed;
   }catch(_){ return null; }
 }
@@ -1804,6 +1830,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   const confluenceBySymbol = new Map<string, Promise<any>>();
   // Per-cycle cache for market regime intelligence (build from per-cycle historical context when needed)
   const marketRegimeIntelligenceBySymbol = new Map<string, Promise<any>>();
+  // Per-cycle cache for context-aware shadow decision
+  const contextAwareShadowDecisionBySymbol = new Map<string, Promise<any>>();
   // Track pending candidate action for symbol during per-symbol processing so appendAudit can use it
   const pendingDecisionActionBySymbol = new Map<string, 'BUY'|'SELL'|'HOLD'|'UNKNOWN'>();
   // Per-cycle cache for fundamental intelligence packages (used by resolver)
@@ -1933,6 +1961,15 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       }catch(_){ }
     } });
   }catch(_){ decisionIntelligenceResolver = null; }
+
+  // Create per-cycle shadow resolver using per-cycle getters and diagnostics builder
+  const contextAwareShadowResolver = createPerCycleContextAwareShadowResolver({
+    getHistoricalSnapshot: async (s:string) => { try{ if (historicalMarketContextBySymbol.has(s)) return await (historicalMarketContextBySymbol.get(s) as Promise<any>).catch(()=>null); return null; }catch(_){ return null; } },
+    getMarketRegimeSnapshot: async (s:string) => { try{ if (marketRegimeIntelligenceBySymbol.has(s)) return await (marketRegimeIntelligenceBySymbol.get(s) as Promise<any>).catch(()=>null); return null; }catch(_){ return null; } },
+    buildDiagnostics: ({ action, confidence, historicalContext, marketRegime }: any) => {
+      try{ const qc = require('./signal-confluence'); return qc.buildDecisionMarketContextDiagnostics({ action: action || 'UNKNOWN', confidence: typeof confidence === 'number' ? confidence : null, historicalContext: historicalContext || null, marketRegime: marketRegime || null }); }catch(_){ return null; }
+    }
+  });
 
   // Build (once per symbol per cycle) the ordered list of signals to append.
   async function buildSignalsForSymbol(opts: { symbol: string; instEntry?: any; instruments?: any[]; prices?: number[]; volumes?: number[]; techMeta?: any; sectorSummaries?: any; macros?: any[] }){
@@ -2195,6 +2232,22 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             }catch(_){ }
 
             candidates.push(cand);
+            try{
+              // Build and attach context-aware shadow decision for this candidate (diagnostic-only)
+              (async ()=>{
+                try{
+                  const symU = String(symbol||'').toUpperCase(); if (!symU) return;
+                  const shadow = await contextAwareShadowResolver.resolve({ symbol: symU, actualAction: cand.action, actualConfidence: cand.confidence });
+                  const sanitizedShadow = sanitizeContextAwareShadowDecisionForState(shadow);
+                  try{
+                    runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {};
+                    const existing = runtime.latestDecisionIntelligenceBySymbol[symU] || null;
+                    if (existing && typeof existing === 'object') runtime.latestDecisionIntelligenceBySymbol[symU] = Object.assign({}, existing, { contextAwareShadowDecision: sanitizedShadow });
+                    else runtime.latestDecisionIntelligenceBySymbol[symU] = { symbol: symU, contextAwareShadowDecision: sanitizedShadow };
+                  }catch(_){ }
+                }catch(_){ }
+              })();
+            }catch(_){ }
             try{ const d2 = ensureDiag(symbol); d2.decision = cand.action; d2.signal = d2.signal || 'SELL'; d2.confidence = typeof cand.confidence === 'number' ? cand.confidence : d2.confidence; }catch(_){ }
           }catch(e:any){
             // On decision engine error: append a REJECT audit and skip this candidate
@@ -2414,6 +2467,16 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             try{ (cand as any).marketRegime = classifyMarketRegime({ trendStrength, momentum, volatility, priceVsMovingAverage, volumeStrength }); }catch(_){ }
           }catch(_){ }
           candidates.push(cand);
+          try{
+            (async ()=>{
+              try{
+                const symU = String(s||'').toUpperCase(); if (!symU) return;
+                const shadow = await contextAwareShadowResolver.resolve({ symbol: symU, actualAction: cand.action, actualConfidence: cand.confidence });
+                const sanitizedShadow = sanitizeContextAwareShadowDecisionForState(shadow);
+                try{ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; const existing = runtime.latestDecisionIntelligenceBySymbol[symU] || null; if (existing && typeof existing === 'object') runtime.latestDecisionIntelligenceBySymbol[symU] = Object.assign({}, existing, { contextAwareShadowDecision: sanitizedShadow }); else runtime.latestDecisionIntelligenceBySymbol[symU] = { symbol: symU, contextAwareShadowDecision: sanitizedShadow }; }catch(_){ }
+              }catch(_){ }
+            })();
+          }catch(_){ }
           try{ const d4 = ensureDiag(s); d4.decision = 'BUY'; d4.signal = d4.signal || 'BUY_CANDIDATE'; d4.confidence = typeof cand.confidence === 'number' ? cand.confidence : d4.confidence; d4.quoteFound = !!q; d4.quoteAgeSeconds = getQuoteAgeSeconds(q); }catch(_){ }
         }catch(e:any){
           // On decision engine error: append a REJECT audit and skip this candidate

@@ -291,6 +291,8 @@ export type DecisionIntelligenceSnapshot = {
   reasoning: string[];
   schemaVersion?: number;
   source?: string;
+  // Optional diagnostic-only shadow decision (sanitized)
+  contextAwareShadowDecision?: import('./context-aware-shadow-decision').ContextAwareShadowDecision | null;
 };
 
 // Market context diagnostics block added for decision intelligence (diagnostic-only)
