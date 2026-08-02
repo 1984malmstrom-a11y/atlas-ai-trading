@@ -75,6 +75,8 @@ type RuntimeState = {
   latestDecisionIntelligenceBySymbol?: Record<string, any>;
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
   latestCompanyNewsContextBySymbol?: Record<string, any>;
+  latestEarningsEventContextBySymbol?: Record<string, any>;
+  latestMarketEventRiskContextBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
@@ -506,6 +508,12 @@ export function sanitizeDecisionIntelligenceForState(snap: any){
     try{
       if (snap && typeof snap.companyNewsContext === 'object' && snap.companyNewsContext !== null){
         try{ const cmod = require('./company-news-context'); allowed.companyNewsContext = cmod.sanitizeCompanyNewsContextForState(snap.companyNewsContext); }catch(_){ allowed.companyNewsContext = null; }
+      }
+    }catch(_){ }
+    // include sanitized market event risk context when present
+    try{
+      if (snap && typeof snap.marketEventRiskContext === 'object' && snap.marketEventRiskContext !== null){
+        try{ const mmod = require('./market-event-risk-context'); allowed.marketEventRiskContext = mmod.sanitizeMarketEventRiskContextForState(snap.marketEventRiskContext); }catch(_){ allowed.marketEventRiskContext = null; }
       }
     }catch(_){ }
     return allowed;
@@ -1967,6 +1975,15 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     updateState: (s:string, r:any) => { try{ runtime.latestCompanyNewsContextBySymbol = runtime.latestCompanyNewsContextBySymbol || {}; runtime.latestCompanyNewsContextBySymbol[String(s).toUpperCase()] = r; }catch(_){ } }
   });
 
+  // Per-cycle earnings resolver: lazy Twelve Data earnings per STOCK symbol
+  const perCycleEarningsResolver = ((): any => {
+    try{
+      const mod = require('./earnings-event-context');
+      const td = require('../market-data/twelve-data');
+      return mod.createPerCycleEarningsResolver({ fetchEarnings: async ({ symbol }: any) => await td.fetchEarnings(symbol).catch(()=>null), instruments: TRADABLE_INSTRUMENTS, timeoutMs: 4000, updateState: (s:string, r:any) => { try{ runtime.latestEarningsEventContextBySymbol = runtime.latestEarningsEventContextBySymbol || {}; runtime.latestEarningsEventContextBySymbol[String(s).toUpperCase()] = r; }catch(_){ } } });
+    }catch(_){ return null; }
+  })();
+
   // Per-cycle decision intelligence resolver (created once per cycle)
   let decisionIntelligenceResolver: any = null;
 
@@ -2049,6 +2066,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                 try{ (primary as any).companyNewsContext = sanitizeCompanyNewsContextForState(cctx); }catch(_){ (primary as any).companyNewsContext = null; }
               }
             }catch(_){ try{ (primary as any).companyNewsContext = null; }catch(_){ } }
+            // Attach sanitized market event risk context (diagnostic-only) when available via per-cycle earnings resolver
+            try{
+              if (sym && typeof perCycleEarningsResolver !== 'undefined' && perCycleEarningsResolver){
+                const ectx = await perCycleEarningsResolver.resolve({ symbol: sym, analyzed: true }).catch(()=>null);
+                try{
+                  const merMod = require('./market-event-risk-context');
+                  const mer = merMod.buildMarketEventRiskContext({ symbol: sym, earnings: ectx, macro: null, now: new Date() });
+                  try{ (primary as any).marketEventRiskContext = merMod.sanitizeMarketEventRiskContextForState(mer); }catch(_){ (primary as any).marketEventRiskContext = null; }
+                  try{ runtime.latestMarketEventRiskContextBySymbol = runtime.latestMarketEventRiskContextBySymbol || {}; runtime.latestMarketEventRiskContextBySymbol[sym] = merMod.sanitizeMarketEventRiskContextForState(mer); }catch(_){ }
+                }catch(_){ try{ (primary as any).marketEventRiskContext = null; }catch(_){ } }
+              }
+            }catch(_){ try{ (primary as any).marketEventRiskContext = null; }catch(_){ } }
             await cycleAuditStore.append(primary);
           }catch(_){ }
           try{ if (sym){ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; runtime.latestDecisionIntelligenceBySymbol[sym] = sanitizeDecisionIntelligenceForState(primary); } }catch(_){ }

@@ -294,6 +294,7 @@ export type DecisionIntelligenceSnapshot = {
   // Optional diagnostic-only shadow decision (sanitized)
   contextAwareShadowDecision?: import('./context-aware-shadow-decision').ContextAwareShadowDecision | null;
   companyNewsContext?: import('./company-news-context').CompanyNewsContext | null;
+  marketEventRiskContext?: import('./market-event-risk-context').MarketEventRiskContext | null;
 };
 
 // Market context diagnostics block added for decision intelligence (diagnostic-only)
