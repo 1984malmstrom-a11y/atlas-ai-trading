@@ -138,6 +138,13 @@ export function buildCurrentExternalIntelligenceReadiness(opts?: { env?: NodeJS.
   try{ const ms = require('./macro-signals'); if (ms && typeof ms.getMacroIndicatorRegistry === 'function'){ const reg = ms.getMacroIndicatorRegistry(env); if (Array.isArray(reg) && reg.some((r:any)=> r && r.enabled === true)) macroConfig = true; } }catch(_){ macroConfig = false; }
 
   const capabilities = { finnhub: !!finnhub, macroConfig: !!macroConfig, fundamentals: !!fundamentals };
+  // Detect analyst estimates availability from runtime snapshot when present
+  try{
+    const analystAvailable = Boolean(runtime && runtime.latestAnalystConsensusContextBySymbol && Object.keys(runtime.latestAnalystConsensusContextBySymbol || {}).some(k => {
+      try{ const v = (runtime.latestAnalystConsensusContextBySymbol as any)[k]; return v && v.consensus && v.consensus !== 'UNKNOWN' && v.dataQuality && v.dataQuality !== 'INSUFFICIENT'; }catch(_){ return false; }
+    }));
+    (capabilities as any).analystEstimates = analystAvailable;
+  }catch(_){ (capabilities as any).analystEstimates = false; }
 
   const runtimeUsage = {
     companyNewsRuntime: Boolean(runtime.latestCompanyNewsContextBySymbol && Object.keys(runtime.latestCompanyNewsContextBySymbol || {}).length > 0) || Boolean(runtime.latestMarketNewsActivity),
@@ -146,6 +153,8 @@ export function buildCurrentExternalIntelligenceReadiness(opts?: { env?: NodeJS.
     macroDI: Boolean(runtime.latestDecisionIntelligenceBySymbol && Object.keys(runtime.latestDecisionIntelligenceBySymbol || {}).length > 0),
     fundamentalsRuntime: Boolean(runtime.latestFundamentalIntelligenceBySymbol && Object.keys(runtime.latestFundamentalIntelligenceBySymbol || {}).length > 0),
     fundamentalsDI: Boolean(runtime.latestDecisionIntelligenceBySymbol && Object.keys(runtime.latestDecisionIntelligenceBySymbol || {}).length > 0),
+    analystRuntime: Boolean(runtime.latestAnalystConsensusContextBySymbol && Object.keys(runtime.latestAnalystConsensusContextBySymbol || {}).length > 0),
+    analystDI: Boolean(runtime.latestDecisionIntelligenceBySymbol && Object.keys(runtime.latestDecisionIntelligenceBySymbol || {}).length > 0 && (capabilities as any).analystEstimates === true),
   };
 
   return buildExternalIntelligenceReadiness({ capabilities, runtimeUsage, now: opts && opts.env && opts.env['NOW'] ? new Date(String(opts.env['NOW'])) : new Date() });

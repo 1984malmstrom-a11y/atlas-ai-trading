@@ -79,6 +79,9 @@ type RuntimeState = {
   latestEarningsEventContextBySymbol?: Record<string, any>;
   latestMarketEventRiskContextBySymbol?: Record<string, any>;
   latestMacroEventContext?: Record<string, any>;
+  latestAnalystConsensusContextBySymbol?: Record<string, any>;
+  latestFinancialHealthContextBySymbol?: Record<string, any>;
+  latestExternalFundamentalContextBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
@@ -510,6 +513,12 @@ export function sanitizeDecisionIntelligenceForState(snap: any){
     try{
       if (snap && typeof snap.companyNewsContext === 'object' && snap.companyNewsContext !== null){
         try{ const cmod = require('./company-news-context'); allowed.companyNewsContext = cmod.sanitizeCompanyNewsContextForState(snap.companyNewsContext); }catch(_){ allowed.companyNewsContext = null; }
+      }
+    }catch(_){ }
+    // include sanitized external fundamental context when present
+    try{
+      if (snap && typeof snap.externalFundamentalContext === 'object' && snap.externalFundamentalContext !== null){
+        try{ const emod = require('./external-fundamental-context'); allowed.externalFundamentalContext = emod.sanitizeExternalFundamentalContextForState(snap.externalFundamentalContext); }catch(_){ allowed.externalFundamentalContext = null; }
       }
     }catch(_){ }
     // include sanitized market event risk context when present
@@ -1961,6 +1970,23 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // Per-cycle cache for fundamental intelligence packages (used by resolver)
   const fundamentalBySymbol = new Map<string, Promise<any>>();
   const perCycleFundResolver = createPerCycleFundamentalResolver({ fetchFundamental: async ({ symbol }: any) => await fetchAndBuildFundamentalIntelligence({ symbol, now: new Date().toISOString() }).catch(()=>null), instruments: TRADABLE_INSTRUMENTS, timeoutMs: 3000, appendAudit: async (res:any) => {/* noop here, append below */}, updateState: (s:string, r:any) => { try{ runtime.latestFundamentalIntelligenceBySymbol = runtime.latestFundamentalIntelligenceBySymbol || {}; runtime.latestFundamentalIntelligenceBySymbol[s] = { snapshot: r.snapshot, quality: r.quality }; }catch(_){ } } });
+
+  // Expose per-cycle external fundamental builder helpers using the existing per-cycle resolver
+  const { buildExternalFundamentalContext } = await (async ()=>{
+    try{ return await import('./external-fundamental-context'); }catch(_){ return { buildExternalFundamentalContext: null }; }
+  })();
+
+  async function buildAndUpdateExternalFundamental(symbol: string){
+    try{
+      if (!buildExternalFundamentalContext) return null;
+      const fund = await perCycleFundResolver.resolve({ symbol, analyzed: true }).catch(()=>null);
+      // build using local snapshot fetcher when available
+      const fetcher = async ({ symbol: s }: any) => { return fund || await fetchAndBuildFundamentalIntelligence({ symbol: s, now: new Date().toISOString() }).catch(()=>null); };
+      const ctx = await buildExternalFundamentalContext({ symbol, fetchFundamental: fetcher, now: new Date() }).catch(()=>null);
+      try{ runtime.latestAnalystConsensusContextBySymbol = runtime.latestAnalystConsensusContextBySymbol || {}; runtime.latestFinancialHealthContextBySymbol = runtime.latestFinancialHealthContextBySymbol || {}; runtime.latestExternalFundamentalContextBySymbol = runtime.latestExternalFundamentalContextBySymbol || {}; if (ctx){ runtime.latestAnalystConsensusContextBySymbol[symbol] = ctx.analystConsensus; runtime.latestFinancialHealthContextBySymbol[symbol] = ctx.financialHealth; runtime.latestExternalFundamentalContextBySymbol[symbol] = ctx; } }catch(_){ }
+      return ctx;
+    }catch(e){ return null; }
+  }
 
   // Per-cycle company news resolver: lazy Finnhub fetch per STOCK symbol
   const perCycleCompanyNewsResolver = createPerCycleCompanyNewsResolver({
