@@ -129,6 +129,56 @@ export function getWatchlistSymbols(eligibleInstruments: any[], watchlist = DEFA
   }catch(_){ return []; }
 }
 
+// Build the automatic analysis universe: preserve stock watchlist behavior and
+// additionally include eligible FOREX instruments (market-data-enabled and
+// enabled) when the Forex session is OPEN. This function only controls which
+// symbols are analyzed; execution eligibility is still gated by tradingEnabled
+// and launch-control elsewhere.
+export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: Date, watchlist = DEFAULT_WATCHLIST){
+  try{
+    if (!Array.isArray(eligibleInstruments)) return [];
+    const out: string[] = [];
+    // Start with the usual watchlist intersection (preserves existing behavior)
+    const wl = getWatchlistSymbols(eligibleInstruments, watchlist) || [];
+    for (const s of wl) out.push(String(s).toUpperCase());
+
+    // Add eligible FOREX instruments when session is open
+    let sessionOpen = false;
+    try{ const diag = getForexSessionDiagnostics(now instanceof Date ? now : new Date()); sessionOpen = diag && diag.status === 'OPEN'; }catch(_){ sessionOpen = false; }
+
+    if (sessionOpen){
+      const seen = new Set(out.map(s=> String(s||'').toUpperCase()));
+      const forexCandidates: string[] = [];
+      for (const inst of eligibleInstruments){
+        try{
+          const type = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
+          if (type !== 'FOREX') continue;
+          const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
+          if (!enabled) continue;
+          if (inst.enabled === false) continue;
+          const prov = String(inst.providerSymbol || inst.id || '').toUpperCase();
+          if (!prov) continue;
+          // normalize simple alphanumeric key for dedupe stability
+          const key = prov.replace(/[^A-Z0-9]/g,'');
+          if (!key) continue;
+          // append providerSymbol (preserve slash) but dedupe by normalized key
+          if (seen.has(prov) || forexCandidates.map(x=>x.replace(/[^A-Z0-9]/g,'')).includes(key)) continue;
+          forexCandidates.push(prov);
+        }catch(_){ }
+      }
+      // stable order: sort forexCandidates by normalized key
+      forexCandidates.sort((a,b)=> a.replace(/[^A-Z0-9]/g,'').localeCompare(b.replace(/[^A-Z0-9]/g,'')));
+      for (const s of forexCandidates) out.push(s);
+    }
+
+    // Final dedupe while preserving order
+    const final: string[] = [];
+    const seen2 = new Set<string>();
+    for (const s of out){ const u = String(s||'').toUpperCase(); if (!seen2.has(u)){ seen2.add(u); final.push(s); } }
+    return final;
+  }catch(_){ return getWatchlistSymbols(eligibleInstruments, watchlist); }
+}
+
 // Small helper exposed for diagnostics: returns forex session status for a given instant.
 export function forexSessionStatus(now?: Date){
   try{ return getForexSessionDiagnostics(now instanceof Date ? now : new Date()); }catch(e){ return { status: 'INVALID_DATE' }; }
