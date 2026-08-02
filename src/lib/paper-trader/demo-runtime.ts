@@ -87,6 +87,7 @@ type RuntimeState = {
   latestIntradayMarketContextBySymbol?: Record<string, any>;
   latestBenchmarkMarketContextBySymbol?: Record<string, any>;
   latestAutonomousRuntimeReadiness?: any;
+  latestMarketEnvironmentIntelligence?: any;
   benchmarkDataReadiness?: any;
   externalIntelligenceReadiness?: any;
   forexReadiness?: ForexReadinessState | null;
@@ -520,6 +521,12 @@ export function sanitizeDecisionIntelligenceForState(snap: any){
     try{
       if (snap && typeof snap.externalFundamentalContext === 'object' && snap.externalFundamentalContext !== null){
         try{ const emod = require('./external-fundamental-context'); allowed.externalFundamentalContext = emod.sanitizeExternalFundamentalContextForState(snap.externalFundamentalContext); }catch(_){ allowed.externalFundamentalContext = null; }
+      }
+    }catch(_){ }
+    // include sanitized Market Environment Intelligence when present (diagnostic-only)
+    try{
+      if (snap && typeof snap.marketEnvironmentIntelligence === 'object' && snap.marketEnvironmentIntelligence !== null){
+        try{ const mmod = require('./market-environment-intelligence'); allowed.marketEnvironmentIntelligence = mmod.sanitizeMarketEnvironmentIntelligenceForState(snap.marketEnvironmentIntelligence); }catch(_){ allowed.marketEnvironmentIntelligence = null; }
       }
     }catch(_){ }
     // include sanitized market event risk context when present
@@ -1555,6 +1562,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   const suppliedCycleId = (opts && (opts as any).cycleId) ? (opts as any).cycleId : null;
   const cycleId = suppliedCycleId || `cycle_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
   const cycleStartMs = Date.now();
+  let meiResolver: any = null;
   // Helper to attach optional market news intelligence summary to a snapshot
   const attachMarketNewsSummary = (snapshot: any) => {
     try{
@@ -1801,6 +1809,29 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         }catch(_){ }
       }
     }
+  }catch(_){ }
+  // Build per-cycle benchmark resolver and MEI resolver now that intradayResolver exists
+  try{
+    let benchmarkResolver: any = null;
+    try{ benchmarkResolver = createPerCycleBenchmarkResolver({ intradayResolver: (intradayResolver as any), updateState: (s:any,r:any)=>{ try{ if (!runtime.latestBenchmarkMarketContextBySymbol) runtime.latestBenchmarkMarketContextBySymbol = {}; runtime.latestBenchmarkMarketContextBySymbol[String(s).toUpperCase()] = r; }catch(_){ } } }); }catch(_){ benchmarkResolver = null; }
+    try{
+      const meiMod = await import('./market-environment-intelligence');
+      meiResolver = meiMod.createPerCycleMarketEnvironmentResolver({
+        getIntradayContext: async (s:string) => {
+          try{ if (typeof intradayResolver !== 'undefined' && intradayResolver) return await intradayResolver.resolve({ symbol: s, interval: '15min', limit: 64 }).catch(()=>null); }catch(_){ }
+          return null;
+        },
+        getBenchmarkContext: async (s:string) => {
+          try{ const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find((i:any)=> String(i.providerSymbol||i.id||'').toUpperCase() === String(s).toUpperCase()) : undefined; if (benchmarkResolver) return await benchmarkResolver.resolve({ symbol: s, instrument: inst, analyzed: true }).catch(()=>null); }catch(_){ }
+          return null;
+        },
+        getMacroContext: async () => { return cycleMacroSnapshot || null; },
+        appendAudit: async (a:any) => { try{ await cycleAuditStore.append(a as any); }catch(_){ } },
+      updateState: (snap:any) => { try{ const mmod = require('./market-environment-intelligence'); runtime.latestMarketEnvironmentIntelligence = mmod.sanitizeMarketEnvironmentIntelligenceForState(snap); }catch(_){ try{ runtime.latestMarketEnvironmentIntelligence = snap; }catch(_){ } } },
+      cycleId: cycleId
+      });
+      try{ meiResolver.buildOnce().catch(()=>{}); }catch(_){ }
+    }catch(_){ }
   }catch(_){ }
   // Per-cycle diagnostics collected for each evaluated symbol
   const diagnosticsBySymbol = new Map<string, any>();
@@ -2176,6 +2207,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           }
         }
       }catch(_){ }
+    }, getMarketEnvironmentIntelligence: async ()=>{
+      try{ if (meiResolver && typeof meiResolver.buildOnce === 'function'){ return await meiResolver.buildOnce().catch(()=>null); } return null; }catch(_){ return null; }
     } });
   }catch(_){ decisionIntelligenceResolver = null; }
 

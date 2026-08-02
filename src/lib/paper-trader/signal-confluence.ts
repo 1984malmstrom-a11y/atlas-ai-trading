@@ -295,6 +295,7 @@ export type DecisionIntelligenceSnapshot = {
   contextAwareShadowDecision?: import('./context-aware-shadow-decision').ContextAwareShadowDecision | null;
   companyNewsContext?: import('./company-news-context').CompanyNewsContext | null;
   marketEventRiskContext?: import('./market-event-risk-context').MarketEventRiskContext | null;
+  marketEnvironmentIntelligence?: import('./market-environment-intelligence').MarketEnvironmentIntelligence | null;
 };
 
 // Market context diagnostics block added for decision intelligence (diagnostic-only)
@@ -445,7 +446,7 @@ export function buildDecisionIntelligenceSnapshot(opts: { cycleId: string; summa
   return snap;
 }
 
-export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: string; generatedAt?: string; buildSummary: (symbol: string, marketSignals?: MarketSignalsPackage) => Promise<SignalConfluenceSummary | null>; buildQuality?: (summary: SignalConfluenceSummary) => AnalysisQualitySummary; buildReasoning?: (summary: SignalConfluenceSummary) => string[]; appendAudit?: (payload: DecisionIntelligenceSnapshot) => Promise<void> }){
+export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: string; generatedAt?: string; buildSummary: (symbol: string, marketSignals?: MarketSignalsPackage) => Promise<SignalConfluenceSummary | null>; buildQuality?: (summary: SignalConfluenceSummary) => AnalysisQualitySummary; buildReasoning?: (summary: SignalConfluenceSummary) => string[]; appendAudit?: (payload: DecisionIntelligenceSnapshot) => Promise<void>; getMarketEnvironmentIntelligence?: ()=>Promise<any> | null }){
   const cycleId = opts.cycleId;
   const generatedAt = opts.generatedAt || new Date().toISOString();
   const buildQualityFn = opts.buildQuality || ((s)=> buildAnalysisQualitySummary(s));
@@ -507,6 +508,24 @@ export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: stri
           Object.keys(newSnap).forEach((k)=>{ (snap as any)[k] = (newSnap as any)[k]; });
         }
       }
+      // Attach per-cycle Market Environment Intelligence snapshot (diagnostic-only) when available
+      try{
+        if (typeof opts.getMarketEnvironmentIntelligence === 'function'){
+          try{
+            const maybe = opts.getMarketEnvironmentIntelligence();
+            let mei: any = null;
+            if (maybe && typeof (maybe as any).then === 'function'){
+              mei = await (maybe as Promise<any>).catch(()=>null);
+            } else {
+              mei = null;
+            }
+            if (mei){ try{ const mmod = await import('./market-environment-intelligence'); (snap as any).marketEnvironmentIntelligence = mmod.sanitizeMarketEnvironmentIntelligenceForState(mei); }catch(_){ (snap as any).marketEnvironmentIntelligence = null; } }
+            else { (snap as any).marketEnvironmentIntelligence = null; }
+          }catch(_){ (snap as any).marketEnvironmentIntelligence = null; }
+        } else {
+          (snap as any).marketEnvironmentIntelligence = null;
+        }
+      }catch(_){ (snap as any).marketEnvironmentIntelligence = null; }
       if (appendAuditFn && !auditAppended.has(sym)){
         try{ await appendAuditFn(snap); auditAppended.add(sym); }catch(_){ }
       }
