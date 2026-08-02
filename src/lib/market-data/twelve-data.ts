@@ -2,9 +2,11 @@
 import path from 'path';
 import type { MarketDataProvider, MarketQuote } from './types';
 import { TRADABLE_INSTRUMENTS, findInstrumentById } from './instruments';
-import fs from 'fs';
+// Avoid static `fs` import which breaks client-side bundling in Next.
+// Resolve `fs` at runtime only when running on the server.
 const _so = 'server' + '-only';
 void import(_so).catch(()=>{});
+// Diagnostics file I/O is handled by a server-only helper to avoid client bundling.
 
   // Get FX rate from `fromCurrency` to SEK. Returns positive finite number or null on failure.
 
@@ -722,11 +724,14 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
         try{
           if (String(instrumentId).toLowerCase() === 'nvidia' || String(providerSymbol).toUpperCase() === 'NVDA'){
             const diag = Object.assign({}, diagBase, { httpStatus, providerErrorCode, providerErrorMessage, responseFieldNames, rawPriceValue, parsedPrice, rawTimestampValue, parsedTimestamp, timestampUnitDetected, quoteAgeSeconds, stale: !!stale, instrumentId, finalRuntimeKey, accepted });
-            const outPath = path.join(process.cwd(),'src','data','twelve-diagnostics.json');
-            let cur: any[] = [];
-            try{ if (fs.existsSync(outPath)){ const raw = fs.readFileSync(outPath,'utf8'); cur = JSON.parse(raw || '[]'); if (!Array.isArray(cur)) cur = []; } }catch(e){ cur = []; }
-            cur.push(diag);
-            try{ fs.writeFileSync(outPath, JSON.stringify(cur.slice(-200), null, 2), 'utf8'); }catch(e){}
+            if (typeof window === 'undefined'){
+              try{
+                const mod = await import('./twelve-diagnostics-store.server');
+                await mod.appendTwelveDiagnostic(diag);
+              }catch(e){
+                // keep provider behavior unchanged if diagnostics fail
+              }
+            }
           }
         }catch(e){}
 

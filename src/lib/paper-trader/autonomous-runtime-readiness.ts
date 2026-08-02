@@ -30,7 +30,7 @@ function finiteOrNull(n: any){ try{ const v = Number(n); if (!Number.isFinite(v)
 
 function dedupeLimit(arr: string[]){ const seen = new Set<string>(); const out: string[] = []; for (const a of arr || []){ const s = String(a || '').trim(); if (!s) continue; if (seen.has(s)) continue; seen.add(s); out.push(s); if (out.length >= 10) break; } return out; }
 
-export async function buildAutonomousRuntimeReadiness(opts?: { now?: Date, runtimeSnapshot?: any }){
+export async function buildAutonomousRuntimeReadiness(opts?: { now?: Date, runtimeSnapshot?: any, portfolioSnapshot?: any }){
   const now = opts && opts.now ? opts.now : new Date();
   const sched = getSchedulerState();
   const runtimeSnapshot = opts && opts.runtimeSnapshot ? opts.runtimeSnapshot : null;
@@ -64,7 +64,9 @@ export async function buildAutonomousRuntimeReadiness(opts?: { now?: Date, runti
 
   const automaticTradingEnabled = !!(runtimeSnapshot && runtimeSnapshot.autonomousEnabled);
   const launchControlStatus = runtimeSnapshot && runtimeSnapshot.forexLaunchControl ? (runtimeSnapshot.forexLaunchControl.isSafeToStartCycle ? 'OK' : 'BLOCKED') : null;
-  const portfolioAvailable = runtimeSnapshot ? Array.isArray(runtimeSnapshot.holdings) : false;
+  // Determine portfolio availability from an explicit portfolio snapshot when provided
+  const portfolioSnapshot = opts && opts.portfolioSnapshot ? opts.portfolioSnapshot : null;
+  const portfolioAvailable = Array.isArray((portfolioSnapshot && portfolioSnapshot.holdings) ? portfolioSnapshot.holdings : (runtimeSnapshot && runtimeSnapshot.holdings) ? runtimeSnapshot.holdings : null);
 
   const blockers: string[] = [];
   const warnings: string[] = [];

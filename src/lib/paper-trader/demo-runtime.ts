@@ -1439,7 +1439,7 @@ export async function getPaperTradingState(){
   try{
     const b = require('./autonomous-runtime-readiness');
     try{
-      const built = await b.buildAutonomousRuntimeReadiness({ now: new Date(), runtimeSnapshot: runtime });
+      const built = await b.buildAutonomousRuntimeReadiness({ now: new Date(), runtimeSnapshot: runtime, portfolioSnapshot: p });
       try{ runtime.latestAutonomousRuntimeReadiness = JSON.parse(JSON.stringify(built)); }catch(_){ runtime.latestAutonomousRuntimeReadiness = built; }
       out.latestAutonomousRuntimeReadiness = runtime.latestAutonomousRuntimeReadiness ? JSON.parse(JSON.stringify(runtime.latestAutonomousRuntimeReadiness)) : null;
     }catch(e){ out.latestAutonomousRuntimeReadiness = null; }
