@@ -22,11 +22,32 @@ export type FxSekConversionResult = {
 
 function normalizeKey(s: string){ return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '_'); }
 
+// Flexible, deterministic match helper:
+// - matches by instrumentId, symbol, providerSymbol or id fields
+// - normalizes by removing separators and uppercasing (EUR/USD -> EURUSD)
+// - no fuzzy matching, no fallbacks to first quote
+function normalizeForMatch(s: string | null | undefined){ return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+
 function findQuote(quotesByCanonicalSymbol: Record<string, any>, a: string, b: string){
-  const k1 = normalizeKey(`${a}_${b}`);
-  const k2 = normalizeKey(`${a}/${b}`);
-  const k3 = normalizeKey(`${a}${b}`);
-  return quotesByCanonicalSymbol[k1] || quotesByCanonicalSymbol[k2] || quotesByCanonicalSymbol[k3] || null;
+  try{
+    const target = normalizeForMatch(`${a}${b}`);
+    // Try quick canonical keys first (underscore/slash/compact)
+    const tryKeys = [ normalizeKey(`${a}_${b}`), normalizeKey(`${a}/${b}`), normalizeKey(`${a}${b}`), normalizeKey(`${a}-${b}`) ];
+    for (const k of tryKeys){ if (k && quotesByCanonicalSymbol[k]) return quotesByCanonicalSymbol[k]; }
+
+    // Scan each quote and compare normalized identifiers (instrumentId, id, symbol, providerSymbol)
+    for (const k of Object.keys(quotesByCanonicalSymbol || {})){
+      const q = quotesByCanonicalSymbol[k];
+      if (!q) continue;
+      const candidates: string[] = [];
+      try{ if (q.instrumentId) candidates.push(String(q.instrumentId)); }catch(_){ }
+      try{ if ((q as any).id) candidates.push(String((q as any).id)); }catch(_){ }
+      try{ if (q.symbol) candidates.push(String(q.symbol)); }catch(_){ }
+      try{ if ((q as any).providerSymbol) candidates.push(String((q as any).providerSymbol)); }catch(_){ }
+      for (const c of candidates){ if (normalizeForMatch(c) === target) return q; }
+    }
+    return null;
+  }catch(_){ return null; }
 }
 
 export function resolveCurrencyToSekRate(params: { currency: string; quotesByCanonicalSymbol: Record<string, any>; now?: Date; maxAgeMs?: number }): FxSekConversionResult {
