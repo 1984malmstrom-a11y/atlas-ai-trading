@@ -35,6 +35,7 @@ import { TRADABLE_INSTRUMENTS } from '../market-data/instruments';
 import { TwelveDataMarketDataProvider } from '../market-data/twelve-data';
 import { getMarketDataProvider } from '../market-data';
 import { buildIntradayMarketContext, sanitizeIntradayMarketContextForState, buildIntradayDataReadiness, IntradayMarketContext } from './intraday-market-context';
+import { resolveBenchmarkSymbol, buildBenchmarkMarketContext, sanitizeBenchmarkMarketContextForState, buildBenchmarkDataReadiness, BenchmarkMarketContext } from './benchmark-market-context';
 import { getForexSessionDiagnostics } from '../forex-market';
 import { fetchAndBuildFundamentalIntelligence } from '../paper-trader/fundamental-data';
 import { buildMacroSignalsMock, buildMacroSignals, buildMacroSnapshotFromInstruments } from './macro-signals';
@@ -74,6 +75,8 @@ type RuntimeState = {
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
+  latestBenchmarkMarketContextBySymbol?: Record<string, any>;
+  benchmarkDataReadiness?: any;
   forexReadiness?: ForexReadinessState | null;
   forexAutonomyArmed?: boolean;
   forexLaunchControl?: ForexLaunchControlState | null;
@@ -194,6 +197,39 @@ export function createPerCycleIntradayResolver(opts: { getIntraday: (symbol: str
       }
     })();
     map.set(key, p as Promise<IntradayMarketContext | null>);
+    return p;
+  }
+  return { resolve };
+}
+
+// Per-cycle benchmark resolver: dedupe benchmark symbol requests and build BenchmarkMarketContext
+export function createPerCycleBenchmarkResolver(opts: { intradayResolver: { resolve: (o:{ symbol: string; interval: '15min'|'5min'; limit?: number }) => Promise<IntradayMarketContext | null> }, updateState?: (s:string,r:any)=>void }){
+  const map = new Map<string, Promise<BenchmarkMarketContext | null>>();
+  const intraday = opts.intradayResolver;
+  async function resolve({ symbol, instrument, analyzed }:{ symbol: string; instrument?: any; analyzed?: boolean }){
+    const sym = String(symbol || '').toUpperCase(); if (!sym) return null;
+    // Only build for STOCKs and when analyzed === true
+    const at = instrument && instrument.assetType ? String(instrument.assetType).toUpperCase() : undefined;
+    if (at && at !== 'STOCK') return null;
+    if (analyzed === false) return null;
+    const benchmark = resolveBenchmarkSymbol(instrument || sym);
+    if (!benchmark) {
+      const unknown = buildBenchmarkMarketContext({ symbolContext: null, benchmarkContext: null, benchmarkSymbol: null, now: new Date() });
+      try{ if (opts.updateState) opts.updateState(sym, sanitizeBenchmarkMarketContextForState(unknown)); }catch(_){ }
+      return unknown;
+    }
+    const key = String(benchmark).toUpperCase();
+    if (map.has(key)) return map.get(key);
+    const p = (async ()=>{
+      try{
+        const bc = await intraday.resolve({ symbol: key, interval: '15min', limit: 64 });
+        const sc = await intraday.resolve({ symbol: sym, interval: '15min', limit: 64 });
+        const ctx = buildBenchmarkMarketContext({ symbolContext: sc || null, benchmarkContext: bc || null, benchmarkSymbol: key, now: new Date() });
+        try{ if (opts.updateState) opts.updateState(sym, sanitizeBenchmarkMarketContextForState(ctx)); }catch(_){ }
+        return ctx;
+      }catch(e){ const unknown = buildBenchmarkMarketContext({ symbolContext: null, benchmarkContext: null, benchmarkSymbol: key, now: new Date() }); try{ if (opts.updateState) opts.updateState(sym, sanitizeBenchmarkMarketContextForState(unknown)); }catch(_){ } return unknown; }
+    })();
+    map.set(key, p);
     return p;
   }
   return { resolve };
