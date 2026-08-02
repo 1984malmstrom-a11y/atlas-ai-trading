@@ -56,6 +56,8 @@ import { SupabaseAuditAdapter } from './supabase-audit-adapter';
 import { acquireRunCycleLockWithOwner, releaseRunCycleLock } from './run-cycle-lock';
 import { createMarketNewsIntelligenceSummary, MarketNewsIntelligenceSummary } from './cycle-intelligence-snapshot';
 import { createMarketNewsActivity, MarketNewsActivity } from './market-news-activity';
+import { createPerCycleCompanyNewsResolver, sanitizeCompanyNewsContextForState } from './company-news-context';
+import { fetchFinnhubCompanyNews } from '../news-providers/finnhub';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
 
@@ -72,6 +74,7 @@ type RuntimeState = {
   autonomousEnabled: boolean;
   latestDecisionIntelligenceBySymbol?: Record<string, any>;
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
+  latestCompanyNewsContextBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
@@ -499,6 +502,12 @@ export function sanitizeDecisionIntelligenceForState(snap: any){
         allowed.contextAwareShadowDecision = sanitizedShadow;
       }
     }catch(_){ }
+    // include sanitized company news context when present
+    try{
+      if (snap && typeof snap.companyNewsContext === 'object' && snap.companyNewsContext !== null){
+        try{ const cmod = require('./company-news-context'); allowed.companyNewsContext = cmod.sanitizeCompanyNewsContextForState(snap.companyNewsContext); }catch(_){ allowed.companyNewsContext = null; }
+      }
+    }catch(_){ }
     return allowed;
   }catch(_){ return null; }
 }
@@ -795,6 +804,7 @@ const runtime: RuntimeState = {
   autonomousEnabled: true,
   latestDecisionIntelligenceBySymbol: {},
   latestHistoricalMarketContextBySymbol: {},
+  latestCompanyNewsContextBySymbol: {},
   forexReadiness: null,
   externalIntelligenceReadiness: null,
   forexAutonomyArmed: false,
@@ -1325,6 +1335,15 @@ export async function getPaperTradingState(){
       }
       out.latestFundamentalIntelligenceBySymbol = safeFund;
     }catch(_){ out.latestFundamentalIntelligenceBySymbol = {}; }
+    // Expose latest sanitized Company News Context per symbol for UI/state
+    try{
+      const rawMapC = runtime.latestCompanyNewsContextBySymbol || {};
+      const safeMapC: Record<string, any> = {};
+      for (const k of Object.keys(rawMapC || {})){
+        try{ const v = (rawMapC as Record<string, any>)[k]; if (!v) continue; safeMapC[k] = v; }catch(_){ }
+      }
+      out.latestCompanyNewsContextBySymbol = safeMapC;
+    }catch(_){ out.latestCompanyNewsContextBySymbol = {}; }
       // Expose latest sanitized Historical Market Context per symbol for UI/state
       try{
         const rawMapH = runtime.latestHistoricalMarketContextBySymbol || {};
@@ -1933,6 +1952,21 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   const fundamentalBySymbol = new Map<string, Promise<any>>();
   const perCycleFundResolver = createPerCycleFundamentalResolver({ fetchFundamental: async ({ symbol }: any) => await fetchAndBuildFundamentalIntelligence({ symbol, now: new Date().toISOString() }).catch(()=>null), instruments: TRADABLE_INSTRUMENTS, timeoutMs: 3000, appendAudit: async (res:any) => {/* noop here, append below */}, updateState: (s:string, r:any) => { try{ runtime.latestFundamentalIntelligenceBySymbol = runtime.latestFundamentalIntelligenceBySymbol || {}; runtime.latestFundamentalIntelligenceBySymbol[s] = { snapshot: r.snapshot, quality: r.quality }; }catch(_){ } } });
 
+  // Per-cycle company news resolver: lazy Finnhub fetch per STOCK symbol
+  const perCycleCompanyNewsResolver = createPerCycleCompanyNewsResolver({
+    fetchCompanyNews: async ({ symbol }: { symbol: string }) => {
+      try{
+        function fmt(d: Date){ const y = d.getUTCFullYear(); const m = String(d.getUTCMonth()+1).padStart(2,'0'); const day = String(d.getUTCDate()).padStart(2,'0'); return `${y}-${m}-${day}`; }
+        const to = new Date(); const from = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+        const res = await fetchFinnhubCompanyNews({ symbols: [String(symbol).toUpperCase()], from: fmt(from), to: fmt(to), apiKey: process.env.FINNHUB_API_KEY, fetchImpl: (globalThis as any).fetch });
+        return Array.isArray(res) ? res : [];
+      }catch(_){ return []; }
+    },
+    instruments: TRADABLE_INSTRUMENTS,
+    timeoutMs: 5000,
+    updateState: (s:string, r:any) => { try{ runtime.latestCompanyNewsContextBySymbol = runtime.latestCompanyNewsContextBySymbol || {}; runtime.latestCompanyNewsContextBySymbol[String(s).toUpperCase()] = r; }catch(_){ } }
+  });
+
   // Per-cycle decision intelligence resolver (created once per cycle)
   let decisionIntelligenceResolver: any = null;
 
@@ -2007,7 +2041,16 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               try{ const diag = qc.buildDecisionMarketContextDiagnostics({ action: (actionHint as any) || 'UNKNOWN', confidence: null, historicalContext: histCtx || null, marketRegime: mrCtx || null }); if (diag) (primary as any).marketContextDiagnostics = diag; }catch(_){ }
             }
           }catch(_){ }
-          try{ await cycleAuditStore.append(primary); }catch(_){ }
+          try{
+            // Attach sanitized company news context (diagnostic-only) when available via per-cycle resolver
+            try{
+              if (sym && typeof perCycleCompanyNewsResolver !== 'undefined' && perCycleCompanyNewsResolver){
+                const cctx = await perCycleCompanyNewsResolver.resolve({ symbol: sym, analyzed: true }).catch(()=>null);
+                try{ (primary as any).companyNewsContext = sanitizeCompanyNewsContextForState(cctx); }catch(_){ (primary as any).companyNewsContext = null; }
+              }
+            }catch(_){ try{ (primary as any).companyNewsContext = null; }catch(_){ } }
+            await cycleAuditStore.append(primary);
+          }catch(_){ }
           try{ if (sym){ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; runtime.latestDecisionIntelligenceBySymbol[sym] = sanitizeDecisionIntelligenceForState(primary); } }catch(_){ }
         }catch(_){ }
       }catch(_){ }

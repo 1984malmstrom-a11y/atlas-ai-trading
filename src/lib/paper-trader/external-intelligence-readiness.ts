@@ -140,7 +140,7 @@ export function buildCurrentExternalIntelligenceReadiness(opts?: { env?: NodeJS.
   const capabilities = { finnhub: !!finnhub, macroConfig: !!macroConfig, fundamentals: !!fundamentals };
 
   const runtimeUsage = {
-    companyNewsRuntime: Boolean(runtime.latestMarketNewsActivity),
+    companyNewsRuntime: Boolean(runtime.latestCompanyNewsContextBySymbol && Object.keys(runtime.latestCompanyNewsContextBySymbol || {}).length > 0) || Boolean(runtime.latestMarketNewsActivity),
     companyNewsDI: Boolean(runtime.latestDecisionIntelligenceBySymbol && Object.keys(runtime.latestDecisionIntelligenceBySymbol || {}).length > 0),
     macroRuntime: Boolean(runtime.latestMarketRegimeIntelligenceBySymbol && Object.keys(runtime.latestMarketRegimeIntelligenceBySymbol || {}).length > 0),
     macroDI: Boolean(runtime.latestDecisionIntelligenceBySymbol && Object.keys(runtime.latestDecisionIntelligenceBySymbol || {}).length > 0),

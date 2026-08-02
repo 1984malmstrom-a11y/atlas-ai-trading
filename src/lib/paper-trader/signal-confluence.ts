@@ -293,6 +293,7 @@ export type DecisionIntelligenceSnapshot = {
   source?: string;
   // Optional diagnostic-only shadow decision (sanitized)
   contextAwareShadowDecision?: import('./context-aware-shadow-decision').ContextAwareShadowDecision | null;
+  companyNewsContext?: import('./company-news-context').CompanyNewsContext | null;
 };
 
 // Market context diagnostics block added for decision intelligence (diagnostic-only)
