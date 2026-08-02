@@ -960,16 +960,12 @@ export function isInstrumentTradableNow(instr: any, now?: Date){
     const t = now instanceof Date ? now : new Date();
     const type = instr && instr.assetType ? String(instr.assetType).toUpperCase() : 'STOCK';
     if (type === 'FOREX' || type === 'COMMODITY'){
-      // Determine UTC day/hours for 24/5 rule
-      const day = t.getUTCDay(); // 0=Sun .. 6=Sat
-      const hour = t.getUTCHours();
-      // Closed on Saturday
-      if (day === 6) return false;
-      // Sunday before 22:00 UTC closed
-      if (day === 0 && hour < 22) return false;
-      // Friday at or after 22:00 UTC closed
-      if (day === 5 && hour >= 22) return false;
-      return true; // otherwise open
+        // Use New York-based session helper to respect DST and accurate
+        // open/close times for Forex (Sunday 17:00 NY -> open, Fri 17:00 NY -> close).
+        try{
+          const diag = getForexSessionDiagnostics(t);
+          return diag && diag.status === 'OPEN';
+        }catch(_){ return false; }
     }
     // STOCK/unknown -> reuse NY market helper
     try{
