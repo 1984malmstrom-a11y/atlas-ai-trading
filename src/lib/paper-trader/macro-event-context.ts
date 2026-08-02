@@ -36,6 +36,8 @@ export type MacroEventContext = {
   warnings: readonly string[];
 };
 
+import { fetchFinnhubEconomicCalendar, FinnhubEconomicCalendarError } from '../news-providers/finnhub-economic-calendar';
+
 function toFiniteOrNull(v: any): number | null { const n = Number(v); return Number.isFinite(n) ? n : null; }
 function normalizeId(id: any){ try{ return String(id||'').trim(); }catch(_){ return ''; } }
 function nowIso(d?: Date){ return (d instanceof Date ? d : new Date()).toISOString(); }
@@ -147,12 +149,32 @@ export function createPerCycleMacroEventResolver(opts?: { fetchMacroCalendar?: (
     if (promise) return promise;
     promise = (async ()=>{
       try{
-        const fetcher = opts && typeof opts.fetchMacroCalendar === 'function' ? opts.fetchMacroCalendar : async ()=> null;
+        const defaultFetcher = async (o?:{ now?: Date }) => {
+          // call Finnhub economic calendar conservatively
+          const now = o && o.now ? new Date(o.now) : new Date();
+          const from = now.toISOString().slice(0,10);
+          const to = new Date(now.getTime() + 7*24*60*60*1000).toISOString().slice(0,10);
+          const raw = await fetchFinnhubEconomicCalendar({ from, to, apiKey: process.env.FINNHUB_API_KEY, fetchImpl: (globalThis as any).fetch });
+          if(!Array.isArray(raw)) return null;
+          // map to the loose shape expected by buildMacroEventContext
+          return raw.map((a:any)=>({ id: a.id, name: a.event, category: a.category, scheduled_at: a.time, importance: a.impact, actual: a.actual, forecast: a.estimate, previous: a.previous, country: a.country, currency: a.currency }));
+        };
+
+        const fetcher = opts && typeof opts.fetchMacroCalendar === 'function' ? opts.fetchMacroCalendar : defaultFetcher;
         const res = await Promise.race([ fetcher({ now: new Date() }), new Promise<null>(resolve => setTimeout(()=> resolve(null), timeoutMs)) ]);
         const ctx = buildMacroEventContext({ events: Array.isArray(res) ? res : null, now: new Date() });
         try{ if (opts && typeof opts.updateState === 'function') opts.updateState('GLOBAL', sanitizeMacroEventContextForState(ctx)); }catch(_){ }
         return ctx;
-      }catch(e){ const u = buildMacroEventContext({ events: null, now: new Date() }); try{ if (opts && typeof opts.updateState === 'function') opts.updateState('GLOBAL', sanitizeMacroEventContextForState(u)); }catch(_){ } return u; }
+      }catch(e:any){
+        const u = buildMacroEventContext({ events: null, now: new Date() }) as any;
+        try{
+          if (e && e instanceof FinnhubEconomicCalendarError){
+            try{ u.warnings = Array.from(new Set([String(e.code), ...(Array.isArray(u.warnings) ? u.warnings : [])])); }catch(_){ }
+          }
+        }catch(_){ }
+        try{ if (opts && typeof opts.updateState === 'function') opts.updateState('GLOBAL', sanitizeMacroEventContextForState(u)); }catch(_){ }
+        return u;
+      }
     })();
     return promise;
   }

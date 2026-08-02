@@ -86,11 +86,11 @@ export function buildExternalIntelligenceReadiness(input?: ReadinessBuildInput):
     }
 
     if (cat === 'MACRO_EVENTS' || cat === 'INTEREST_RATES' || cat === 'INFLATION' || cat === 'EMPLOYMENT'){
-      provider = 'MACRO_REGISTRY';
-      provAvailable = !!caps.macroConfig;
+      provider = 'FINNHUB';
+      provAvailable = !!caps.finnhub;
       runtimeIntegrated = !!run.macroRuntime;
       diIntegrated = !!run.macroDI;
-      if (!provAvailable) warn.push('MACRO_CONFIG_MISSING');
+      if (!provAvailable) warn.push('PROVIDER_MISSING');
     }
 
     if (cat === 'INCOME_STATEMENT' || cat === 'BALANCE_SHEET' || cat === 'CASH_FLOW' || cat === 'COMPANY_PROFILE' || cat === 'ANALYST_ESTIMATES' || cat === 'EARNINGS_CALENDAR'){
