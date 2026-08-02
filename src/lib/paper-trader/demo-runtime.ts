@@ -1150,7 +1150,15 @@ async function runAutomaticCycleImplementation(){
     let tickCycleId: string | null = null;
     try{
         tickCycleId = `auto_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-        const fr = runtime.forexReadiness || null;
+        // Prefer using fresh, current-cycle readiness derived from provider quotes
+        // so Launch Control decisions reflect the latest market data instead
+        // of stale runtime.forexReadiness from a previous cycle.
+        let fr: any = null;
+        try{
+          const fetchedQuotes = await fetchQuotes().catch(()=>null);
+          fr = buildForexReadinessState({ now: new Date(), instruments: TRADABLE_INSTRUMENTS, quotes: Array.isArray(fetchedQuotes) ? fetchedQuotes : [] });
+          try{ runtime.forexReadiness = JSON.parse(JSON.stringify(fr)); }catch(_){ runtime.forexReadiness = fr as any; }
+        }catch(_){ fr = runtime.forexReadiness || null; }
         const schedState = getGlobalScheduler();
         // compute real daily counters for launch control
         const daily = await buildDailyTradingSummary({ auditStore, now: new Date() }).catch(()=> ({ executedTradeCount: 0, realizedPnLSek: 0, dailyLossSek: 0, dateKey: new Date().toISOString(), timezone: 'Europe/Stockholm' }));
