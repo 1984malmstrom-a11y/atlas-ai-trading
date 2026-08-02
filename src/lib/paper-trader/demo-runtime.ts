@@ -77,6 +77,7 @@ type RuntimeState = {
   latestIntradayMarketContextBySymbol?: Record<string, any>;
   latestBenchmarkMarketContextBySymbol?: Record<string, any>;
   benchmarkDataReadiness?: any;
+  externalIntelligenceReadiness?: any;
   forexReadiness?: ForexReadinessState | null;
   forexAutonomyArmed?: boolean;
   forexLaunchControl?: ForexLaunchControlState | null;
@@ -795,6 +796,7 @@ const runtime: RuntimeState = {
   latestDecisionIntelligenceBySymbol: {},
   latestHistoricalMarketContextBySymbol: {},
   forexReadiness: null,
+  externalIntelligenceReadiness: null,
   forexAutonomyArmed: false,
   forexLaunchControl: null,
   latestForexCycleStatus: null,
@@ -1385,6 +1387,15 @@ export async function getPaperTradingState(){
           }
           out.latestMarketRegimeIntelligenceBySymbol = safeReg;
         }catch(_){ out.latestMarketRegimeIntelligenceBySymbol = {}; }
+  // Expose external intelligence readiness (diagnostic-only)
+  try{
+    const rir = require('./external-intelligence-readiness');
+    try{
+      const built = rir.buildCurrentExternalIntelligenceReadiness({ env: process.env, runtime: runtime });
+      try{ runtime.externalIntelligenceReadiness = JSON.parse(JSON.stringify(built)); }catch(_){ runtime.externalIntelligenceReadiness = built; }
+      out.externalIntelligenceReadiness = runtime.externalIntelligenceReadiness ? JSON.parse(JSON.stringify(runtime.externalIntelligenceReadiness)) : null;
+    }catch(e){ out.externalIntelligenceReadiness = null; }
+  }catch(_){ out.externalIntelligenceReadiness = null; }
   // Expose latest market news activity from the most recent CYCLE_INTELLIGENCE_SNAPSHOT audit (if any)
   try{
     let latestActivity: MarketNewsActivity | undefined = undefined;
