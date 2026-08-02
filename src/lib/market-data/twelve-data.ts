@@ -419,11 +419,101 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
   private histTtlMs = 6 * 60 * 60_000; // 6 hours
   private histCache = new Map<string, { expires: number; v: { symbol: string; closes: number[]; dates: string[]; source: string; fetchedAt: string } }>();
   private histPending = new Map<string, Promise<any>>();
+  // intraday cache and in-flight dedupe per symbol|interval
+  private intradayTtlMs = 3 * 60 * 1000; // 3 minutes
+  private intradayCache = new Map<string, { expires: number; v: { symbol: string; interval: string; fetchedAt: string; candles: any[] } }>();
+  private intradayPending = new Map<string, Promise<any>>();
 
   constructor(){
     const key = process.env.TWELVE_DATA_API_KEY;
     if (!key) throw new Error('TWELVE_DATA_API_KEY must be set on server');
     this.apiKey = key;
+  }
+
+  // Fetch intraday candles using Twelve Data time_series endpoint (5min|15min). Returns normalized candles oldest->newest
+  async getIntradayCandles(providerSymbol: string, interval: '5min' | '15min', limit = 64, timeout = 10_000) {
+    try{
+      if (!providerSymbol || typeof providerSymbol !== 'string') throw Object.assign(new Error('Invalid symbol'), { code: 'UNSUPPORTED_SYMBOL' });
+      const sym = String(providerSymbol).toUpperCase();
+      if (interval !== '5min' && interval !== '15min') throw Object.assign(new Error('Invalid interval'), { code: 'INVALID_INTERVAL' });
+      // clamp limit
+      const lim = Math.max(20, Math.min(96, Math.floor(Number(limit) || 64)));
+      const key = `${sym}|${interval}|${lim}`;
+      const cached = this.intradayCache.get(key);
+      if (cached && cached.expires > Date.now()) return cached.v;
+      const pending = this.intradayPending.get(key);
+      if (pending) return pending;
+
+      const p = (async ()=>{
+        try{
+          const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${interval}&outputsize=${lim}&timezone=UTC&apikey=${this.apiKey}`;
+          const res = await this.fetchWithTimeout(url, timeout).catch(e=>{ throw Object.assign(new Error('INTRADAY_TIMEOUT'), { code: 'INTRADAY_TIMEOUT' }); });
+          if (!res.ok){ if (res.status === 429) throw Object.assign(new Error('Rate limited'), { code: 'INTRADAY_RATE_LIMITED' }); throw Object.assign(new Error(`Provider status ${res.status}`), { code: 'INTRADAY_PROVIDER_UNAVAILABLE' }); }
+          const data = await res.json().catch(()=> null);
+          if (!data) throw Object.assign(new Error('Invalid provider response'), { code: 'INTRADAY_PAYLOAD_INVALID' });
+          if (data.status === 'error'){
+            const msg = String(data.message || 'provider error');
+            if (/Invalid symbol/i.test(msg) || /not found/i.test(msg)) throw Object.assign(new Error('Unsupported symbol'), { code: 'UNSUPPORTED_SYMBOL' });
+            throw Object.assign(new Error('Provider error'), { code: 'INTRADAY_PROVIDER_UNAVAILABLE' });
+          }
+
+          const values = Array.isArray(data.values) ? data.values : (Array.isArray(data.data) ? data.data : []);
+          if (!Array.isArray(values)) throw Object.assign(new Error('Invalid provider payload'), { code: 'INTRADAY_PAYLOAD_INVALID' });
+
+          // Build records preserving original index so duplicates keep last-seen
+          const records: { ts: string; tsDate: Date; open: number; high: number; low: number; close: number; volume: number | null; idx: number }[] = [];
+          const now = Date.now();
+          for (let i = 0; i < values.length; i++){
+            const it = values[i];
+            if (!it) continue;
+            // read fields defensively
+            const rawTs = it.datetime ?? it.timestamp ?? it.time ?? it.dt ?? it.datetime_utc ?? it.datetimeEpoch ?? it.datetime_epoch ?? null;
+            const dt = rawTs === null ? null : parseTwelveTimestamp(rawTs);
+            if (!dt) continue; // invalid timestamp
+            // reject far-future beyond 2 minutes
+            if (dt.getTime() > now + 2*60*1000) continue;
+            const openRaw = it.open ?? it.o ?? null; const highRaw = it.high ?? it.h ?? null; const lowRaw = it.low ?? it.l ?? null; const closeRaw = it.close ?? it.c ?? null; const volRaw = it.volume ?? it.v ?? it.vol ?? null;
+            const open = typeof openRaw === 'string' ? Number(openRaw) : Number(openRaw);
+            const high = typeof highRaw === 'string' ? Number(highRaw) : Number(highRaw);
+            const low = typeof lowRaw === 'string' ? Number(lowRaw) : Number(lowRaw);
+            const close = typeof closeRaw === 'string' ? Number(closeRaw) : Number(closeRaw);
+            let volume: number | null = null;
+            if (volRaw !== null && volRaw !== undefined){ const v = typeof volRaw === 'string' ? Number(volRaw) : Number(volRaw); if (Number.isFinite(v) && v >= 0) volume = v; else volume = null; }
+            if (!this.isValidNumber(open) || open <= 0) continue;
+            if (!this.isValidNumber(high) || high <= 0) continue;
+            if (!this.isValidNumber(low) || low <= 0) continue;
+            if (!this.isValidNumber(close) || close <= 0) continue;
+            // relational checks
+            if (!(high >= open && high >= close && high >= low)) continue;
+            if (!(low <= open && low <= close)) continue;
+            records.push({ ts: dt.toISOString(), tsDate: dt, open: Number(open), high: Number(high), low: Number(low), close: Number(close), volume, idx: i });
+          }
+
+          if (records.length === 0) throw Object.assign(new Error('No valid candles'), { code: 'INTRADAY_NO_VALID_CANDLES' });
+
+          // Collapse duplicates keeping the last seen (higher idx), sort oldest->newest
+          // Map timestamp -> record (keep later idx)
+          const mapByTs = new Map<string, { rec: any; idx: number }>();
+          for (const r of records){ const ex = mapByTs.get(r.ts); if (!ex || r.idx >= ex.idx) mapByTs.set(r.ts, { rec: r, idx: r.idx }); }
+          const tsList = Array.from(mapByTs.keys()).sort((a,b)=> a < b ? -1 : a > b ? 1 : 0);
+          const candles = tsList.map(ts => {
+            const r = mapByTs.get(ts)!.rec;
+            return { timestamp: r.ts, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume };
+          });
+
+          const out = { symbol: sym, interval, fetchedAt: new Date().toISOString(), candles };
+          this.intradayCache.set(key, { expires: Date.now() + this.intradayTtlMs, v: out });
+          return out;
+        }catch(e){
+          // Normalize thrown errors into stable error codes
+          if (e && (e as any).code) throw e;
+          throw Object.assign(new Error('INTRADAY_PROVIDER_UNAVAILABLE'), { code: 'INTRADAY_PROVIDER_UNAVAILABLE' });
+        }finally{ this.intradayPending.delete(key); }
+      })();
+
+      this.intradayPending.set(key, p as Promise<any>);
+      return p;
+    }catch(e){ throw e; }
   }
 
   // Public: fetch normalized daily closes for a provider symbol (e.g. 'MSFT')

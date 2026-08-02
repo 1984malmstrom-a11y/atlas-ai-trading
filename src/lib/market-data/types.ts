@@ -19,3 +19,27 @@ export interface MarketDataProvider {
   getQuote(instrumentId: string): Promise<MarketQuote>;
   getQuotes(instrumentIds: string[]): Promise<MarketQuote[]>;
 }
+
+export type IntradayInterval = '5min' | '15min';
+
+export type IntradayCandle = {
+  timestamp: string; // ISO
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+};
+
+export type IntradaySeriesResult = {
+  symbol: string;
+  interval: IntradayInterval;
+  fetchedAt: string;
+  candles: readonly IntradayCandle[];
+};
+
+export interface MarketDataProvider {
+  getQuote(instrumentId: string): Promise<MarketQuote>;
+  getQuotes(instrumentIds: string[]): Promise<MarketQuote[]>;
+  getIntradayCandles?(symbol: string, interval: IntradayInterval, limit?: number): Promise<IntradaySeriesResult>;
+}

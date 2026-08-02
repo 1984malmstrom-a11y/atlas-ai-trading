@@ -33,6 +33,8 @@ import aggregateShadowDecisionPerformance from './shadow-decision-performance-ag
 import { createPerCycleContextAwareShadowResolver, sanitizeContextAwareShadowDecisionForState } from './context-aware-shadow-decision';
 import { TRADABLE_INSTRUMENTS } from '../market-data/instruments';
 import { TwelveDataMarketDataProvider } from '../market-data/twelve-data';
+import { getMarketDataProvider } from '../market-data';
+import { buildIntradayMarketContext, sanitizeIntradayMarketContextForState, buildIntradayDataReadiness, IntradayMarketContext } from './intraday-market-context';
 import { getForexSessionDiagnostics } from '../forex-market';
 import { fetchAndBuildFundamentalIntelligence } from '../paper-trader/fundamental-data';
 import { buildMacroSignalsMock, buildMacroSignals, buildMacroSnapshotFromInstruments } from './macro-signals';
@@ -71,6 +73,7 @@ type RuntimeState = {
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
+  latestIntradayMarketContextBySymbol?: Record<string, any>;
   forexReadiness?: ForexReadinessState | null;
   forexAutonomyArmed?: boolean;
   forexLaunchControl?: ForexLaunchControlState | null;
@@ -163,6 +166,34 @@ export function createPerCycleMarketRegimeResolver(opts: { buildIntelligence: (o
       }catch(e){ return null; }
     })();
     map.set(sym, p);
+    return p;
+  }
+  return { resolve };
+}
+
+// Per-cycle intraday resolver factory: dedupe provider calls per cycle by key `${symbol}|${interval}`.
+export function createPerCycleIntradayResolver(opts: { getIntraday: (symbol: string, interval: '5min'|'15min', limit?: number)=>Promise<any>, instruments?: any[], timeoutMs?: number, updateState?: (s:string,r:any)=>void }){
+  const map = new Map<string, Promise<IntradayMarketContext | null>>();
+  const getter = opts.getIntraday;
+  const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 8000;
+  async function resolve({ symbol, interval, limit }: { symbol: string; interval: '5min'|'15min'; limit?: number }){
+    const sym = String(symbol || '').toUpperCase(); if (!sym) return null;
+    const key = `${sym}|${interval}`;
+    if (map.has(key)) return map.get(key);
+    const p = (async ()=>{
+      try{
+        const res = await Promise.race([ getter(sym, interval, typeof limit === 'number' ? limit : 64), new Promise((_,rej)=> setTimeout(()=> rej(Object.assign(new Error('INTRADAY_TIMEOUT'), { code: 'INTRADAY_TIMEOUT' })), timeoutMs)) ]);
+        if (!res || !Array.isArray((res as any).candles)) throw Object.assign(new Error('INTRADAY_NO_VALID_CANDLES'), { code: 'INTRADAY_NO_VALID_CANDLES' });
+        const ctx = buildIntradayMarketContext({ symbol: sym, interval, candles: (res as any).candles, fetchedAt: (res as any).fetchedAt });
+        // update optional state callback with sanitized copy
+        try{ if (opts.updateState) opts.updateState(sym, sanitizeIntradayMarketContextForState(ctx)); }catch(_){ }
+        return ctx;
+      }catch(e){
+        // return sanitized UNAVAILABLE context
+        try{ const unavailable: IntradayMarketContext = { schemaVersion: 1, source: 'TWELVE_DATA_INTRADAY', symbol: sym, interval, observedAt: null, generatedAt: new Date().toISOString(), fetchedAt: null, expiresAt: null, isFresh: false, coverage: 'UNAVAILABLE', pointCount: 0, latest: { open: null, high: null, low: null, close: null, volume: null }, session: { openPrice: null, highPrice: null, lowPrice: null, changePercent: null, rangePercent: null, cumulativeVolume: null }, momentum: { shortReturnPercent: null, volumeVsAverage: null, direction: 'UNKNOWN' }, warnings: ['INTRADAY_PROVIDER_UNAVAILABLE'] }; return unavailable; }catch(_){ return null; }
+      }
+    })();
+    map.set(key, p as Promise<IntradayMarketContext | null>);
     return p;
   }
   return { resolve };
@@ -1659,6 +1690,23 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       cycleMacroSignals = buildMacroSignals(cycleMacroSnapshot as any);
     }
   }catch(_){ cycleMacroSnapshot = undefined; cycleMacroSignals = undefined; }
+  // Build per-cycle intraday resolver and fetch intraday contexts for analyzed symbols (diagnostic-only)
+  const intradayResolver = createPerCycleIntradayResolver({ getIntraday: (s, interval, lim) => {
+    try{ const prov = getMarketDataProvider(); if (typeof (prov as any).getIntradayCandles === 'function') return (prov as any).getIntradayCandles(s, interval, lim); return Promise.reject(new Error('NO_INTRADAY_SUPPORT')); }catch(e){ return Promise.reject(e); }
+  }, updateState: (s, r) => {
+    try{ if (!runtime.latestIntradayMarketContextBySymbol) runtime.latestIntradayMarketContextBySymbol = {}; runtime.latestIntradayMarketContextBySymbol[String(s).toUpperCase()] = r; }catch(_){ }
+  } });
+
+  // For initial diagnostic pass fetch 15min intraday context for watchlist symbols present
+  try{
+    if (Array.isArray(symbols) && symbols.length > 0){
+      for (const sym of symbols){
+        try{ // only schedule, do not await to avoid blocking; store promise to map via resolver
+          intradayResolver.resolve({ symbol: sym, interval: '15min', limit: 64 }).catch(()=>{});
+        }catch(_){ }
+      }
+    }
+  }catch(_){ }
   // Per-cycle diagnostics collected for each evaluated symbol
   const diagnosticsBySymbol = new Map<string, any>();
   function ensureDiag(sym: string){
