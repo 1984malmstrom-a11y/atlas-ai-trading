@@ -293,6 +293,111 @@ export type DecisionIntelligenceSnapshot = {
   source?: string;
 };
 
+// Market context diagnostics block added for decision intelligence (diagnostic-only)
+export type DecisionHistoricalContextDiagnostics = {
+  dataQuality: import('./historical-market-context').HistoricalDataQuality | null;
+  shortTrend: import('./historical-market-context').HistoricalTrendDirection | null;
+  mediumTrend: import('./historical-market-context').HistoricalTrendDirection | null;
+  longTrend: import('./historical-market-context').HistoricalTrendDirection | null;
+  trendAgreement: number | null;
+  volatilityState: import('./historical-market-context').HistoricalVolatilityState | null;
+  momentumPersistence: import('./historical-market-context').HistoricalMomentumPersistence | null;
+  currentDrawdownPercent: number | null;
+  maxDrawdownPercent: number | null;
+  recoveryPercent: number | null;
+  rangePosition: number | null;
+  volumeTrend: import('./historical-market-context').HistoricalMarketContext['volumeTrend'] | null;
+  warnings: string[];
+};
+
+export type DecisionMarketRegimeDiagnostics = {
+  primaryRegime: import('./market-regime-intelligence').MarketRegimeIntelligenceSnapshot['primaryRegime'] | null;
+  volatilityRegime: import('./market-regime-intelligence').MarketRegimeIntelligenceSnapshot['volatilityRegime'] | null;
+  riskRegime: import('./market-regime-intelligence').MarketRegimeIntelligenceSnapshot['riskRegime'] | null;
+  confidence: number | null;
+  strength: import('./market-regime-intelligence').MarketRegimeIntelligenceSnapshot['strength'] | null;
+  quality: import('./market-regime-intelligence').MarketRegimeIntelligenceSnapshot['quality'] | null;
+  supportingSignals: string[];
+  conflictingSignals: string[];
+  warnings: string[];
+};
+
+export type MarketContextDiagnostics = {
+  historicalContext: DecisionHistoricalContextDiagnostics | null;
+  marketRegime: DecisionMarketRegimeDiagnostics | null;
+  contextAlignment: 'SUPPORTIVE'|'CONFLICTING'|'NEUTRAL'|'INSUFFICIENT';
+  contextSummary: string[];
+};
+
+// Build typed diagnostics purely from inputs
+export function buildDecisionMarketContextDiagnostics(opts: { action: 'BUY'|'SELL'|'HOLD'|'UNKNOWN'; confidence?: number | null; historicalContext?: import('./historical-market-context').HistoricalMarketContextSnapshot | null; marketRegime?: import('./market-regime-intelligence').MarketRegimeIntelligenceSnapshot | null }): MarketContextDiagnostics {
+  const action = opts.action || 'UNKNOWN';
+  const hist = opts.historicalContext || null;
+  const mr = opts.marketRegime || null;
+
+  const histDiag: DecisionHistoricalContextDiagnostics | null = hist ? {
+    dataQuality: hist.dataQuality || null,
+    shortTrend: hist.shortTrend || null,
+    mediumTrend: hist.mediumTrend || null,
+    longTrend: hist.longTrend || null,
+    trendAgreement: typeof hist.trendAgreement === 'number' ? hist.trendAgreement : null,
+    volatilityState: hist.volatilityState || null,
+    momentumPersistence: hist.momentumPersistence || null,
+    currentDrawdownPercent: typeof hist.currentDrawdownPercent === 'number' ? hist.currentDrawdownPercent : null,
+    maxDrawdownPercent: typeof hist.maxDrawdownPercent === 'number' ? hist.maxDrawdownPercent : null,
+    recoveryPercent: typeof hist.recoveryPercent === 'number' ? hist.recoveryPercent : null,
+    rangePosition: typeof hist.rangePosition === 'number' ? hist.rangePosition : null,
+    volumeTrend: hist.volumeTrend || null,
+    warnings: Array.isArray(hist.warnings) ? Array.from(new Set(hist.warnings)).slice(0,10) : []
+  } : null;
+
+  const mrDiag: DecisionMarketRegimeDiagnostics | null = mr ? {
+    primaryRegime: mr.primaryRegime || null,
+    volatilityRegime: mr.volatilityRegime || null,
+    riskRegime: mr.riskRegime || null,
+    confidence: typeof mr.confidence === 'number' ? mr.confidence : null,
+    strength: mr.strength || null,
+    quality: mr.quality || null,
+    supportingSignals: Array.isArray(mr.supportingSignals) ? mr.supportingSignals.slice(0,10) : [],
+    conflictingSignals: Array.isArray(mr.conflictingSignals) ? mr.conflictingSignals.slice(0,10) : [],
+    warnings: Array.isArray(mr.warnings) ? mr.warnings.slice(0,10) : []
+  } : null;
+
+  // Alignment rules
+  let alignment: MarketContextDiagnostics['contextAlignment'] = 'INSUFFICIENT';
+  if (!histDiag && !mrDiag) alignment = 'INSUFFICIENT';
+  else if (action === 'HOLD' || action === 'UNKNOWN') alignment = (histDiag || mrDiag) ? 'NEUTRAL' : 'INSUFFICIENT';
+  else {
+    // derive from marketRegime primarily when present, else historical trends
+    const primary = mrDiag && mrDiag.primaryRegime ? mrDiag.primaryRegime : null;
+    const risk = mrDiag && mrDiag.riskRegime ? mrDiag.riskRegime : null;
+    if (primary && ((action === 'BUY' && primary === 'BULL_TREND') || (action === 'SELL' && primary === 'BEAR_TREND')) && risk !== 'RISK_OFF') alignment = 'SUPPORTIVE';
+    else if (primary && ((action === 'BUY' && primary === 'BEAR_TREND') || (action === 'SELL' && primary === 'BULL_TREND')) ) alignment = 'CONFLICTING';
+    else if (risk === 'RISK_OFF' && action === 'BUY') alignment = 'CONFLICTING';
+    else alignment = 'NEUTRAL';
+  }
+
+  // Build deterministic context summary (max 5 lines)
+  const sums: string[] = [];
+  try{
+    if (histDiag){
+      if (histDiag.shortTrend && histDiag.longTrend && histDiag.shortTrend === histDiag.longTrend) sums.push(`Den korta och långa trenden pekar ${histDiag.shortTrend === 'UP' ? 'uppåt' : histDiag.shortTrend === 'DOWN' ? 'nedåt' : 'sidoled'}.`);
+      else if (histDiag.shortTrend && histDiag.longTrend && histDiag.shortTrend !== histDiag.longTrend) sums.push(`Kort trend ${histDiag.shortTrend === 'UP' ? 'uppåt' : histDiag.shortTrend === 'DOWN' ? 'nedåt' : 'sidoled'} mot lång trend ${histDiag.longTrend === 'UP' ? 'uppåt' : histDiag.longTrend === 'DOWN' ? 'nedåt' : 'sidoled'}.`);
+      if (histDiag.volatilityState && histDiag.volatilityState !== 'INSUFFICIENT') sums.push(`Volatiliteten är ${histDiag.volatilityState.toLowerCase()}.`);
+      if (typeof histDiag.currentDrawdownPercent === 'number' && typeof histDiag.maxDrawdownPercent === 'number') sums.push(`Instrumentet handlas ${Math.round((histDiag.rangePosition??0)*100)}% inuti senaste intervall.`);
+      if (typeof histDiag.rangePosition === 'number') sums.push(`Range-position: ${Math.round(histDiag.rangePosition * 100)}% av intervall.`);
+    }
+    if (mrDiag){
+      if (mrDiag.primaryRegime) sums.push(`Marknadsregimen är ${mrDiag.primaryRegime.toLowerCase().replace(/_/g,' ')}.`);
+      if (mrDiag.riskRegime) sums.push(`Regimen är ${mrDiag.riskRegime.toLowerCase().replace(/_/g,' ')}.`);
+    }
+  }catch(_){ }
+  // stable ordering and dedupe
+  const deduped = Array.from(new Set(sums)).slice(0,5);
+
+  return { historicalContext: histDiag, marketRegime: mrDiag, contextAlignment: alignment, contextSummary: deduped };
+}
+
 
 // Schema/versioning for Decision Intelligence primary snapshot
 export const DECISION_INTELLIGENCE_SCHEMA_VERSION = 1;

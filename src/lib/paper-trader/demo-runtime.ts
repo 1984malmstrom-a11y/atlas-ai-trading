@@ -1802,6 +1802,10 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   const signalsBySymbol = new Map<string, Promise<any[]>>();
   // Per-cycle cache for confluence summaries
   const confluenceBySymbol = new Map<string, Promise<any>>();
+  // Per-cycle cache for market regime intelligence (build from per-cycle historical context when needed)
+  const marketRegimeIntelligenceBySymbol = new Map<string, Promise<any>>();
+  // Track pending candidate action for symbol during per-symbol processing so appendAudit can use it
+  const pendingDecisionActionBySymbol = new Map<string, 'BUY'|'SELL'|'HOLD'|'UNKNOWN'>();
   // Per-cycle cache for fundamental intelligence packages (used by resolver)
   const fundamentalBySymbol = new Map<string, Promise<any>>();
   const perCycleFundResolver = createPerCycleFundamentalResolver({ fetchFundamental: async ({ symbol }: any) => await fetchAndBuildFundamentalIntelligence({ symbol, now: new Date().toISOString() }).catch(()=>null), instruments: TRADABLE_INSTRUMENTS, timeoutMs: 3000, appendAudit: async (res:any) => {/* noop here, append below */}, updateState: (s:string, r:any) => { try{ runtime.latestFundamentalIntelligenceBySymbol = runtime.latestFundamentalIntelligenceBySymbol || {}; runtime.latestFundamentalIntelligenceBySymbol[s] = { snapshot: r.snapshot, quality: r.quality }; }catch(_){ } } });
@@ -1839,11 +1843,49 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     }, buildQuality: qc.buildAnalysisQualitySummary, buildReasoning: qc.buildConfluenceReasoning, appendAudit: async (payload:any) => {
       // append a sanitized DECISION_INTELLIGENCE_SNAPSHOT audit and update runtime state
       try{
-        const primary = Object.assign({}, payload, { kind: 'DECISION_INTELLIGENCE_SNAPSHOT', schemaVersion: qc.DECISION_INTELLIGENCE_SCHEMA_VERSION, source: qc.DECISION_INTELLIGENCE_SOURCE });
-        try{ await cycleAuditStore.append(primary); }catch(_){ }
+        // Enrich payload with market-context diagnostics when available (diagnostic-only)
         try{
+          const primary = Object.assign({}, payload, { kind: 'DECISION_INTELLIGENCE_SNAPSHOT', schemaVersion: qc.DECISION_INTELLIGENCE_SCHEMA_VERSION, source: qc.DECISION_INTELLIGENCE_SOURCE });
           const sym = primary && primary.symbol ? String(primary.symbol).toUpperCase() : null;
-          if (sym){ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; runtime.latestDecisionIntelligenceBySymbol[sym] = sanitizeDecisionIntelligenceForState(primary); }
+          // Attempt to reuse per-cycle caches rather than calling providers
+          let histCtx: any = null;
+          try{
+            // Use only per-cycle cached historical context; do NOT fallback to runtime.latest* (could be stale)
+            if (sym && historicalMarketContextBySymbol.has(sym)){
+              histCtx = await (historicalMarketContextBySymbol.get(sym) as Promise<any>).catch(()=>null);
+            } else {
+              histCtx = null;
+            }
+          }catch(_){ histCtx = null; }
+          let mrCtx: any = null;
+          try{
+            // Build or reuse per-cycle market regime intelligence using per-cycle historical context only
+            if (sym){
+              if (marketRegimeIntelligenceBySymbol.has(sym)){
+                mrCtx = await marketRegimeIntelligenceBySymbol.get(sym as string)!.catch(()=>null);
+              } else {
+                const p = (async ()=>{
+                  try{
+                    if (!histCtx) return null;
+                    const mod = await import('./market-regime-intelligence');
+                    const built = mod.buildMarketRegimeIntelligence({ symbol: sym, historicalContext: histCtx, now: new Date() });
+                    return built;
+                  }catch(_){ return null; }
+                })();
+                marketRegimeIntelligenceBySymbol.set(sym, p);
+                mrCtx = await p.catch(()=>null);
+              }
+            }
+          }catch(_){ mrCtx = null; }
+          // Determine action hint if available from pendingDecisionActionBySymbol
+          const actionHint = sym && pendingDecisionActionBySymbol.has(sym) ? pendingDecisionActionBySymbol.get(sym) : 'UNKNOWN';
+          try{
+            if (typeof qc.buildDecisionMarketContextDiagnostics === 'function'){
+              try{ const diag = qc.buildDecisionMarketContextDiagnostics({ action: (actionHint as any) || 'UNKNOWN', confidence: null, historicalContext: histCtx || null, marketRegime: mrCtx || null }); if (diag) (primary as any).marketContextDiagnostics = diag; }catch(_){ }
+            }
+          }catch(_){ }
+          try{ await cycleAuditStore.append(primary); }catch(_){ }
+          try{ if (sym){ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; runtime.latestDecisionIntelligenceBySymbol[sym] = sanitizeDecisionIntelligenceForState(primary); } }catch(_){ }
         }catch(_){ }
       }catch(_){ }
       // Fetch and append fundamental intelligence audit (best-effort, per-cycle cached) via resolver
@@ -2087,9 +2129,11 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             try{
               if (decisionIntelligenceResolver){
                 try{
+                  try{ pendingDecisionActionBySymbol.set(String(symbol||'').toUpperCase(), 'SELL'); }catch(_){ }
                   const finalSnap = await decisionIntelligenceResolver.finalizeSnapshot({ symbol, selectedSupportingSignalIds: _chosenSupportingSignalIdsForDecision || [] });
                   try{ const d = ensureDiag(symbol); if (d) d.decisionIntelligence = { direction: finalSnap.direction, bullishScore: finalSnap.bullishScore, bearishScore: finalSnap.bearishScore, hasConflict: finalSnap.hasConflict, hasIndependentBullishSupport: finalSnap.hasIndependentBullishSupport, hasIndependentBearishSupport: finalSnap.hasIndependentBearishSupport, analysisQuality: finalSnap.analysisQuality, selectedSupportingSignals: finalSnap.selectedSupportingSignals, warnings: finalSnap.warnings, reasoning: finalSnap.reasoning }; }catch(_){ }
-                }catch(_){ }
+                  try{ pendingDecisionActionBySymbol.delete(String(symbol||'').toUpperCase()); }catch(_){ }
+                }catch(_){ try{ pendingDecisionActionBySymbol.delete(String(symbol||'').toUpperCase()); }catch(_){ } }
               }
             }catch(_){ }
             const decRes = DecisionEngine.evaluateDecision(decInput);
