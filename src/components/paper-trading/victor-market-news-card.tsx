@@ -2,8 +2,52 @@
 
 import React, { useState } from 'react';
 
-export default function VictorMarketNewsCard({ activity, latestDecision, nextRunCountdown }: { activity: { title: string; message: string } | undefined | null, latestDecision?: any | null, nextRunCountdown?: string | null }){
-  const [showReasoning, setShowReasoning] = useState(false);
+type MarketRegimeView = {
+  primaryRegime: string | null;
+  volatilityRegime: string | null;
+  riskRegime: string | null;
+  confidencePercent: number | null;
+  strength: string | null;
+  quality: string | null;
+  warnings: readonly string[];
+};
+
+type HistoricalContextView = {
+  shortTrend: string | null;
+  mediumTrend: string | null;
+  longTrend: string | null;
+  trendAgreement: number | null;
+  volatilityState: string | null;
+  momentumPersistence: string | null;
+  currentDrawdownPercent: number | null;
+  rangePositionPercent: number | null;
+  volumeTrend: string | null;
+  warnings: readonly string[];
+};
+
+type VictorMarketNewsCardProps = { activity: { title: string; message: string } | undefined | null; latestDecision?: any | null; nextRunCountdown?: string | null; initiallyExpanded?: boolean };
+
+function mapPrimaryRegimeToSwedish(r: string | null | undefined){
+  if (!r) return 'Okänt';
+  const up = String(r).toUpperCase();
+  if (up === 'BULL_TREND') return 'Bulltrend';
+  if (up === 'BEAR_TREND') return 'Beartrend';
+  if (up === 'SIDEWAYS') return 'Sidledes marknad';
+  if (up === 'BREAKOUT') return 'Utbrottsläge';
+  if (up === 'MEAN_REVERSION') return 'Återgång mot medelvärdet';
+  return 'Okänt';
+}
+
+function mapRiskRegimeToSwedish(r: string | null | undefined){
+  if (!r) return 'Neutralt riskläge';
+  const up = String(r).toUpperCase();
+  if (up === 'RISK_ON') return 'Riskvilja';
+  if (up === 'RISK_OFF') return 'Riskaversion';
+  return 'Neutralt riskläge';
+}
+
+export default function VictorMarketNewsCard({ activity, latestDecision, nextRunCountdown, initiallyExpanded }: VictorMarketNewsCardProps){
+  const [showReasoning, setShowReasoning] = useState(Boolean(initiallyExpanded));
   if (!activity) return null;
   return (
     <section className="mt-3 bg-white border rounded p-3">
@@ -57,8 +101,8 @@ export default function VictorMarketNewsCard({ activity, latestDecision, nextRun
           <div className="mt-3 font-semibold">Beslutsunderlag</div>
           <div className="mt-1">────────────</div>
 
-          {latestDecision ? (
-            <div className="mt-2 text-gray-600">
+              {latestDecision ? (
+                <div className="mt-2 text-gray-600">
               <div><strong>Beslut:</strong> {latestDecision.action ? String(latestDecision.action).toUpperCase() : '—'}</div>
               <div className="mt-1"><strong>Confidence:</strong> {(typeof latestDecision.confidence === 'number') ? String(latestDecision.confidence) + ' %' : '—'}</div>
               <div className="mt-2"><strong>Motivering / sammanfattning:</strong></div>
@@ -87,9 +131,116 @@ export default function VictorMarketNewsCard({ activity, latestDecision, nextRun
                 </div>
               ) : null}
             </div>
-          ) : (
-            <div className="mt-2 text-gray-600">Underlag saknas för detta beslut.</div>
-          )}
+              ) : (
+                <div className="mt-2 text-gray-600">Underlag saknas för detta beslut.</div>
+              )}
+
+              {/* Additional diagnostics: Market Regime, Historical Context, Context Impact */}
+              <div className="mt-4">
+                <div className="font-semibold">Marknadskontext</div>
+                <div className="mt-2 grid grid-cols-1 gap-2 text-sm text-gray-700">
+                  {/* Market Regime */}
+                  {(() => {
+                    try{
+                      const diag = latestDecision && latestDecision.marketContextDiagnostics ? latestDecision.marketContextDiagnostics : null;
+                      const mr = diag && diag.marketRegime ? diag.marketRegime : null;
+                      if (!mr) return (<div className="text-gray-500">Marknadsläge saknas</div>);
+                      const mapRegime = (r:any) => ({
+                        primaryRegime: mapPrimaryRegimeToSwedish(r.primaryRegime || null),
+                        volatilityRegime: r.volatilityRegime || null,
+                        riskRegime: mapRiskRegimeToSwedish(r.riskRegime || null),
+                        confidencePercent: typeof r.confidence === 'number' && isFinite(r.confidence) ? Math.round(r.confidence * 100) / 100 : null,
+                        strength: r.strength || null,
+                        quality: r.quality || null,
+                        warnings: Array.isArray(r.warnings) ? r.warnings.slice(0,5) : []
+                      }) as MarketRegimeView;
+                      const mv = mapRegime(mr);
+                      const present = (k:string|null) => k ? k : 'Okänt';
+                      return (
+                        <div>
+                          <div className="text-xs text-gray-500">MARKNADSLÄGE</div>
+                          <div className="mt-1 grid grid-cols-2 gap-2">
+                            <div><strong>Regim:</strong> {present(mv.primaryRegime)}</div>
+                            <div><strong>Volatilitet:</strong> {present(mv.volatilityRegime)}</div>
+                            <div><strong>Riskläge:</strong> {present(mv.riskRegime)}</div>
+                            <div><strong>Confidence:</strong> {mv.confidencePercent !== null ? String(mv.confidencePercent) + ' %' : '—'}</div>
+                            <div><strong>Strength:</strong> {present(mv.strength)}</div>
+                            <div><strong>Datakvalitet:</strong> {present(mv.quality)}</div>
+                          </div>
+                        </div>
+                      );
+                    }catch(_){ return (<div className="text-gray-500">Marknadsläge saknas</div>); }
+                  })()}
+
+                  {/* Historical Context */}
+                  {(() => {
+                    try{
+                      const diag = latestDecision && latestDecision.marketContextDiagnostics ? latestDecision.marketContextDiagnostics : null;
+                      const hc = diag && diag.historicalContext ? diag.historicalContext : null;
+                      if (!hc) return (<div className="text-gray-500">Historisk kontext saknas</div>);
+                      const mapHist = (h:any) => ({
+                        shortTrend: h.shortTrend || null,
+                        mediumTrend: h.mediumTrend || null,
+                        longTrend: h.longTrend || null,
+                        trendAgreement: typeof h.trendAgreement === 'number' ? Math.round(Number(h.trendAgreement) * 100) / 100 : null,
+                        volatilityState: h.volatilityState || null,
+                        momentumPersistence: h.momentumPersistence || null,
+                        currentDrawdownPercent: typeof h.currentDrawdownPercent === 'number' && isFinite(h.currentDrawdownPercent) ? Math.round(h.currentDrawdownPercent * 100) / 100 : null,
+                        rangePositionPercent: typeof h.rangePosition === 'number' && isFinite(h.rangePosition) ? Math.round(h.rangePosition * 10000) / 100 : null,
+                        volumeTrend: h.volumeTrend || null,
+                        warnings: Array.isArray(h.warnings) ? h.warnings.slice(0,5) : []
+                      }) as HistoricalContextView;
+                      const hv = mapHist(hc);
+                      return (
+                        <div>
+                          <div className="text-xs text-gray-500">HISTORISK KONTEXT</div>
+                          <div className="mt-1 grid grid-cols-2 gap-2">
+                            <div><strong>Kort trend:</strong> {hv.shortTrend ?? '—'}</div>
+                            <div><strong>Medeltrend:</strong> {hv.mediumTrend ?? '—'}</div>
+                            <div><strong>Lång trend:</strong> {hv.longTrend ?? '—'}</div>
+                            <div><strong>Överensstämmelse:</strong> {hv.trendAgreement !== null ? String(hv.trendAgreement) : '—'}</div>
+                            <div><strong>Volatilitet:</strong> {hv.volatilityState ?? '—'}</div>
+                            <div><strong>Momentum:</strong> {hv.momentumPersistence ?? '—'}</div>
+                            <div><strong>Aktuell drawdown:</strong> {hv.currentDrawdownPercent !== null ? String(hv.currentDrawdownPercent) + ' %' : '—'}</div>
+                            <div><strong>Position i intervall:</strong> {hv.rangePositionPercent !== null ? String(hv.rangePositionPercent) + ' %' : '—'}</div>
+                            <div><strong>Volymtrend:</strong> {hv.volumeTrend ?? '—'}</div>
+                          </div>
+                        </div>
+                      );
+                    }catch(_){ return (<div className="text-gray-500">Historisk kontext saknas</div>); }
+                  })()}
+
+                  {/* Context impact */}
+                  {(() => {
+                    try{
+                      const diag = latestDecision && latestDecision.marketContextDiagnostics ? latestDecision.marketContextDiagnostics : null;
+                      const ca = diag && diag.contextAlignment ? String(diag.contextAlignment) : null;
+                      const summary = diag && Array.isArray(diag.contextSummary) ? diag.contextSummary.slice(0,5) : [];
+                      const mapAlign = (a:string|null) => {
+                        if (!a) return 'Otillräcklig data';
+                        const up = String(a).toUpperCase();
+                        if (up === 'SUPPORTIVE') return 'Stödjer beslutet';
+                        if (up === 'CONFLICTING') return 'Motsäger beslutet';
+                        if (up === 'NEUTRAL') return 'Neutral påverkan';
+                        if (up === 'INSUFFICIENT') return 'Otillräcklig data';
+                        return 'Okänt';
+                      };
+                      return (
+                        <div>
+                          <div className="text-xs text-gray-500">KONTEXTENS PÅVERKAN PÅ BESLUTET</div>
+                          <div className="mt-1"><strong>{mapAlign(ca)}</strong></div>
+                          {summary.length > 0 ? (
+                            <ul className="list-disc list-inside mt-2 text-gray-700">
+                              {summary.map((s:any,i:number)=>(<li key={i}>{String(s)}</li>))}
+                            </ul>
+                          ) : null}
+                        </div>
+                      );
+                    }catch(_){ return (<div className="text-gray-500">Kontekstens påverkan saknas</div>); }
+                  })()}
+
+                </div>
+              </div>
         </div>
       )}
     </section>
