@@ -18,6 +18,7 @@ import analyzePriceSeries from './technical';
 import classifyMarketRegime from './market-regime-classifier';
 import buildMarketContextAdvice from './market-context-advisor';
 import buildHistoricalContext from './historical-context-engine';
+import type { HistoricalMarketContextSnapshot } from './historical-market-context';
 import buildDecisionConfidenceExplanation from './decision-confidence-explainer';
 import buildDecisionEvidence from './evidence-aggregator';
 import analyzeEvidenceConsistency from './evidence-consistency-analyzer';
@@ -66,6 +67,7 @@ type RuntimeState = {
   autonomousEnabled: boolean;
   latestDecisionIntelligenceBySymbol?: Record<string, any>;
   latestFundamentalIntelligenceBySymbol?: Record<string, any>;
+  latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   forexReadiness?: ForexReadinessState | null;
   forexAutonomyArmed?: boolean;
   forexLaunchControl?: ForexLaunchControlState | null;
@@ -672,6 +674,7 @@ const runtime: RuntimeState = {
   lastUpdated: nowIso(),
   autonomousEnabled: true,
   latestDecisionIntelligenceBySymbol: {},
+  latestHistoricalMarketContextBySymbol: {},
   forexReadiness: null,
   forexAutonomyArmed: false,
   forexLaunchControl: null,
@@ -1201,6 +1204,40 @@ export async function getPaperTradingState(){
       }
       out.latestFundamentalIntelligenceBySymbol = safeFund;
     }catch(_){ out.latestFundamentalIntelligenceBySymbol = {}; }
+      // Expose latest sanitized Historical Market Context per symbol for UI/state
+      try{
+        const rawMapH = runtime.latestHistoricalMarketContextBySymbol || {};
+        const safeHist: Record<string, HistoricalMarketContextSnapshot> = {};
+        for (const k of Object.keys(rawMapH || {})){
+          try{
+            const v = (rawMapH as Record<string, any>)[k]; if (!v) continue;
+            safeHist[k] = {
+              schemaVersion: v.schemaVersion,
+              source: v.source,
+              symbol: v.symbol,
+              observedAt: v.observedAt,
+              generatedAt: v.generatedAt,
+              observationCount: v.observationCount,
+              hasVolume: v.hasVolume,
+              dataQuality: v.dataQuality,
+              missingCapabilities: Array.isArray(v.missingCapabilities) ? v.missingCapabilities.slice() : [],
+              shortTrend: v.shortTrend,
+              mediumTrend: v.mediumTrend,
+              longTrend: v.longTrend,
+              trendAgreement: v.trendAgreement,
+              volatilityState: v.volatilityState,
+              momentumPersistence: v.momentumPersistence,
+              currentDrawdownPercent: typeof v.currentDrawdownPercent === 'number' ? v.currentDrawdownPercent : null,
+              maxDrawdownPercent: typeof v.maxDrawdownPercent === 'number' ? v.maxDrawdownPercent : null,
+              recoveryPercent: typeof v.recoveryPercent === 'number' ? v.recoveryPercent : null,
+              rangePosition: typeof v.rangePosition === 'number' ? v.rangePosition : null,
+              volumeTrend: v.volumeTrend,
+              warnings: Array.isArray(v.warnings) ? v.warnings.slice() : []
+            };
+          }catch(_){ }
+        }
+        out.latestHistoricalMarketContextBySymbol = safeHist;
+      }catch(_){ out.latestHistoricalMarketContextBySymbol = {}; }
   // Expose latest market news activity from the most recent CYCLE_INTELLIGENCE_SNAPSHOT audit (if any)
   try{
     let latestActivity: MarketNewsActivity | undefined = undefined;
@@ -1668,6 +1705,45 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     return historicalRequestsBySymbol.get(sym) as Promise<any>;
   }
 
+  // Per-cycle cache for built historical market contexts (one build per symbol per cycle)
+  const historicalMarketContextBySymbol = new Map<string, Promise<any>>();
+
+  // Build or return cached historical market context for a symbol. Uses existing per-cycle
+  // `historicalRequestsBySymbol` to avoid extra provider calls. Appends a sanitized audit
+  // snapshot once per symbol and updates runtime.latestHistoricalMarketContextBySymbol.
+  async function getOrBuildHistoricalMarketContext(symbol: string){
+    const sym = String(symbol).toUpperCase();
+    if (!sym) return null;
+    if (historicalMarketContextBySymbol.has(sym)) return historicalMarketContextBySymbol.get(sym) as Promise<any>;
+    const p = (async ()=>{
+      try{
+        const mod = await import('./historical-market-context');
+        const hist = await getHistoricalForSymbol(sym).catch(()=>null);
+        if (!hist || !Array.isArray(hist.closes) || !Array.isArray(hist.dates)){
+          const ctx = mod.buildHistoricalMarketContext({ symbol: sym, closes: [], dates: [], volumes: [], now: new Date() });
+          // Mark provider-unavailable so downstream contracts can distinguish a provider failure
+          try{ if (Array.isArray(ctx.warnings) && !ctx.warnings.includes('HISTORICAL_PROVIDER_UNAVAILABLE')) ctx.warnings.push('HISTORICAL_PROVIDER_UNAVAILABLE'); }catch(_){ }
+          try{ if (Array.isArray(ctx.missingCapabilities) && !ctx.missingCapabilities.includes('HISTORICAL_PROVIDER')) ctx.missingCapabilities.push('HISTORICAL_PROVIDER'); }catch(_){ }
+          try{ const audit = Object.assign({ id: `historical_${sym}_${cycleId}`, timestamp: new Date().toISOString() }, mod.buildHistoricalContextAuditPayload(cycleId, ctx)); await cycleAuditStore.append(audit as AuditEntry); }catch(_){ }
+          try{ runtime.latestHistoricalMarketContextBySymbol = runtime.latestHistoricalMarketContextBySymbol || {}; runtime.latestHistoricalMarketContextBySymbol[sym] = mod.sanitizeContextForState(ctx); }catch(_){ }
+          return ctx;
+        }
+        // Build using available fields; volumes optional
+        const input = { symbol: sym, closes: hist.closes, dates: hist.dates, volumes: Array.isArray(hist.volumes) ? hist.volumes : undefined, fetchedAt: hist.fetchedAt || hist.fetchedAtAt || undefined, now: new Date() };
+        const ctx = mod.buildHistoricalMarketContext(input);
+        // Append sanitized audit (best-effort)
+        try{ const audit = Object.assign({ id: `historical_${sym}_${cycleId}`, timestamp: new Date().toISOString() }, mod.buildHistoricalContextAuditPayload(cycleId, ctx)); await cycleAuditStore.append(audit as AuditEntry); }catch(_){ }
+        try{ runtime.latestHistoricalMarketContextBySymbol = runtime.latestHistoricalMarketContextBySymbol || {}; runtime.latestHistoricalMarketContextBySymbol[sym] = mod.sanitizeContextForState(ctx); }catch(_){ }
+        return ctx;
+      }catch(e){
+        try{ historicalRequestsBySymbol.delete(sym); }catch(_){ }
+        return null;
+      }
+    })();
+    historicalMarketContextBySymbol.set(sym, p);
+    return p;
+  }
+
   // Per-cycle cache for built signal packages (dedupe building of market-structure + related signals)
   const signalsBySymbol = new Map<string, Promise<any[]>>();
   // Per-cycle cache for confluence summaries
@@ -1686,6 +1762,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     if (confluenceBySymbol.has(sym)) return confluenceBySymbol.get(sym) as Promise<any>;
     const p = (async ()=>{
       try{
+        // Ensure historical market context is built first (per requirement)
+        try{ await getOrBuildHistoricalMarketContext(sym); }catch(_){ }
         const mod = await import('./signal-confluence');
         const summary = mod.buildSignalConfluenceSummary(sym, marketSignals, ts || new Date().toISOString());
         // also compute quality once and attach to summary object for reuse
