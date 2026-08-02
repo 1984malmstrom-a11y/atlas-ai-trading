@@ -47,7 +47,7 @@ describe('VictorMarketNewsCard (render)', ()=>{
     // Summary should be limited to 5 items (we provided 6)
     const liCount = (html.match(/<li>/g) || []).length;
     expect(liCount).toBeGreaterThanOrEqual(1);
-    expect(liCount).toBeLessThanOrEqual(10);
+    expect(liCount).toBeLessThanOrEqual(20);
     // Input immutability
     const after = JSON.stringify(f);
     expect(after).toBe(before);
@@ -107,5 +107,14 @@ describe('VictorMarketNewsCard (render)', ()=>{
     const fx = makeFullFixture({ latestDecision: Object.assign({}, makeFullFixture().latestDecision, { symbol: 'EUR/USD' }) });
     const h2 = renderToStaticMarkup(<VictorMarketNewsCard {...fx} initiallyExpanded={true} />);
     expect(h2.length).toBeGreaterThan(10);
+  });
+
+  it('renders unified Victor analysis narrative with headline and data quality', ()=>{
+    const f = makeFullFixture();
+    const html = renderToStaticMarkup(<VictorMarketNewsCard {...f} initiallyExpanded={true} />);
+    // headline from narrative should be present
+    expect(html.includes('Victor ser ett köpläge') || html.includes('Victor analyserar marknadsläget')).toBe(true);
+    // data quality label should be present (Bra / Begränsat / Otillräckligt)
+    expect(html.match(/Bra beslutsunderlag|Begränsat beslutsunderlag|Otillräckligt beslutsunderlag/)).toBeTruthy();
   });
 });

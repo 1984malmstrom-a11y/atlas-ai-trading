@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from 'react';
+import { buildVictorAnalysisNarrative, VictorDecisionViewInput } from '../../lib/paper-trader/victor-analysis-narrative';
 
 type MarketRegimeView = {
   primaryRegime: string | null;
@@ -25,7 +26,7 @@ type HistoricalContextView = {
   warnings: readonly string[];
 };
 
-type VictorMarketNewsCardProps = { activity: { title: string; message: string } | undefined | null; latestDecision?: any | null; nextRunCountdown?: string | null; initiallyExpanded?: boolean };
+type VictorMarketNewsCardProps = { activity: { title: string; message: string } | undefined | null; latestDecision?: VictorDecisionViewInput | null; nextRunCountdown?: string | null; initiallyExpanded?: boolean };
 
 function mapPrimaryRegimeToSwedish(r: string | null | undefined){
   if (!r) return 'Okänt';
@@ -134,6 +135,34 @@ export default function VictorMarketNewsCard({ activity, latestDecision, nextRun
               ) : (
                 <div className="mt-2 text-gray-600">Underlag saknas för detta beslut.</div>
               )}
+
+              {/* Unified Victor analysis narrative (presentation-only) */}
+              {(() => {
+                try{
+                  const nv = latestDecision ? buildVictorAnalysisNarrative(latestDecision) : null;
+                  if (!nv) return null;
+                  const renderList = (arr: readonly string[] | undefined) => Array.isArray(arr) && arr.length ? (<ul className="list-disc list-inside mt-1 text-gray-700">{arr.map((s,i)=>(<li key={i}>{String(s)}</li>))}</ul>) : null;
+                  return (
+                    <div className="mt-4">
+                      <div className="font-semibold">Victors samlade analys</div>
+                      <div className="mt-1 text-sm text-gray-800"><strong>{nv.headline}</strong></div>
+                      <div className="mt-1 text-sm text-gray-700">{nv.verdict}</div>
+                      {nv.whyNow && nv.whyNow.length ? (<div className="mt-2 text-xs text-gray-500">Varför nu?</div>) : null}
+                      {renderList(nv.whyNow)}
+                      {nv.supportingFactors && nv.supportingFactors.length ? (<div className="mt-2 text-xs text-gray-500">Det som stödjer</div>) : null}
+                      {renderList(nv.supportingFactors)}
+                      {nv.conflictingFactors && nv.conflictingFactors.length ? (<div className="mt-2 text-xs text-gray-500">Det som talar emot</div>) : null}
+                      {renderList(nv.conflictingFactors)}
+                      {nv.riskFactors && nv.riskFactors.length ? (<div className="mt-2 text-xs text-gray-500">Risker</div>) : null}
+                      {renderList(nv.riskFactors)}
+                      {nv.watchNext && nv.watchNext.length ? (<div className="mt-2 text-xs text-gray-500">Det Victor bevakar</div>) : null}
+                      {renderList(nv.watchNext)}
+                      <div className="mt-2 text-xs text-gray-500">Beslutsunderlag / Datakvalitet</div>
+                      <div className="mt-1 text-sm text-gray-700">{nv.dataQuality.label}</div>
+                    </div>
+                  );
+                }catch(_){ return null; }
+              })()}
 
               {/* Additional diagnostics: Market Regime, Historical Context, Context Impact */}
               <div className="mt-4">
