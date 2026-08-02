@@ -57,6 +57,7 @@ import { acquireRunCycleLockWithOwner, releaseRunCycleLock } from './run-cycle-l
 import { createMarketNewsIntelligenceSummary, MarketNewsIntelligenceSummary } from './cycle-intelligence-snapshot';
 import { createMarketNewsActivity, MarketNewsActivity } from './market-news-activity';
 import { createPerCycleCompanyNewsResolver, sanitizeCompanyNewsContextForState } from './company-news-context';
+import { createPerCycleMacroEventResolver, sanitizeMacroEventContextForState } from './macro-event-context';
 import { fetchFinnhubCompanyNews } from '../news-providers/finnhub';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
@@ -77,6 +78,7 @@ type RuntimeState = {
   latestCompanyNewsContextBySymbol?: Record<string, any>;
   latestEarningsEventContextBySymbol?: Record<string, any>;
   latestMarketEventRiskContextBySymbol?: Record<string, any>;
+  latestMacroEventContext?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
@@ -1984,6 +1986,15 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     }catch(_){ return null; }
   })();
 
+  // Per-cycle macro calendar resolver: shared once-per-cycle calendar (may be unavailable)
+  const perCycleMacroResolver = ((): any => {
+    try{
+      const mod = require('./macro-event-context');
+      // No provider configured by default: fetcher returns null (UNKNOWN fallback)
+      return mod.createPerCycleMacroEventResolver({ fetchMacroCalendar: async ({ now }:{ now?: Date } = {}) => { return null; }, timeoutMs: 4000, updateState: (k:string, r:any) => { try{ runtime.latestMacroEventContext = runtime.latestMacroEventContext || {}; runtime.latestMacroEventContext['GLOBAL'] = r; }catch(_){ } } });
+    }catch(_){ return null; }
+  })();
+
   // Per-cycle decision intelligence resolver (created once per cycle)
   let decisionIntelligenceResolver: any = null;
 
@@ -2066,15 +2077,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                 try{ (primary as any).companyNewsContext = sanitizeCompanyNewsContextForState(cctx); }catch(_){ (primary as any).companyNewsContext = null; }
               }
             }catch(_){ try{ (primary as any).companyNewsContext = null; }catch(_){ } }
-            // Attach sanitized market event risk context (diagnostic-only) when available via per-cycle earnings resolver
+            // Attach sanitized market event risk context (diagnostic-only) when available via per-cycle earnings resolver and macro resolver
             try{
               if (sym && typeof perCycleEarningsResolver !== 'undefined' && perCycleEarningsResolver){
                 const ectx = await perCycleEarningsResolver.resolve({ symbol: sym, analyzed: true }).catch(()=>null);
+                let mctx: any = null;
+                try{ if (typeof perCycleMacroResolver !== 'undefined' && perCycleMacroResolver){ mctx = await perCycleMacroResolver.resolve().catch(()=>null); } }catch(_){ mctx = null; }
                 try{
                   const merMod = require('./market-event-risk-context');
-                  const mer = merMod.buildMarketEventRiskContext({ symbol: sym, earnings: ectx, macro: null, now: new Date() });
+                  const mer = merMod.buildMarketEventRiskContext({ symbol: sym, earnings: ectx, macro: mctx || null, now: new Date() });
                   try{ (primary as any).marketEventRiskContext = merMod.sanitizeMarketEventRiskContextForState(mer); }catch(_){ (primary as any).marketEventRiskContext = null; }
                   try{ runtime.latestMarketEventRiskContextBySymbol = runtime.latestMarketEventRiskContextBySymbol || {}; runtime.latestMarketEventRiskContextBySymbol[sym] = merMod.sanitizeMarketEventRiskContextForState(mer); }catch(_){ }
+                  try{ if (mctx){ try{ runtime.latestMacroEventContext = runtime.latestMacroEventContext || {}; runtime.latestMacroEventContext['GLOBAL'] = sanitizeMacroEventContextForState(mctx); }catch(_){ } } }catch(_){ }
                 }catch(_){ try{ (primary as any).marketEventRiskContext = null; }catch(_){ } }
               }
             }catch(_){ try{ (primary as any).marketEventRiskContext = null; }catch(_){ } }
