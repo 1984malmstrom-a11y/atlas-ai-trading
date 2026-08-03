@@ -974,7 +974,18 @@ export default function Page(){
 
             <div className="mt-4">
               {(() => {
-                const reasoning = Array.isArray(latestDecision?.reasoning) ? latestDecision.reasoning : [];
+                // Prefer presentation snapshot reasoning when available for multi-market analyses
+                let reasoning: any[] = Array.isArray(latestDecision?.reasoning) ? latestDecision.reasoning : (latestDecision?.reasoning ? [latestDecision.reasoning] : []);
+
+                // If the unified presentation describes a multi-market abstain due to insufficient signals,
+                // show a clear, user-facing sentence instead of legacy fallback lines like "Saknar marknadsdata".
+                try{
+                  const insufficientLabels = ['Otillräckligt underlag','Begränsat underlag'];
+                  if (presentation && presentation.analyzedCount > 0 && presentation.displayAction === 'Avstår' && (presentation.opportunityCount === 0 || presentation.opportunityCount === undefined) && insufficientLabels.includes(String(presentation.analysisQualityLabel))){
+                    const preferred = presentation.summary || presentation.activityDetail || 'Inga marknader hade tillräckligt många stödjande signaler för att skapa en handelskandidat.';
+                    reasoning = [preferred];
+                  }
+                }catch(_){ }
 
                 // system keywords: these sentences are simulation/system info and must be shown separately
                 const sysKeywords = ['simulerad','verifiering','paper trader','ingen riktig order','skickas till marknaden','demo','test','runtime','api','ingen riktig order skickades','ingen riktig order skickas','simulerad victor','simulerad victor-cykel'];
@@ -983,6 +994,8 @@ export default function Page(){
                 const financialParts: string[] = [];
                 for (const r of reasoning){
                   const text = (''+r).toLowerCase();
+                  // suppress legacy "Saknar marknadsdata" unless this is truly a historical fallback
+                  if (text.includes('saknar marknadsdata') && !(presentation && presentation.isHistoricalFallback)) continue;
                   if (sysKeywords.some(k => text.includes(k))){ systemParts.push(r); }
                   else { financialParts.push(r); }
                 }
