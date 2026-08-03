@@ -258,28 +258,22 @@ export default function Page(){
 
     // build natural Swedish activity summary
     function naturalSummary(){
-      if (!s) return null;
-      const when = s.lastAutomaticRunAt ? formatDateTimeLocal(s.lastAutomaticRunAt) : null;
-      // Prefer latest completed cycle decision summary for the natural sentence
-      try{
-        const cycleSummary = s.latestCycle && s.latestCycle.decisionSummary ? s.latestCycle.decisionSummary : null;
-        if (cycleSummary){
-          const analyzed = Array.isArray(cycleSummary.analyzedSymbols) ? cycleSummary.analyzedSymbols.length : (s.latestMultiTimeframeTechnicalIntelligenceBySymbol ? Object.keys(s.latestMultiTimeframeTechnicalIntelligenceBySymbol).length : null);
-          const decisions = Array.isArray(cycleSummary.decisions) ? cycleSummary.decisions : [];
-          const analyzedText = (typeof analyzed === 'number') ? `${analyzed} marknader` : 'marknaden';
-          if (when) {
-            if (decisions.length > 0){
-              const d = decisions[0];
-              const action = d && d.action ? mapAction(d.action) : null;
-              const sym = d && d.symbol ? d.symbol : null;
-              return `${when} analyserade Victor ${analyzedText}${sym ? ' — ' + sym + ' ' + (action || '') : ''}`;
+        if (!s) return null;
+        // Prefer unified presentation snapshot when available
+        try{
+          if (presentation){
+            const when = presentation.timestamp ? formatDateTimeLocal(presentation.timestamp) : (s.lastAutomaticRunAt ? formatDateTimeLocal(s.lastAutomaticRunAt) : null);
+            const analyzedText = typeof presentation.analyzedCount === 'number' ? `${presentation.analyzedCount} marknader` : 'marknaden';
+            const action = presentation.displayAction || null;
+            const summary = presentation.summary || presentation.activityDetail || '';
+            if (when){
+              if (action && action !== 'Avstår') return `${when} analyserade Victor ${analyzedText} — ${action}`;
+              // abstain wording when no action
+              return `${when} analyserade Victor ${analyzedText} och avstod från handel — ${summary || (presentation.analysisQualityLabel || 'Otillräckligt underlag')}`;
             }
-            return `${when} analyserade Victor ${analyzedText}`;
           }
-          return null;
-        }
-      }catch(_){ }
-      return null;
+        }catch(_){ }
+        return null;
     }
 
     // activity feed (up to 3 lines) derived from available data
@@ -470,20 +464,38 @@ export default function Page(){
               const sym = s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : null;
               const action = s.latestDecision && s.latestDecision.action ? (function(a:any){ const up = String(a).toUpperCase(); if (up==='HOLD') return 'Behåll'; if (up==='BUY') return 'Köp'; if (up==='SELL') return 'Sälj'; if (up==='REJECT' || up==='REJECTED') return 'Avvisad'; return up; })(s.latestDecision.action) : null;
               const reason = s.lastAutomaticRunMessage || (s.latestDecision && Array.isArray(s.latestDecision.reasoning) ? s.latestDecision.reasoning[0] : null);
-              const headline = sym ? `Victor analyserade ${sym}` : 'Victor slutförde en marknadsanalys';
-              return (
-                <div className="flex items-start gap-3">
-                  <div className="text-xs text-gray-500 mt-1">{time}</div>
-                  <div className="flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="w-2 h-2 rounded-full bg-blue-400 mt-1" />
-                            <div className="text-sm font-semibold text-gray-800">{headline}</div>
-                            {action ? (<div className="ml-2 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-700">{action}</div>) : null}
-                          </div>
-                          {reason ? (<div className="mt-1 text-sm text-gray-600 flex items-start gap-2"><span className="w-2 h-2 rounded-full bg-amber-300 mt-1" /> <div>{String(reason)}</div></div>) : null}
+                // When presentation describes a multi-market analysis, prefer that summary
+                if (presentation && (presentation.source === 'SUCCESS_CYCLE' || presentation.source === 'INTELLIGENCE_MAPS') && presentation.analyzedCount > 0){
+                  const pt = presentation.timestamp ? new Date(presentation.timestamp) : new Date(s.lastAutomaticRunAt);
+                  const timeStr = pt ? pt.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' }) : time;
+                  return (
+                    <div className="flex items-start gap-3">
+                      <div className="text-xs text-gray-500 mt-1">{timeStr}</div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-blue-400 mt-1" />
+                          <div className="text-sm font-semibold text-gray-800">{presentation.activityTitle}</div>
+                          <div className="ml-2 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-700">{presentation.displayAction}</div>
+                        </div>
+                        <div className="mt-1 text-sm text-gray-600">Ingen handelssignal identifierades</div>
+                      </div>
+                    </div>
+                  );
+                }
+                const headline = sym ? `Victor analyserade ${sym}` : 'Victor slutförde en marknadsanalys';
+                return (
+                  <div className="flex items-start gap-3">
+                    <div className="text-xs text-gray-500 mt-1">{time}</div>
+                    <div className="flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="w-2 h-2 rounded-full bg-blue-400 mt-1" />
+                              <div className="text-sm font-semibold text-gray-800">{headline}</div>
+                              {action ? (<div className="ml-2 px-2 py-0.5 rounded text-xs bg-gray-100 text-gray-700">{action}</div>) : null}
+                            </div>
+                            {reason ? (<div className="mt-1 text-sm text-gray-600 flex items-start gap-2"><span className="w-2 h-2 rounded-full bg-amber-300 mt-1" /> <div>{String(reason)}</div></div>) : null}
+                    </div>
                   </div>
-                </div>
-              );
+                );
             })()}
           </div>
         </div>
