@@ -2231,6 +2231,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     // Wait for per-symbol intelligence builds (isolate failures) before finalizing cycle
     try{ await Promise.allSettled(perCycleBuildPromises); }catch(_){ }
 
+    // (Decision Intelligence finalization deferred until after resolver creation)
+
   // Helper: build or return cached confluence summary for a symbol
   async function getOrBuildConfluence(symbol: string, marketSignals: any, ts?: string){
     const sym = String(symbol).toUpperCase();
@@ -2391,6 +2393,35 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       try{ const sym = String(s||'').toUpperCase(); if (!sym) return null; return (runtime.latestForexSessionIntelligenceBySymbol && runtime.latestForexSessionIntelligenceBySymbol[sym]) ? runtime.latestForexSessionIntelligenceBySymbol[sym] : null; }catch(_){ return null; }
     } });
   }catch(_){ decisionIntelligenceResolver = null; }
+
+  // After creating the decision intelligence resolver, run a single deterministic finalize pass
+  try{
+    if (decisionIntelligenceResolver && Array.isArray(symbols) && symbols.length > 0){
+      // normalize and dedupe symbols for this cycle
+      const normSymbols = Array.from(new Set(symbols.filter(s=> !!s).map((s:any)=> String(s).toUpperCase())));
+      const finalizeResults: Array<{ symbol: string; snap: any | null; error?: any }> = [];
+      // finalize each symbol sequentially to avoid flooding appendAudit and to simplify ordering
+      for (const sym of normSymbols){
+        try{
+          const s = String(sym).toUpperCase();
+          try{
+            const snap = await decisionIntelligenceResolver.finalizeSnapshot({ symbol: s, selectedSupportingSignalIds: [] }).catch(()=>null);
+            // Ensure runtime state has the sanitized snapshot; appendAudit is primary but may silently fail
+            try{
+              if (snap){
+                const existing = runtime.latestDecisionIntelligenceBySymbol && runtime.latestDecisionIntelligenceBySymbol[String(s).toUpperCase()] ? runtime.latestDecisionIntelligenceBySymbol[String(s).toUpperCase()] : null;
+                if (!existing){
+                  try{ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; runtime.latestDecisionIntelligenceBySymbol[String(s).toUpperCase()] = sanitizeDecisionIntelligenceForState(snap); }catch(_){ }
+                }
+              }
+            }catch(_){ }
+            finalizeResults.push({ symbol: s, snap });
+          }catch(errSym){ finalizeResults.push({ symbol: s, snap: null, error: errSym }); }
+        }catch(_){ /* isolate symbol errors */ }
+      }
+      // best-effort await complete (all done sequentially already)
+    }
+  }catch(_){ }
 
   // Create per-cycle shadow resolver using per-cycle getters and diagnostics builder
   const contextAwareShadowResolver = createPerCycleContextAwareShadowResolver({

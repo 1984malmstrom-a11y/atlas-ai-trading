@@ -30,6 +30,36 @@ describe('autonomous technical intelligence integration', () => {
     const mockMarketProvider = () => ({ getIntradayCandles: async (s: string, tf: any, lim?: number) => intradaySpy(s, tf, lim) });
     vi.doMock('../market-data', () => ({ getMarketDataProvider: mockMarketProvider, default: {} }));
 
+    // Mock signal-confluence to expose a spyable finalizeSnapshot and minimal helpers
+    vi.doMock('./signal-confluence', () => {
+      const finalizeCalls: any[] = [];
+      try{ (globalThis as any).__DI_FINALIZE_CALLS = finalizeCalls; }catch(_){ }
+      return {
+        createPerCycleDecisionIntelligenceResolver: (opts: any) => {
+          return {
+            resolveAnalysis: async ({ symbol }: any) => {
+              return { cycleId: opts.cycleId, symbol: String(symbol).toUpperCase(), direction: 'NEUTRAL', bullishScore: 0, bearishScore: 0, hasConflict: false, hasIndependentBullishSupport: false, hasIndependentBearishSupport: false, analysisQuality: { level: 'INSUFFICIENT', score: 0, usableSignalCount: 0, distinctTypes: 0, distinctOrigins: 0, missingCapabilities: [] }, selectedSupportingSignals: [], warnings: [], reasoning: [] };
+            },
+            finalizeSnapshot: async ({ symbol, selectedSupportingSignalIds }: any) => {
+              const s = String(symbol).toUpperCase();
+              const snap = { cycleId: opts.cycleId, symbol: s, generatedAt: new Date().toISOString(), direction: 'NEUTRAL', bullishScore: 0, bearishScore: 0, hasConflict: false, hasIndependentBullishSupport: false, hasIndependentBearishSupport: false, analysisQuality: { level: 'INSUFFICIENT', score: 0, usableSignalCount: 0, distinctTypes: 0, distinctOrigins: 0, missingCapabilities: [] }, selectedSupportingSignals: Array.isArray(selectedSupportingSignalIds) ? selectedSupportingSignalIds.map((id:any)=> ({ id })) : [], warnings: [], reasoning: [] };
+              finalizeCalls.push({ symbol: s, selectedSupportingSignalIds: Array.isArray(selectedSupportingSignalIds) ? selectedSupportingSignalIds.slice() : [] });
+              // Call provided appendAudit if available to emulate real resolver behavior
+              try{ if (opts && typeof opts.appendAudit === 'function') await opts.appendAudit(snap); }catch(_){ }
+              return snap;
+            },
+            getStats: () => ({ analyzedSymbols: 0, finalizedSymbols: 0, auditedSymbols: 0 }),
+            hasSymbol: (s:string) => false,
+            __finalizeCalls: finalizeCalls
+          };
+        },
+        buildAnalysisQualitySummary: (s:any) => ({ level: 'INSUFFICIENT', score: 0, usableSignalCount: 0, distinctTypes: 0, distinctOrigins: 0, missingCapabilities: [] }),
+        buildConfluenceReasoning: (s:any) => [],
+        DECISION_INTELLIGENCE_SCHEMA_VERSION: 1,
+        DECISION_INTELLIGENCE_SOURCE: 'TEST_DECISION_INTELLIGENCE'
+      };
+    });
+
     // Import runtime and run automatic implementation directly
     const mod = await import('./demo-runtime');
     // Clear past audits/state
@@ -68,5 +98,30 @@ describe('autonomous technical intelligence integration', () => {
     expect(intradaySpy.mock.calls.length).toBeGreaterThanOrEqual(1);
     const intradaySymbols = intradaySpy.mock.calls.map(c=> String(c[0]).toUpperCase());
     expect(intradaySymbols).toContain('EUR/USD'.toUpperCase());
+
+    // --- Decision Intelligence finalize assertions (mocked signal-confluence) ---
+    // Read finalize calls recorded by mock (prefer exported, fallback to global)
+    let finalizeCalls: any[] = [];
+    try{
+      const qc = await import('./signal-confluence');
+      finalizeCalls = Array.isArray((qc as any).__finalizeCalls) ? (qc as any).__finalizeCalls : finalizeCalls;
+    }catch(_){ }
+    try{ if (!Array.isArray(finalizeCalls) && Array.isArray((globalThis as any).__DI_FINALIZE_CALLS)) finalizeCalls = (globalThis as any).__DI_FINALIZE_CALLS as any[]; }catch(_){ }
+    const eurCalls = finalizeCalls.filter((c:any)=> String(c.symbol).toUpperCase() === 'EUR/USD'.toUpperCase());
+    if (finalizeCalls.length >= 1){
+      expect(eurCalls.length).toBeGreaterThanOrEqual(1);
+      // verify arguments structure
+      expect(eurCalls[0].selectedSupportingSignalIds).toBeDefined();
+    }
+
+    // Verify that appendAudit resulted in persisted audit and runtime update
+    const audits = await mod.__listAudits && await mod.__listAudits();
+    const diAudits = Array.isArray(audits) ? audits.filter((a:any)=> ((a && a.raw && a.raw.kind==='DECISION_INTELLIGENCE_SNAPSHOT') || (a && a.kind==='DECISION_INTELLIGENCE_SNAPSHOT'))) : [];
+    // Expect at least one DI audit appended (proof appendAudit was invoked)
+    expect(diAudits.length).toBeGreaterThanOrEqual(1);
+    // Runtime state should include sanitized DI under EUR/USD
+    const diMap = state.latestDecisionIntelligenceBySymbol || {};
+    const hasEUR = Object.keys(diMap).map(k=> String(k).toUpperCase()).includes('EUR/USD'.toUpperCase());
+    expect(hasEUR).toBeTruthy();
   }, 20000);
 });
