@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react';
 import LeftSidebar from '../../components/dashboard-v1/LeftSidebar';
 import CompanyLogo from '../../components/CompanyLogo';
 import VictorMarketNewsCard from '../../components/paper-trading/victor-market-news-card';
+import buildPaperTradingPresentation from '../../lib/ui/paper-trading-presentation';
 
 type Holding = any;
 
@@ -82,6 +83,9 @@ export default function Page(){
 
     return ()=>{ document.removeEventListener('visibilitychange', onVisibility); if (interval) clearInterval(interval); };
   }, []);
+
+  // Unified presentation snapshot used across the page
+  const presentation = buildPaperTradingPresentation(state || {});
 
   // Close panel on Escape and lock background scroll while open
   useEffect(()=>{
@@ -256,16 +260,26 @@ export default function Page(){
     function naturalSummary(){
       if (!s) return null;
       const when = s.lastAutomaticRunAt ? formatDateTimeLocal(s.lastAutomaticRunAt) : null;
-      const sym = s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : null;
-      const act = s.latestDecision && s.latestDecision.action ? mapAction(s.latestDecision.action) : null;
-      const rawReason = s.lastAutomaticRunMessage || (s.latestDecision && Array.isArray(s.latestDecision.reasoning) ? (s.latestDecision.reasoning[0]||null) : null);
-      const reason = translateRuntimeText(rawReason);
-      const parts: string[] = [];
-      if (when) parts.push(`${when} analyserade Victor${sym ? ' ' + sym : ''}${act ? ' och valde ' + act : ''}`);
-      if (reason) parts.push(reason.charAt(0).toLowerCase() === ' ' ? reason.trim() : reason);
-      if (parts.length === 0) return null;
-      // join into a single readable sentence
-      return parts.join(' — ');
+      // Prefer latest completed cycle decision summary for the natural sentence
+      try{
+        const cycleSummary = s.latestCycle && s.latestCycle.decisionSummary ? s.latestCycle.decisionSummary : null;
+        if (cycleSummary){
+          const analyzed = Array.isArray(cycleSummary.analyzedSymbols) ? cycleSummary.analyzedSymbols.length : (s.latestMultiTimeframeTechnicalIntelligenceBySymbol ? Object.keys(s.latestMultiTimeframeTechnicalIntelligenceBySymbol).length : null);
+          const decisions = Array.isArray(cycleSummary.decisions) ? cycleSummary.decisions : [];
+          const analyzedText = (typeof analyzed === 'number') ? `${analyzed} marknader` : 'marknaden';
+          if (when) {
+            if (decisions.length > 0){
+              const d = decisions[0];
+              const action = d && d.action ? mapAction(d.action) : null;
+              const sym = d && d.symbol ? d.symbol : null;
+              return `${when} analyserade Victor ${analyzedText}${sym ? ' — ' + sym + ' ' + (action || '') : ''}`;
+            }
+            return `${when} analyserade Victor ${analyzedText}`;
+          }
+          return null;
+        }
+      }catch(_){ }
+      return null;
     }
 
     // activity feed (up to 3 lines) derived from available data
@@ -309,15 +323,15 @@ export default function Page(){
           {/* three compact stat cards (large number, small label) */}
           <div className="flex items-stretch gap-3">
             <div className="bg-gray-50 border rounded px-4 py-3 text-center min-w-[88px]">
-              <div className="text-2xl font-bold text-gray-900">{(s && typeof s.lastAutomaticEvaluationCount === 'number') ? s.lastAutomaticEvaluationCount : (s && typeof s.evaluationCount === 'number' ? s.evaluationCount : '—')}</div>
+              <div className="text-2xl font-bold text-gray-900">{(presentation && typeof presentation.analyzedCount === 'number') ? presentation.analyzedCount : ((s && typeof s.lastAutomaticEvaluationCount === 'number') ? s.lastAutomaticEvaluationCount : '—')}</div>
               <div className="text-xs text-gray-500 mt-1">Analyser idag</div>
             </div>
             <div className="bg-gray-50 border rounded px-4 py-3 text-center min-w-[88px]">
-              <div className="text-2xl font-bold text-gray-900">{(s && typeof s.tradesToday === 'number') ? s.tradesToday : '—'}</div>
+              <div className="text-2xl font-bold text-gray-900">{(presentation && typeof presentation.executionCount === 'number') ? presentation.executionCount : ((s && typeof s.tradesToday === 'number') ? s.tradesToday : '—')}</div>
               <div className="text-xs text-gray-500 mt-1">Affärer idag</div>
             </div>
             <div className="bg-gray-50 border rounded px-4 py-3 text-center min-w-[120px]">
-              <div className="text-2xl font-bold text-gray-900">{s && s.latestDecision && s.latestDecision.action ? (function(){ const a = String(s.latestDecision.action).toUpperCase(); if (a==='HOLD') return 'Behåll'; if (a==='BUY') return 'Köp'; if (a==='SELL') return 'Sälj'; if (a==='REJECT' || a==='REJECTED') return 'Avvisad'; return a; })() : (s && s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : '—')}</div>
+              <div className="text-2xl font-bold text-gray-900">{presentation ? presentation.displayAction : (s && s.latestDecision && s.latestDecision.symbol ? s.latestDecision.symbol : '—')}</div>
               <div className="text-xs text-gray-500 mt-1">Senaste beslut</div>
             </div>
           </div>
@@ -637,8 +651,8 @@ export default function Page(){
               <div className="bg-white rounded-xl p-3 shadow-sm border flex flex-col justify-between">
                 <div>
                       <div className="text-xs text-gray-500">Victors bedömning</div>
-                      <div className="mt-2 text-sm font-semibold">{state.activeRecommendation ? state.activeRecommendation : (latestDecision && latestDecision.action ? (function(a:any){ const up=String(a).toUpperCase(); if(up==='HOLD') return 'Behåll'; if(up==='BUY') return 'Köp'; if(up==='SELL') return 'Sälj'; if(up==='REJECT' || up==='REJECTED') return 'Avvisad'; return a; })(latestDecision.action) : 'Ingen aktiv rekommendation')}</div>
-                      <div className="mt-1 text-xs text-gray-500">{latestDecision && latestDecision.generatedAt ? `Senaste rekommendation: ${new Date(latestDecision.generatedAt).toLocaleString()}` : ''}</div>
+                      <div className="mt-2 text-sm font-semibold">{presentation ? presentation.displayAction : (state.activeRecommendation ? state.activeRecommendation : (latestDecision && latestDecision.action ? (function(a:any){ const up=String(a).toUpperCase(); if(up==='HOLD') return 'Behåll'; if(up==='BUY') return 'Köp'; if(up==='SELL') return 'Sälj'; if(up==='REJECT' || up==='REJECTED') return 'Avvisad'; return a; })(latestDecision.action) : 'Ingen aktiv rekommendation'))}</div>
+                      <div className="mt-1 text-xs text-gray-500">{presentation && presentation.timestamp ? `Senaste rekommendation: ${new Date(presentation.timestamp).toLocaleString()}` : (latestDecision && latestDecision.generatedAt ? `Senaste rekommendation: ${new Date(latestDecision.generatedAt).toLocaleString()}` : '')}</div>
                       <div className="mt-2 text-xs text-gray-600">Victor fortsätter analysera marknaden autonomt.</div>
                 </div>
               </div>
@@ -648,8 +662,8 @@ export default function Page(){
                 <div className="mt-2 grid grid-cols-1 gap-2 text-sm">
                   {state.maxPosition !== undefined ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Max position</div><div className="font-medium">{state.maxPosition}</div></div> : null}
                   {state.dailyLossLimit !== undefined ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Daglig förlustgräns</div><div className="font-medium">{Number.isFinite(Number(state.dailyLossLimit)) ? Number(state.dailyLossLimit).toLocaleString() + ' kr' : state.dailyLossLimit}</div></div> : null}
-                  {typeof state.tradesToday === 'number' ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Affärer idag</div><div className="font-medium">{state.tradesToday}</div></div> : null}
-                  { (state.maxPosition===undefined && state.dailyLossLimit===undefined && typeof state.tradesToday !== 'number') ? <div className="text-xs text-gray-500">Ingen riskdata tillgänglig</div> : null }
+                  {typeof presentation?.executionCount === 'number' ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Affärer idag</div><div className="font-medium">{presentation.executionCount}</div></div> : (typeof state.tradesToday === 'number' ? <div className="flex items-center justify-between"><div className="text-xs text-gray-500">Affärer idag</div><div className="font-medium">{state.tradesToday}</div></div> : null)}
+                  { presentation && presentation.riskStatus === 'NOT_APPLICABLE' ? <div className="text-xs text-gray-500">Riskkontroll ej aktuell</div> : ( (state.maxPosition===undefined && state.dailyLossLimit===undefined && typeof state.tradesToday !== 'number') ? <div className="text-xs text-gray-500">Ingen riskdata tillgänglig</div> : null ) }
                 </div>
               </div>
             </div>
@@ -889,29 +903,55 @@ export default function Page(){
         {/* Removed duplicate KPI row - values are shown in Victor Performance and Portföljstatus */}
 
         {/* VICTOR'S LATEST DECISION - promoted to main focus */}
+        {/* derive a presentation decision from latest completed cycle when available */}
+        {(() => {
+          try{
+            const cycleSummary = state.latestCycle && state.latestCycle.decisionSummary ? state.latestCycle.decisionSummary : null;
+            let dayDecision: any = null;
+            if (cycleSummary){
+              if (Array.isArray(cycleSummary.decisions) && cycleSummary.decisions.length > 0) dayDecision = cycleSummary.decisions[0];
+              else dayDecision = { action: 'HOLD', confidence: null, reasoning: ['Inga marknader uppfyllde kraven för en affär'], __presentationOnly: true } as any;
+            } else {
+              const ld = latestDecision;
+              if (ld && state.lastAutomaticRunAt){ const ldTime = ld && ld.generatedAt ? Date.parse(String(ld.generatedAt)) : 0; const runTime = state.lastAutomaticRunAt ? Date.parse(String(state.lastAutomaticRunAt)) : 0; if (ldTime >= runTime) dayDecision = ld; }
+              else if (ld && !state.lastAutomaticRunAt) dayDecision = ld;
+            }
+            return (<>{/* inject dayDecision into local scope via data attribute */}<div style={{display:'none'}} data-daydecision={JSON.stringify(dayDecision || {})} /></>);
+          }catch(_){ return null; }
+        })()}
         <div className="mt-6 bg-white rounded-xl p-5 shadow-sm border">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-xs text-gray-500">DAGENS ANALYS</div>
-              {latestDecision ? (
-                <div className="text-xs text-gray-400">Victor har analyserat marknaden</div>
-              ) : (
-                <div className="text-xs text-gray-400">Victor har ännu inte analyserat marknaden idag.</div>
-              )}
-              <div className="mt-2 flex items-center gap-4">
-                  {latestDecision?.symbol ? (
-                    <CompanyLogo symbol={latestDecision.symbol} name={latestDecision.companyName || undefined} size={44} className="rounded" />
-                  ) : null}
-                  <div className="flex flex-col sm:flex-row sm:items-baseline gap-2">
-                    <div className="text-3xl font-bold">{latestDecision?.symbol || '—'}</div>
-                    <div className="flex items-center gap-3">
-                      <div>{kindBadge(latestDecision?.action)}</div>
-                      <div className="text-sm text-gray-600">Confidence: {latestDecision?.confidence ?? '—'}%</div>
-                    </div>
+              <div className="text-sm text-gray-500">DAGENS ANALYS</div>
+                  {presentation ? (
+                    <div className="text-xs text-gray-400">{presentation.activityTitle}</div>
+                  ) : (
+                    <div className="text-xs text-gray-400">Victor har ännu inte analyserat marknaden idag.</div>
+                  )}
+                  <div className="mt-2 flex items-center gap-4">
+                      {(() => {
+                        // When the presentation represents a multi-market analysis, show summary instead of a single symbol
+                        if (presentation && !presentation.isHistoricalFallback && presentation.analyzedCount > 1){
+                          return (<div className="flex-1"><div className="text-3xl font-bold">{presentation.analyzedCount} marknader analyserade</div><div className="mt-1 text-sm text-gray-600">AVSTÅR — {presentation.analysisQualityLabel || 'Otillräckligt underlag'}</div></div>);
+                        }
+                        // Otherwise, show a single symbol if available (historical fallback or single-symbol cycle)
+                        const sym = (presentation && presentation.analyzedSymbols && presentation.analyzedSymbols[0]) || (latestDecision && latestDecision.symbol) || null;
+                        return (
+                          <>
+                            {sym ? <CompanyLogo symbol={sym} name={undefined} size={44} className="rounded" /> : null}
+                            <div className="flex flex-col sm:flex-row sm:items-baseline gap-2">
+                              <div className="text-3xl font-bold">{sym || '—'}</div>
+                              <div className="flex items-center gap-3">
+                                <div>{kindBadge(presentation ? presentation.displayAction : (latestDecision && latestDecision.action))}</div>
+                                <div className="text-sm text-gray-600">{presentation && presentation.confidencePercent != null ? `Confidence: ${presentation.confidencePercent}%` : (presentation && presentation.analysisQualityLabel ? presentation.analysisQualityLabel : (latestDecision?.confidence != null ? `Confidence: ${latestDecision.confidence}%` : '—'))}</div>
+                              </div>
+                            </div>
+                          </>
+                        );
+                      })()}
                   </div>
-              </div>
-            </div>
-            <div className="text-sm text-gray-500">Senaste körning: {latestDecision?.generatedAt ? new Date(latestDecision.generatedAt).toLocaleString() : '—'}</div>
+                </div>
+                <div className="text-sm text-gray-500">Senaste körning: {presentation && presentation.timestamp ? new Date(presentation.timestamp).toLocaleString() : (latestDecision?.generatedAt ? new Date(latestDecision.generatedAt).toLocaleString() : '—')}</div>
           </div>
 
           {/* Motivering removed — explanations are rendered in the analysis section below */}
@@ -1064,7 +1104,12 @@ export default function Page(){
             <div className="bg-white rounded-xl p-5 shadow-sm border h-full flex flex-col">
               <div className="text-sm font-medium">SENASTE AKTIVITET</div>
               <div className="mt-4 space-y-3 flex-1 overflow-y-auto">
-                {normalizedAudit && normalizedAudit.length>0 ? (()=>{
+                {presentation && presentation.analyzedCount > 1 && presentation.source !== 'HISTORICAL_DECISION' ? (
+                  <div className="p-2">
+                    <div className="text-sm font-medium">{presentation.activityTitle}</div>
+                    <div className="text-xs text-gray-500 mt-1">Ingen handelssignal identifierades</div>
+                  </div>
+                ) : (normalizedAudit && normalizedAudit.length>0 ? (()=>{
                   const allGroups = groupAuditEntries(normalizedAudit);
                   const execGroups = allGroups.filter((x:any)=> x.kind === 'EXECUTION');
                   const otherGroups = allGroups.filter((x:any)=> x.kind !== 'EXECUTION');
@@ -1090,7 +1135,7 @@ export default function Page(){
                       </Wrapper>
                     );
                   });
-                })() : <div className="text-sm text-gray-500">Ingen aktivitet ännu.</div>}
+                })() : <div className="text-sm text-gray-500">Ingen aktivitet ännu.</div>)}
               </div>
             </div>
           </div>
