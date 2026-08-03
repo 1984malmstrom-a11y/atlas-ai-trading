@@ -1170,7 +1170,11 @@ async function runAutomaticCycleImplementation(){
           forexReadiness: fr,
           autonomousEnabled: !!runtime.autonomousEnabled,
           schedulerEnabled: !!runtime.autonomousEnabled,
-          cycleLocked: !!schedState.inProgress,
+          // If this process just acquired the run-cycle lock (ownerToken present)
+          // do not treat the in-process lock as an external blocker for this
+          // current cycle. This prevents the Launch Control reporting the
+          // current cycle's own lock as a blocking reason.
+          cycleLocked: !!schedState.inProgress && !ownerToken,
           tradesToday: typeof daily.executedTradeCount === 'number' ? daily.executedTradeCount : 0,
           maxTradesPerDay,
           dailyLossSek: typeof daily.dailyLossSek === 'number' ? daily.dailyLossSek : 0,
