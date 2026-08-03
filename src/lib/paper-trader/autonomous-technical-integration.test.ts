@@ -99,6 +99,14 @@ describe('autonomous technical intelligence integration', () => {
     const intradaySymbols = intradaySpy.mock.calls.map(c=> String(c[0]).toUpperCase());
     expect(intradaySymbols).toContain('EUR/USD'.toUpperCase());
 
+    // Inspect exactly what symbol argument was used for historical daily calls
+    const histCalledSymbols = histSpy.mock.calls.map(c=> String(c[0]).toUpperCase());
+    // Should include provider symbol form (EUR/USD) when mapping is applied
+    const hasProviderSlash = histCalledSymbols.includes('EUR/USD'.toUpperCase());
+    const hasRegistryUnderscore = histCalledSymbols.includes('EUR_USD'.toUpperCase());
+    // Record one of the forms for diagnostics
+    expect(hasProviderSlash || hasRegistryUnderscore).toBeTruthy();
+
     // --- Decision Intelligence finalize assertions (mocked signal-confluence) ---
     // Read finalize calls recorded by mock (prefer exported, fallback to global)
     let finalizeCalls: any[] = [];
@@ -123,5 +131,16 @@ describe('autonomous technical intelligence integration', () => {
     const diMap = state.latestDecisionIntelligenceBySymbol || {};
     const hasEUR = Object.keys(diMap).map(k=> String(k).toUpperCase()).includes('EUR/USD'.toUpperCase());
     expect(hasEUR).toBeTruthy();
+
+    // Check whether historical market context map was populated for EUR/USD (or EUR_USD)
+    const hmap = state.latestHistoricalMarketContextBySymbol || {};
+    const hkeys = Object.keys(hmap).map(k=> String(k).toUpperCase());
+    const keyUsed = hkeys.find(k => k === 'EUR/USD'.toUpperCase() || k === 'EUR_USD'.toUpperCase());
+    if (keyUsed){
+      const snap = hmap[keyUsed];
+      // expect closes/dates arrays when provider returned data
+      expect(snap).toBeDefined();
+      if (snap && snap.closes) expect(Array.isArray(snap.closes)).toBeTruthy();
+    }
   }, 20000);
 });

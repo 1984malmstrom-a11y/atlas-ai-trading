@@ -2043,18 +2043,21 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
 
   // Helper: fetch raw historical series (deduped per-cycle). Returns provider-normalized object
   async function getHistoricalForSymbol(symbol: string){
-    const sym = String(symbol).toUpperCase();
-    if (!historicalRequestsBySymbol.has(sym)){
+    const callerKey = String(symbol).toUpperCase();
+    if (!historicalRequestsBySymbol.has(callerKey)){
       try{
+        // Resolve provider symbol when caller passed an instrument id (e.g. 'EUR_USD')
+        let providerSymbol = callerKey;
+        try{ const inst = TRADABLE_INSTRUMENTS.find((i:any)=> String(i.id).toUpperCase() === callerKey); if (inst && inst.providerSymbol) providerSymbol = String(inst.providerSymbol).toUpperCase(); }catch(_){ }
         const provider = new TwelveDataMarketDataProvider();
-        const histP = provider.getHistoricalDailyCloses(sym, 100);
-        historicalRequestsBySymbol.set(sym, histP);
+        const histP = provider.getHistoricalDailyCloses(providerSymbol, 100);
+        historicalRequestsBySymbol.set(callerKey, histP);
       }catch(e){
         // If provider creation fails, store a rejected promise to avoid retries
-        historicalRequestsBySymbol.set(sym, Promise.reject(e));
+        historicalRequestsBySymbol.set(callerKey, Promise.reject(e));
       }
     }
-    return historicalRequestsBySymbol.get(sym) as Promise<any>;
+    return historicalRequestsBySymbol.get(callerKey) as Promise<any>;
   }
 
   // Per-cycle cache for built historical market contexts (one build per symbol per cycle)
@@ -2187,6 +2190,21 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     });
     try{ perCycleTechnicalResolver.build && perCycleTechnicalResolver.buildOnce && perCycleTechnicalResolver.buildOnce().catch(()=>{}); }catch(_){ }
   }catch(_){ perCycleTechnicalResolver = null; }
+    // Ensure historical market context is built for every symbol in the automatic analysis universe
+    // before market-signal construction and Decision Intelligence finalization. Reuse
+    // per-cycle caches (historicalRequestsBySymbol and historicalMarketContextBySymbol)
+    // to avoid duplicate provider calls.
+    try{
+      const histPromises: Promise<any>[] = [];
+      if (Array.isArray(symbols) && symbols.length > 0){
+        const normSymbols = Array.from(new Set(symbols.filter(s=> !!s).map((s:any)=> String(s).toUpperCase())));
+        for (const s of normSymbols){
+          try{ const p = getOrBuildHistoricalMarketContext(s).catch(()=>null); histPromises.push(p); }catch(_){ }
+        }
+        try{ await Promise.allSettled(histPromises); }catch(_){ }
+      }
+    }catch(_){ }
+
     // Prime per-symbol technical + forex builds (collect promises and await before finalizing cycle)
     const perCycleBuildPromises: Promise<any>[] = [];
     try{
