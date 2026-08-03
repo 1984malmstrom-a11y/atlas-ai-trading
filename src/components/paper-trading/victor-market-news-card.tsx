@@ -3,6 +3,21 @@
 import React, { useState } from 'react';
 import { buildVictorAnalysisNarrative, VictorDecisionViewInput } from '../../lib/paper-trader/victor-analysis-narrative';
 
+// Map internal data quality + numeric confidence to presentation label
+export function formatConfidenceLabel(dataQualityLevel: string | null | undefined, confidence: number | null | undefined){
+  try{
+    const lvl = dataQualityLevel ? String(dataQualityLevel).toUpperCase() : null;
+    if (lvl === 'INSUFFICIENT') return 'Otillräckligt underlag';
+    if (lvl === 'LIMITED') return 'Begränsad';
+    if (lvl === 'COMPLETE' || lvl === 'HIGH'){
+      return (typeof confidence === 'number') ? String(confidence) + ' %' : '—';
+    }
+    // Fallback: if no explicit quality but numeric confidence, show percent
+    if (typeof confidence === 'number') return String(confidence) + ' %';
+    return '—';
+  }catch(_){ return '—'; }
+}
+
 type MarketRegimeView = {
   primaryRegime: string | null;
   volatilityRegime: string | null;
@@ -64,12 +79,12 @@ export default function VictorMarketNewsCard({ activity, latestDecision, nextRun
 
       <div className="mt-3">
         <div className="text-xs text-gray-500">Senaste beslut</div>
-        <div className="mt-1 text-sm font-semibold text-gray-800">{(latestDecision && latestDecision.action) ? String(latestDecision.action) : '—'}</div>
+        <div className="mt-1 text-sm font-semibold text-gray-800">{(latestDecision && (latestDecision as any).__presentationOnly) ? 'Avstår' : ((latestDecision && latestDecision.action) ? (function(a:any){ const up = String(a).toUpperCase(); if (up==='HOLD') return 'Behåll'; if (up==='BUY') return 'Köp'; if (up==='SELL') return 'Sälj'; if (up==='REJECT' || up==='REJECTED') return 'Avvisad'; return up; })(latestDecision.action) : '—')}</div>
       </div>
 
       <div className="mt-2">
         <div className="text-xs text-gray-500">Confidence</div>
-        <div className="mt-1 text-sm font-semibold text-gray-800">{(latestDecision && typeof latestDecision.confidence === 'number') ? String(latestDecision.confidence) + ' %' : '—'}</div>
+        <div className="mt-1 text-sm font-semibold text-gray-800">{formatConfidenceLabel(latestDecision && (latestDecision as any).dataQualityLevel ? (latestDecision as any).dataQualityLevel : null, latestDecision && typeof latestDecision.confidence === 'number' ? latestDecision.confidence : null)}</div>
       </div>
 
       <div className="mt-2">
@@ -104,8 +119,8 @@ export default function VictorMarketNewsCard({ activity, latestDecision, nextRun
 
               {latestDecision ? (
                 <div className="mt-2 text-gray-600">
-              <div><strong>Beslut:</strong> {latestDecision.action ? String(latestDecision.action).toUpperCase() : '—'}</div>
-              <div className="mt-1"><strong>Confidence:</strong> {(typeof latestDecision.confidence === 'number') ? String(latestDecision.confidence) + ' %' : '—'}</div>
+              <div><strong>Beslut:</strong> {(latestDecision as any).__presentationOnly ? 'Avstår' : (latestDecision.action ? (function(a:any){ const up = String(a).toUpperCase(); if (up==='HOLD') return 'Behåll'; if (up==='BUY') return 'Köp'; if (up==='SELL') return 'Sälj'; if (up==='REJECT' || up==='REJECTED') return 'Avvisad'; return up; })(latestDecision.action) : '—')}</div>
+              <div className="mt-1"><strong>Confidence:</strong> {formatConfidenceLabel(latestDecision && (latestDecision as any).dataQualityLevel ? (latestDecision as any).dataQualityLevel : null, latestDecision && typeof latestDecision.confidence === 'number' ? latestDecision.confidence : null)}</div>
               <div className="mt-2"><strong>Motivering / sammanfattning:</strong></div>
               {Array.isArray(latestDecision.reasoning) && latestDecision.reasoning.length > 0 ? (
                 <div className="mt-1 text-gray-700">{String(latestDecision.reasoning[0])}</div>

@@ -408,9 +408,41 @@ export default function Page(){
             );
           })()}
           {/* natural summary always shows real-data sentence when available */}
-            {(() => { const ns = naturalSummary(); return ns ? (<div className="mt-4 text-sm text-gray-700">{formatNaturalSentence(ns)}</div>) : null; })()}
+            {(() => {
+              // Prefer latest completed cycle decisions for presentation. Do not show stale global latestDecision
+              const cycleDecisionSummary = s && s.latestCycle && s.latestCycle.decisionSummary ? s.latestCycle.decisionSummary : null;
+              let displayDecisionFromCycle: any = null;
+              if (cycleDecisionSummary && Array.isArray(cycleDecisionSummary.decisions) && cycleDecisionSummary.decisions.length > 0){
+                displayDecisionFromCycle = cycleDecisionSummary.decisions[0];
+              } else if (cycleDecisionSummary && Array.isArray(cycleDecisionSummary.decisions) && cycleDecisionSummary.decisions.length === 0){
+                // presentation-only abstain object
+                displayDecisionFromCycle = { action: 'HOLD', confidence: null, reasoning: ['Inga marknader uppfyllde kraven för en affär'], __presentationOnly: true } as any;
+              }
+              const ns = naturalSummary(); return ns ? (<div className="mt-4 text-sm text-gray-700">{formatNaturalSentence(ns)}</div>) : null;
+            })()}
             {/* Latest market news activity (compact) - only show when present */}
-            {(() => { const act = (s && (s as any).latestMarketNewsActivity) ? (s as any).latestMarketNewsActivity : null; return act ? (<VictorMarketNewsCard activity={act} latestDecision={s && s.latestDecision ? s.latestDecision : null} nextRunCountdown={sharedCountdown} />) : null; })()}
+            {(() => {
+              const act = (s && (s as any).latestMarketNewsActivity) ? (s as any).latestMarketNewsActivity : null;
+              if (!act) return null;
+              // compute displayDecision: prefer latest completed cycle, otherwise show latestDecision only if not older than lastAutomaticRunAt
+              const cycleDecisionSummary = s && s.latestCycle && s.latestCycle.decisionSummary ? s.latestCycle.decisionSummary : null;
+              let displayDecision: any = null;
+              if (cycleDecisionSummary && Array.isArray(cycleDecisionSummary.decisions) && cycleDecisionSummary.decisions.length > 0){
+                displayDecision = cycleDecisionSummary.decisions[0];
+              } else if (cycleDecisionSummary && Array.isArray(cycleDecisionSummary.decisions) && cycleDecisionSummary.decisions.length === 0){
+                displayDecision = { action: 'HOLD', confidence: null, reasoning: ['Inga marknader uppfyllde kraven för en affär'], __presentationOnly: true } as any;
+              } else {
+                const ld = s && s.latestDecision ? s.latestDecision : null;
+                if (ld && s && s.lastAutomaticRunAt){
+                  const ldTime = ld && ld.generatedAt ? Date.parse(String(ld.generatedAt)) : 0;
+                  const runTime = s.lastAutomaticRunAt ? Date.parse(String(s.lastAutomaticRunAt)) : 0;
+                  if (ldTime >= runTime) displayDecision = ld;
+                } else if (ld && !s.lastAutomaticRunAt){
+                  displayDecision = ld;
+                }
+              }
+              return act ? (<VictorMarketNewsCard activity={act} latestDecision={displayDecision} nextRunCountdown={sharedCountdown} />) : null;
+            })()}
         </div>
 
         {/* Activity feed (timeline) */}
