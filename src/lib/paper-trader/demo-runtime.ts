@@ -129,6 +129,30 @@ export function getWatchlistSymbols(eligibleInstruments: any[], watchlist = DEFA
   }catch(_){ return []; }
 }
 
+// Helper: adapt provider historical daily closes -> IntradayCandle[] (oldest->newest)
+export function adaptHistoricalClosesToCandles(hist: any){
+  try{
+    // Require both arrays (dates and closes) to avoid inventing timestamps
+    if (!hist || !Array.isArray(hist.closes) || !Array.isArray(hist.dates)) return [];
+    const closes = hist.closes.slice();
+    const dates = hist.dates.slice();
+    const pairs: Array<{ ts: number; close: number }> = [];
+    const n = Math.min(closes.length, dates.length);
+    for (let i = 0; i < n; i++){
+      const rawDate = dates[i];
+      const ts = Date.parse(String(rawDate));
+      const rawClose = closes[i];
+      const close = typeof rawClose === 'number' ? rawClose : (typeof rawClose === 'string' ? Number(rawClose) : NaN);
+      if (!isFinite(ts) || !Number.isFinite(close) || close <= 0) continue;
+      pairs.push({ ts: ts, close });
+    }
+    if (pairs.length === 0) return [];
+    // oldest -> newest
+    pairs.sort((a,b)=> a.ts - b.ts);
+    return pairs.map(p => ({ timestamp: new Date(p.ts).toISOString(), close: p.close }));
+  }catch(_){ return []; }
+}
+
 // Build the automatic analysis universe: preserve stock watchlist behavior and
 // additionally include eligible FOREX instruments (market-data-enabled and
 // enabled) when the Forex session is OPEN. This function only controls which
@@ -1469,6 +1493,7 @@ export async function getPaperTradingState(){
       }
       out.latestForexSessionIntelligenceBySymbol = safeMapF;
     }catch(_){ out.latestForexSessionIntelligenceBySymbol = {}; }
+    // MTTI daily diagnostics removed in this clean adapter patch
       // Expose latest sanitized Historical Market Context per symbol for UI/state
       try{
         const rawMapH = runtime.latestHistoricalMarketContextBySymbol || {};
@@ -1994,6 +2019,10 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // cycle and is not a long-lived cache. The provider's own cache remains the
   // only long-lived cache.
   const historicalRequestsBySymbol = new Map<string, Promise<any>>();
+  // Per-cycle cache keyed by canonical provider symbol (e.g. 'EUR/USD').
+  // This ensures one provider request per provider symbol per cycle and
+  // is used by both historical-context builders and MTTI daily candle adapter.
+  const providerHistoricalRequestsBySymbol = new Map<string, Promise<any>>();
   const analysisResultsBySymbol = new Map<string, Promise<any>>();
 
   // Helper: fetch historical closes once per symbol (promise dedupe) and run analyzePriceSeries once.
@@ -2002,12 +2031,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     if (!analysisResultsBySymbol.has(sym)){
       const p = (async ()=>{
         try{
-          if (!historicalRequestsBySymbol.has(sym)){
+          // Resolve canonical provider symbol when caller passed an instrument id
+          let providerSymbol = sym;
+          try{ const inst = TRADABLE_INSTRUMENTS.find((i:any)=> String(i.id).toUpperCase() === sym); if (inst && inst.providerSymbol) providerSymbol = String(inst.providerSymbol).toUpperCase(); }catch(_){ }
+          // Use per-provider-symbol cache (one request per provider symbol per cycle)
+          if (!providerHistoricalRequestsBySymbol.has(providerSymbol)){
             const provider = new TwelveDataMarketDataProvider();
-            const histP = provider.getHistoricalDailyCloses(sym, 30);
-            historicalRequestsBySymbol.set(sym, histP);
+            const histP = provider.getHistoricalDailyCloses(providerSymbol, 100);
+            providerHistoricalRequestsBySymbol.set(providerSymbol, histP);
           }
-          const hist = await historicalRequestsBySymbol.get(sym);
+          const hist = await providerHistoricalRequestsBySymbol.get(providerSymbol);
+          // mirror promise under caller-key for compatibility with existing consumers
+          if (!historicalRequestsBySymbol.has(sym)) historicalRequestsBySymbol.set(sym, providerHistoricalRequestsBySymbol.get(providerSymbol) as Promise<any>);
           const techMeta: any = { technicalAnalysisMode: 'observe-only' };
           if (hist && Array.isArray(hist.closes)){
             const analysis = analyzePriceSeries ? analyzePriceSeries(hist.closes) : null;
@@ -2042,26 +2077,39 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   }
 
   // Helper: fetch raw historical series (deduped per-cycle). Returns provider-normalized object
+  // Per-cycle helper: fetch raw daily history for a canonical provider symbol
+  async function fetchRawDailyHistoryForProviderSymbol(providerSymbol: string){
+    const ps = String(providerSymbol || '').toUpperCase(); if (!ps) return null;
+    if (providerHistoricalRequestsBySymbol.has(ps)) return providerHistoricalRequestsBySymbol.get(ps) as Promise<any>;
+    try{
+      const provider = new TwelveDataMarketDataProvider();
+      const p = provider.getHistoricalDailyCloses(ps, 100).catch((e:any)=> { throw e; });
+      providerHistoricalRequestsBySymbol.set(ps, p);
+      return p;
+    }catch(e){ providerHistoricalRequestsBySymbol.set(ps, Promise.reject(e)); return providerHistoricalRequestsBySymbol.get(ps); }
+  }
+
+  // Helper: fetch raw historical series (deduped per provider symbol). Returns provider-normalized object
   async function getHistoricalForSymbol(symbol: string){
     const callerKey = String(symbol).toUpperCase();
-    if (!historicalRequestsBySymbol.has(callerKey)){
-      try{
-        // Resolve provider symbol when caller passed an instrument id (e.g. 'EUR_USD')
-        let providerSymbol = callerKey;
-        try{ const inst = TRADABLE_INSTRUMENTS.find((i:any)=> String(i.id).toUpperCase() === callerKey); if (inst && inst.providerSymbol) providerSymbol = String(inst.providerSymbol).toUpperCase(); }catch(_){ }
-        const provider = new TwelveDataMarketDataProvider();
-        const histP = provider.getHistoricalDailyCloses(providerSymbol, 100);
-        historicalRequestsBySymbol.set(callerKey, histP);
-      }catch(e){
-        // If provider creation fails, store a rejected promise to avoid retries
-        historicalRequestsBySymbol.set(callerKey, Promise.reject(e));
-      }
+    if (!callerKey) return null;
+    // Resolve provider symbol when caller passed an instrument id (e.g. 'EUR_USD')
+    let providerSymbol = callerKey;
+    try{ const inst = TRADABLE_INSTRUMENTS.find((i:any)=> String(i.id).toUpperCase() === callerKey); if (inst && inst.providerSymbol) providerSymbol = String(inst.providerSymbol).toUpperCase(); }catch(_){ }
+    // ensure provider-level promise exists
+    const provP = await fetchRawDailyHistoryForProviderSymbol(providerSymbol).catch(()=>null);
+    // mirror promise under caller-key for compatibility
+    if (!historicalRequestsBySymbol.has(callerKey) && providerHistoricalRequestsBySymbol.has(providerSymbol)){
+      historicalRequestsBySymbol.set(callerKey, providerHistoricalRequestsBySymbol.get(providerSymbol) as Promise<any>);
     }
-    return historicalRequestsBySymbol.get(callerKey) as Promise<any>;
+    return provP;
   }
 
   // Per-cycle cache for built historical market contexts (one build per symbol per cycle)
   const historicalMarketContextBySymbol = new Map<string, Promise<any>>();
+
+  // NOTE: provider-internals and experimental cached-response fallbacks removed
+  // to keep MTTI daily path minimal and deterministic in this clean patch.
 
   // Build or return cached historical market context for a symbol. Uses existing per-cycle
   // `historicalRequestsBySymbol` to avoid extra provider calls. Appends a sanitized audit
@@ -2180,7 +2228,16 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           }
           // daily support via historical closes when available
           if (timeframe === '1day'){
-            try{ const prov2 = new TwelveDataMarketDataProvider(); const hist = await prov2.getHistoricalDailyCloses(String(symbol).toUpperCase(), 128).catch(()=>null); if (!hist || !Array.isArray(hist.closes)) return null; const dates = Array.isArray(hist.dates) ? hist.dates : []; const candles = hist.closes.map((c:any,i:number)=> ({ timestamp: (dates[i] || (typeof c === 'number' ? new Date().toISOString().slice(0,10) : new Date().toISOString())), open: c, high: c, low: c, close: c, volume: (hist.volumes && Array.isArray(hist.volumes) && typeof hist.volumes[i] === 'number') ? hist.volumes[i] : null })); return candles;
+            try{
+              // Resolve canonical provider symbol when available
+              let providerSymbol = String(symbol || '').toUpperCase();
+              try{ const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find((i:any)=> String(i.id).toUpperCase() === String(symbol || '').toUpperCase()) : undefined; if (inst && inst.providerSymbol) providerSymbol = String(inst.providerSymbol).toUpperCase(); }catch(_){ }
+              try{
+                const hist = await fetchRawDailyHistoryForProviderSymbol(String(providerSymbol)).catch(()=>null);
+                if (!hist || !Array.isArray(hist.closes) || !Array.isArray(hist.dates)) return null;
+                const candles = adaptHistoricalClosesToCandles(hist);
+                return Array.isArray(candles) ? candles : null;
+              }catch(_){ return null; }
             }catch(_){ return null; }
           }
         }catch(_){ }
@@ -2228,9 +2285,9 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                   try{
                       // Build candles for daily via TwelveData provider when possible
                       let candles: any[] | null = null;
-                      try{ const prov2 = new TwelveDataMarketDataProvider(); const hist = await prov2.getHistoricalDailyCloses(String(sym).toUpperCase(), 128).catch(()=>null); if (hist && Array.isArray(hist.closes)){
+                      try{ const hist = await fetchRawDailyHistoryForProviderSymbol(String(sym).toUpperCase()).catch(()=>null); if (hist && Array.isArray(hist.closes)){
                         const dates = Array.isArray(hist.dates) ? hist.dates : [];
-                        candles = hist.closes.map((c:any,i:number)=> ({ timestamp: (dates[i] || new Date().toISOString()), open: c, high: c, low: c, close: c, volume: (hist.volumes && Array.isArray(hist.volumes) && typeof hist.volumes[i] === 'number') ? hist.volumes[i] : null }));
+                        candles = adaptHistoricalClosesToCandles(hist);
                       } }
                       catch(_){ candles = null; }
                       const snap = fxMod.buildForexSessionIntelligence({ symbol: String(sym).toUpperCase(), candles: Array.isArray(candles) ? candles : undefined, now: new Date() });

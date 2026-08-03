@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildMultiTimeframeTechnicalIntelligence, sanitizeMultiTimeframeTechnicalIntelligenceForState, createPerCycleTechnicalIntelligenceResolver } from './multi-timeframe-technical-intelligence';
+import { adaptHistoricalClosesToCandles } from './demo-runtime';
 import { IntradayCandle } from './intraday-market-context';
 
 describe('multi-timeframe-technical-intelligence', ()=>{
@@ -32,5 +33,45 @@ describe('multi-timeframe-technical-intelligence', ()=>{
     expect(a && b).toBeTruthy();
     expect(a!.symbol).toBe('EURUSD');
     expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  describe('adaptHistoricalClosesToCandles adapter', ()=>{
+    it('returns 3 items with timestamp and close only for valid input', ()=>{
+      const dates = ['2026-07-30','2026-07-31','2026-08-01'];
+      const closes = [100, 101.5, 102.25];
+      const hist = { symbol: 'EUR/USD', dates, closes };
+      const out = adaptHistoricalClosesToCandles(hist);
+      expect(Array.isArray(out)).toBe(true);
+      expect(out.length).toBe(3);
+      for (let i=0;i<3;i++){
+        expect(typeof out[i].timestamp).toBe('string');
+        expect(isFinite(Date.parse(out[i].timestamp))).toBeTruthy();
+        expect(typeof out[i].close).toBe('number');
+        expect(out[i].close).toBe(closes[i]);
+        // ensure extraneous fields are not present
+        expect((out[i] as any).open).toBeUndefined();
+        expect((out[i] as any).high).toBeUndefined();
+        expect((out[i] as any).low).toBeUndefined();
+        expect((out[i] as any).volume).toBeUndefined();
+      }
+    });
+
+    it('filters out entries with invalid date or non-finite close', ()=>{
+      const dates = ['2026-07-30','not-a-date','2026-08-01'];
+      const closes = [100, NaN, 102];
+      const hist = { symbol: 'EUR/USD', dates, closes };
+      const out = adaptHistoricalClosesToCandles(hist);
+      // only two valid entries (indexes 0 and 2)
+      expect(Array.isArray(out)).toBe(true);
+      expect(out.length).toBe(2);
+      expect(out[0].close).toBe(100);
+      expect(out[1].close).toBe(102);
+    });
+
+    it('returns empty array for mismatched or empty arrays', ()=>{
+      expect(adaptHistoricalClosesToCandles({} as any)).toEqual([]);
+      expect(adaptHistoricalClosesToCandles({ dates: [], closes: [] })).toEqual([]);
+      expect(adaptHistoricalClosesToCandles({ dates: ['2026-08-01'], closes: [] })).toEqual([]);
+    });
   });
 });

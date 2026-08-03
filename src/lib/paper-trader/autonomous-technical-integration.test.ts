@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'fs';
 
 describe('autonomous technical intelligence integration', () => {
   beforeEach(() => {
@@ -6,9 +7,9 @@ describe('autonomous technical intelligence integration', () => {
     vi.stubEnv('PAPER_TRADER_SCHEDULER_MODE', 'in_memory');
     vi.stubEnv('NODE_ENV', 'test');
   });
-  afterEach(() => {
-    try{ vi.unstubAllEnvs(); }catch(_){ }
-    vi.restoreAllMocks();
+    afterEach(() => {
+      try { vi.unstubAllEnvs(); } catch (_) { }
+      vi.restoreAllMocks();
   });
 
   it('builds per-cycle technical intelligence for watchlist symbols during automatic run', async () => {
@@ -22,7 +23,7 @@ describe('autonomous technical intelligence integration', () => {
     vi.doMock('../market-data/instruments', () => ({ TRADABLE_INSTRUMENTS: [ { id: 'EUR_USD', providerSymbol: 'EUR/USD', assetType: 'FOREX', tradingEnabled: true, marketDataEnabled: true, enabled: true, baseAsset: 'EUR', quoteCurrency: 'USD' }, { id: 'NVDA', providerSymbol: 'NVDA', assetType: 'STOCK', tradingEnabled: true, marketDataEnabled: true, enabled: true } ] }));
 
     // Spy functions for TwelveData provider methods
-    const histSpy = vi.fn(async (_s: string, _d: number) => { const now = Date.now(); const closes = Array.from({ length: 64 }, (_,i)=> 100 + i); const dates = closes.map((_,i)=> new Date(now - (closes.length - i)*24*60*60*1000).toISOString()); return { closes, dates, source: 'mock' }; });
+    const histSpy = vi.fn(async (_s: string, _d: number) => { const now = Date.now(); const closes = Array.from({ length: 99 }, (_,i)=> 100 + i); const dates = closes.map((_,i)=> new Date(now - (closes.length - i)*24*60*60*1000).toISOString()); return { closes, dates, source: 'mock' }; });
     const intradaySpy = vi.fn(async (_s: string, _tf: any, _lim?: number) => { const ts = new Date().toISOString(); return { symbol: _s, interval: _tf, fetchedAt: ts, candles: [ { timestamp: ts, open: 1, high: 2, low: 0.9, close: 1, volume: 100 } ] }; });
     vi.doMock('../market-data/twelve-data', () => ({ TwelveDataMarketDataProvider: class { async getHistoricalDailyCloses(s: string, d: number){ return histSpy(s,d); } async getIntradayCandles(s: string, tf: any, lim?: number){ return intradaySpy(s, tf, lim); } } }));
 
@@ -106,6 +107,9 @@ describe('autonomous technical intelligence integration', () => {
     const hasRegistryUnderscore = histCalledSymbols.includes('EUR_USD'.toUpperCase());
     // Record one of the forms for diagnostics
     expect(hasProviderSlash || hasRegistryUnderscore).toBeTruthy();
+    // Ensure provider was requested with outputSize 100 for EUR/USD
+    const calledWithExact = histSpy.mock.calls.some((c:any)=> String(c[0]).toUpperCase() === 'EUR/USD'.toUpperCase() && Number(c[1]) === 100);
+    expect(calledWithExact).toBeTruthy();
 
     // --- Decision Intelligence finalize assertions (mocked signal-confluence) ---
     // Read finalize calls recorded by mock (prefer exported, fallback to global)
@@ -140,7 +144,30 @@ describe('autonomous technical intelligence integration', () => {
       const snap = hmap[keyUsed];
       // expect closes/dates arrays when provider returned data
       expect(snap).toBeDefined();
-      if (snap && snap.closes) expect(Array.isArray(snap.closes)).toBeTruthy();
+      // historical snapshot should report observationCount > 0
+      expect(typeof snap.observationCount === 'number' ? snap.observationCount > 0 : false).toBeTruthy();
     }
+
+    // Validate MTTI daily timeframe for the forex symbol: pointCount > 0 and observedAt exists
+    const tkeys = Object.keys(tmap).map(k=> String(k).toUpperCase());
+    const tKeyUsed = tkeys.find(k => k === 'EUR/USD'.toUpperCase() || k === 'EUR_USD'.toUpperCase());
+    if (tKeyUsed){
+      const msnap = tmap[tKeyUsed];
+      if (msnap && Array.isArray(msnap.timeframes)){
+        const tf = msnap.timeframes.find((x:any)=> x.timeframe === '1day');
+        expect(tf).toBeDefined();
+        if (tf){
+          expect(typeof tf.pointCount === 'number' ? tf.pointCount > 0 : false).toBeTruthy();
+          expect(tf.observedAt).toBeDefined();
+        }
+      }
+    }
+
+    // Write provider-call diagnostics so test runner output can be inspected
+    try{
+      const eurCalls = histSpy.mock.calls.filter((c:any)=> { const s = String(c[0]||'').toUpperCase(); return s === 'EUR/USD'.toUpperCase() || s === 'EUR_USD'.toUpperCase(); }).length;
+      const out = { totalHistCalls: histSpy.mock.calls.length, eurUsdHistCalls: eurCalls };
+      try{ fs.writeFileSync('tmp/provider_calls_eurusd.json', JSON.stringify(out, null, 2), 'utf-8'); }catch(_){ }
+    }catch(_){ }
   }, 20000);
 });
