@@ -49,6 +49,35 @@ describe('acquireRunCycleLock', () => {
     expect(body[5]).toBe(123);
   });
 
+  it('honors PAPER_TRADER_LOCK_NAMESPACE and falls back to atlas', async () => {
+    process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'secrettoken';
+    const origNs = process.env.PAPER_TRADER_LOCK_NAMESPACE;
+    try {
+      let seenBody: any = null;
+      (global as any).fetch = vi.fn().mockImplementation(async (_url:any, opts:any) => {
+        seenBody = JSON.parse(opts.body);
+        return { ok: true, json: async () => ({ result: 'OK' }) };
+      });
+
+      // explicit namespace
+      process.env.PAPER_TRADER_LOCK_NAMESPACE = 'atlas-dev-test';
+      const r = await acquireRunCycleLockWithOwner('paper-trader:cycle:default', 60);
+      expect(r.status).toBe('ACQUIRED');
+      expect(seenBody[1]).toBe('atlas-dev-test:paper-trader:run-cycle:paper-trader:cycle:default');
+
+      // missing namespace -> default to atlas
+      delete process.env.PAPER_TRADER_LOCK_NAMESPACE;
+      seenBody = null;
+      const r2 = await acquireRunCycleLockWithOwner('paper-trader:cycle:default', 60);
+      expect(r2.status).toBe('ACQUIRED');
+      expect(seenBody[1]).toBe('atlas:paper-trader:run-cycle:paper-trader:cycle:default');
+    } finally {
+      if (origNs === undefined) delete process.env.PAPER_TRADER_LOCK_NAMESPACE; else process.env.PAPER_TRADER_LOCK_NAMESPACE = origNs;
+      delete (global as any).fetch;
+    }
+  });
+
   it('returns DUPLICATE when redis returns null', async () => {
     process.env.UPSTASH_REDIS_REST_URL = 'https://example.upstash.io';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'secrettoken';

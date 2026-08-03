@@ -26,7 +26,8 @@ export async function acquireRunCycleLockWithOwner(
     if (url && token){
       if (!idempotencyKey || typeof idempotencyKey !== 'string') return { status: 'UNAVAILABLE' };
       if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) return { status: 'UNAVAILABLE' };
-      const key = `atlas:paper-trader:run-cycle:${idempotencyKey}`;
+      const ns = (process.env.PAPER_TRADER_LOCK_NAMESPACE && process.env.PAPER_TRADER_LOCK_NAMESPACE.trim()) || 'atlas';
+      const key = `${ns}:paper-trader:run-cycle:${idempotencyKey}`;
       const owner = makeOwnerToken();
       const body = [
         "SET",
@@ -69,7 +70,8 @@ export async function acquireRunCycleLockWithOwner(
     const owner = makeOwnerToken();
     const now = Date.now();
     const expiresAt = now + Math.floor(Number(ttlSeconds)) * 1000;
-    const key = `atlas:paper-trader:run-cycle:${idempotencyKey}`;
+    const ns = (process.env.PAPER_TRADER_LOCK_NAMESPACE && process.env.PAPER_TRADER_LOCK_NAMESPACE.trim()) || 'atlas';
+    const key = `${ns}:paper-trader:run-cycle:${idempotencyKey}`;
     const existing = store[key];
     if (!existing || (existing && typeof existing.expiresAt === 'number' && existing.expiresAt <= now)){
       // acquire
@@ -104,7 +106,8 @@ export async function releaseRunCycleLock(keyId: string, ownerToken: string): Pr
     const token = process.env.UPSTASH_REDIS_REST_TOKEN;
     if (url && token){
       if (!keyId || !ownerToken) return false;
-      const key = `atlas:paper-trader:run-cycle:${keyId}`;
+      const ns = (process.env.PAPER_TRADER_LOCK_NAMESPACE && process.env.PAPER_TRADER_LOCK_NAMESPACE.trim()) || 'atlas';
+      const key = `${ns}:paper-trader:run-cycle:${keyId}`;
       const lua = "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end";
       const body = ["EVAL", lua, 1, key, ownerToken];
       const res = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
