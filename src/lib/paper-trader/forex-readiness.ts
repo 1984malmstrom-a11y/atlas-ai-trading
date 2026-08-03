@@ -73,10 +73,15 @@ export function buildForexReadinessState(opts: { now?: Date; instruments?: any[]
         if (!ts || !isFinite(Date.parse(String(ts))) ){ unavailablePairCount++; reasonInc('QUOTE_TIMESTAMP_INVALID'); }
         else {
           const age = now.getTime() - Date.parse(String(ts));
-          if (age < 0){ stalePairCount++; reasonInc('QUOTE_TIMESTAMP_FUTURE'); }
-          else if (age > maxAge || q.isStale){ stalePairCount++; reasonInc('QUOTE_STALE'); }
-          else if (!Number.isFinite(Number(price)) || price <= 0){ unavailablePairCount++; reasonInc('QUOTE_PRICE_INVALID'); }
-          else { quoteReadyCount++; quoteFresh = true; }
+            if (age < 0){ stalePairCount++; reasonInc('QUOTE_TIMESTAMP_FUTURE'); }
+            // Respect the normalized quote's `isStale` classification produced by
+            // the centralized quotes-service. That service applies market-session
+            // aware overrides (e.g. consider same trading date fresh). Use that
+            // classification as authoritative to avoid double-counting an age
+            // check that may disagree with provider-aware logic.
+            else if (q.isStale){ stalePairCount++; reasonInc('QUOTE_STALE'); }
+            else if (!Number.isFinite(Number(price)) || price <= 0){ unavailablePairCount++; reasonInc('QUOTE_PRICE_INVALID'); }
+            else { quoteReadyCount++; quoteFresh = true; }
         }
       }
 
