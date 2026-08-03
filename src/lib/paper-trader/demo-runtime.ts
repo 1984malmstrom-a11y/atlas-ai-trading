@@ -898,7 +898,15 @@ const runtime: RuntimeState = {
   latestCompanyNewsContextBySymbol: {},
   forexReadiness: null,
   externalIntelligenceReadiness: null,
-  forexAutonomyArmed: false,
+  // Deterministic server-side env-driven permanent arming flag.
+  // Only the exact string "true" (case-insensitive, trimmed) enables arming.
+  forexAutonomyArmed: ((): boolean => {
+    try{
+      const v = process.env.PAPER_TRADER_FOREX_AUTONOMY_ARMED;
+      if (!v) return false;
+      return String(v).trim().toLowerCase() === 'true';
+    }catch(_){ return false; }
+  })(),
   forexLaunchControl: null,
   latestForexCycleStatus: null,
   forexNoTradeSummary: null,
@@ -1774,8 +1782,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     return { skipped: true, code: 'NO_ELIGIBLE_INSTRUMENTS' } as any;
   }
 
-  // For BUY candidates, analyze the configured watchlist (filtered by eligible instruments)
-  const symbols = getWatchlistSymbols(eligibleInstruments);
+  // For BUY candidates, analyze the configured automatic universe (includes watchlist and eligible FOREX when session open)
+  const symbols = buildAutomaticAnalysisSymbols(eligibleInstruments, nowForCycle);
   const quotes = opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes) ? opts.overrideUniverse.quotes : await fetchQuotes();
 
   // --- RUNTIME QUOTES SNAPSHOT (transient diagnostic for cycle troubleshooting) ---
@@ -2179,40 +2187,49 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     });
     try{ perCycleTechnicalResolver.build && perCycleTechnicalResolver.buildOnce && perCycleTechnicalResolver.buildOnce().catch(()=>{}); }catch(_){ }
   }catch(_){ perCycleTechnicalResolver = null; }
-
-  // Prime per-symbol technical + forex builds (best-effort, do not await)
-  try{
-    if (Array.isArray(symbols) && symbols.length > 0){
-      for (const sym of symbols){
-        try{
-          const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find((i:any)=> String(i.providerSymbol||i.id||i.symbol||'').toUpperCase() === String(sym).toUpperCase()) : undefined;
-          const assetType = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
-          // Trigger MTTI build (deduped per-cycle)
-          try{ if (perCycleTechnicalResolver && typeof perCycleTechnicalResolver.build === 'function') perCycleTechnicalResolver.build(String(sym).toUpperCase(), assetType).catch(()=>{}); }catch(_){ }
-          // For FOREX-like instruments also build forex session intelligence (best-effort)
-          if (assetType !== 'STOCK'){
+    // Prime per-symbol technical + forex builds (collect promises and await before finalizing cycle)
+    const perCycleBuildPromises: Promise<any>[] = [];
+    try{
+      if (Array.isArray(symbols) && symbols.length > 0){
+        for (const sym of symbols){
+          try{
+            const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find((i:any)=> String(i.providerSymbol||i.id||i.symbol||'').toUpperCase() === String(sym).toUpperCase()) : undefined;
+            const assetType = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
+            // Trigger MTTI build (deduped per-cycle) and capture promise
             try{
-              const fxMod = await import('./forex-session-intelligence');
-              (async ()=>{
-                try{
-                    // Build candles for daily via TwelveData provider when possible
-                    let candles: any[] | null = null;
-                    try{ const prov2 = new TwelveDataMarketDataProvider(); const hist = await prov2.getHistoricalDailyCloses(String(sym).toUpperCase(), 128).catch(()=>null); if (hist && Array.isArray(hist.closes)){
-                      const dates = Array.isArray(hist.dates) ? hist.dates : [];
-                      candles = hist.closes.map((c:any,i:number)=> ({ timestamp: (dates[i] || new Date().toISOString()), open: c, high: c, low: c, close: c, volume: (hist.volumes && Array.isArray(hist.volumes) && typeof hist.volumes[i] === 'number') ? hist.volumes[i] : null }));
-                    } }
-                    catch(_){ candles = null; }
-                    const snap = fxMod.buildForexSessionIntelligence({ symbol: String(sym).toUpperCase(), candles: Array.isArray(candles) ? candles : undefined, now: new Date() });
-                    try{ /* Audits for forex session snapshots are skipped in this milestone to avoid unsafe casts; runtime state updated below. */ }catch(_){ }
-                    try{ runtime.latestForexSessionIntelligenceBySymbol = runtime.latestForexSessionIntelligenceBySymbol || {}; runtime.latestForexSessionIntelligenceBySymbol[String(sym).toUpperCase()] = snap ? fxMod.sanitizeForexSessionIntelligenceForState(snap) : null; }catch(_){ }
-                }catch(_){ }
-              })();
+              if (perCycleTechnicalResolver && typeof perCycleTechnicalResolver.build === 'function'){
+                const p = perCycleTechnicalResolver.build(String(sym).toUpperCase(), assetType).catch((e:any)=>{ return null; });
+                perCycleBuildPromises.push(p);
+              }
             }catch(_){ }
-          }
-        }catch(_){ }
+            // For FOREX-like instruments also build forex session intelligence (capture promise)
+            if (assetType !== 'STOCK'){
+              try{
+                const fxMod = await import('./forex-session-intelligence');
+                const pfx = (async ()=>{
+                  try{
+                      // Build candles for daily via TwelveData provider when possible
+                      let candles: any[] | null = null;
+                      try{ const prov2 = new TwelveDataMarketDataProvider(); const hist = await prov2.getHistoricalDailyCloses(String(sym).toUpperCase(), 128).catch(()=>null); if (hist && Array.isArray(hist.closes)){
+                        const dates = Array.isArray(hist.dates) ? hist.dates : [];
+                        candles = hist.closes.map((c:any,i:number)=> ({ timestamp: (dates[i] || new Date().toISOString()), open: c, high: c, low: c, close: c, volume: (hist.volumes && Array.isArray(hist.volumes) && typeof hist.volumes[i] === 'number') ? hist.volumes[i] : null }));
+                      } }
+                      catch(_){ candles = null; }
+                      const snap = fxMod.buildForexSessionIntelligence({ symbol: String(sym).toUpperCase(), candles: Array.isArray(candles) ? candles : undefined, now: new Date() });
+                      try{ runtime.latestForexSessionIntelligenceBySymbol = runtime.latestForexSessionIntelligenceBySymbol || {}; runtime.latestForexSessionIntelligenceBySymbol[String(sym).toUpperCase()] = snap ? fxMod.sanitizeForexSessionIntelligenceForState(snap) : null; }catch(_){ }
+                      return snap;
+                  }catch(e){ return null; }
+                })();
+                perCycleBuildPromises.push(pfx.catch(()=>null));
+              }catch(_){ }
+            }
+          }catch(_){ }
+        }
       }
-    }
-  }catch(_){ }
+    }catch(_){ }
+
+    // Wait for per-symbol intelligence builds (isolate failures) before finalizing cycle
+    try{ await Promise.allSettled(perCycleBuildPromises); }catch(_){ }
 
   // Helper: build or return cached confluence summary for a symbol
   async function getOrBuildConfluence(symbol: string, marketSignals: any, ts?: string){
