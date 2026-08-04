@@ -10,7 +10,7 @@ export type TradableInstrument = {
   enabled: boolean;
   disabledReason?: string;
   // New asset-aware metadata
-  assetType?: 'STOCK' | 'FOREX' | 'COMMODITY';
+  assetType?: 'STOCK' | 'FOREX' | 'COMMODITY' | 'ETF';
   baseAsset?: string;
   quoteCurrency?: string;
   marketDataEnabled?: boolean; // whether this instrument should be fetched for market data
@@ -32,6 +32,53 @@ export const TRADABLE_INSTRUMENTS: TradableInstrument[] = [
   { id: 'amd', name: 'AMD', providerSymbol: 'AMD', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
   { id: 'netflix', name: 'Netflix', providerSymbol: 'NFLX', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
   { id: 'broadcom', name: 'Broadcom', providerSymbol: 'AVGO', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Additional US development universe additions
+  { id: 'oracle', name: 'Oracle', providerSymbol: 'ORCL', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'salesforce', name: 'Salesforce', providerSymbol: 'CRM', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'palantir', name: 'Palantir', providerSymbol: 'PLTR', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Semiconductors / AI
+  { id: 'taiwan-semiconductor', name: 'Taiwan Semiconductor', providerSymbol: 'TSM', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'arm', name: 'ARM Holdings', providerSymbol: 'ARM', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'micron', name: 'Micron Technology', providerSymbol: 'MU', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'qualcomm', name: 'Qualcomm', providerSymbol: 'QCOM', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'asml', name: 'ASML', providerSymbol: 'ASML', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'supermicro', name: 'Super Micro Computer', providerSymbol: 'SMCI', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Financials
+  { id: 'jpmorgan', name: 'JPMorgan Chase', providerSymbol: 'JPM', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'bank-america', name: 'Bank of America', providerSymbol: 'BAC', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'goldman', name: 'Goldman Sachs', providerSymbol: 'GS', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'visa', name: 'Visa', providerSymbol: 'V', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'mastercard', name: 'Mastercard', providerSymbol: 'MA', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Healthcare
+  { id: 'lilly', name: 'Eli Lilly', providerSymbol: 'LLY', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'unitedhealth', name: 'UnitedHealth', providerSymbol: 'UNH', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'abbvie', name: 'AbbVie', providerSymbol: 'ABBV', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'jnj', name: 'Johnson & Johnson', providerSymbol: 'JNJ', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Consumer
+  { id: 'costco', name: 'Costco', providerSymbol: 'COST', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'walmart', name: 'Walmart', providerSymbol: 'WMT', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'mcdonalds', name: 'McDonalds', providerSymbol: 'MCD', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'home-depot', name: 'Home Depot', providerSymbol: 'HD', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'nike', name: 'Nike', providerSymbol: 'NKE', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Industrials
+  { id: 'caterpillar', name: 'Caterpillar', providerSymbol: 'CAT', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'general-electric', name: 'General Electric', providerSymbol: 'GE', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'raytheon', name: 'Raytheon Technologies', providerSymbol: 'RTX', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'deere', name: 'Deere & Company', providerSymbol: 'DE', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Energy
+  { id: 'exxon', name: 'Exxon Mobil', providerSymbol: 'XOM', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'chevron', name: 'Chevron', providerSymbol: 'CVX', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // Cyber / Cloud
+  { id: 'palo-alto', name: 'Palo Alto Networks', providerSymbol: 'PANW', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'crowdstrike', name: 'CrowdStrike', providerSymbol: 'CRWD', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'snowflake', name: 'Snowflake', providerSymbol: 'SNOW', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'shopify', name: 'Shopify', providerSymbol: 'SHOP', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  { id: 'uber', name: 'Uber Technologies', providerSymbol: 'UBER', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'STOCK', quoteCurrency: 'USD' },
+  // ETFs
+  { id: 'spy', name: 'SPDR S&P 500 ETF Trust', providerSymbol: 'SPY', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'ETF', quoteCurrency: 'USD' },
+  { id: 'qqq', name: 'Invesco QQQ Trust', providerSymbol: 'QQQ', exchange: 'NASDAQ', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'ETF', quoteCurrency: 'USD' },
+  { id: 'iwm', name: 'iShares Russell 2000 ETF', providerSymbol: 'IWM', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'ETF', quoteCurrency: 'USD' },
+  { id: 'dia', name: 'SPDR Dow Jones Industrial Average ETF', providerSymbol: 'DIA', exchange: 'NYSE', currency: 'USD', enabled: true, marketDataEnabled: true, tradingEnabled: true, assetType: 'ETF', quoteCurrency: 'USD' },
   { id: 'telia', name: 'Telia', providerSymbol: 'TELIA', exchange: 'STO', currency: 'SEK', enabled: false, marketDataEnabled: false, tradingEnabled: false, assetType: 'STOCK', disabledReason: 'TWELVE_DATA_PLAN_RESTRICTED' },
   // Gold spot (commodity) — market data enabled, trading disabled for now
   // Added official Forex and Metals instruments (market data only, trading disabled)

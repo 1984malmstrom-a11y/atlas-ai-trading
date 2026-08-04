@@ -163,59 +163,92 @@ export function adaptHistoricalClosesToCandles(hist: any){
 export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: Date, watchlist = DEFAULT_WATCHLIST){
   try{
     if (!Array.isArray(eligibleInstruments)) return [];
+    const MAX_SLOTS = 10;
     const out: string[] = [];
-    // Start with the usual watchlist intersection (preserves existing behavior)
-    const wl = getWatchlistSymbols(eligibleInstruments, watchlist) || [];
-    for (const s of wl) out.push(String(s).toUpperCase());
 
-    // Add eligible FOREX instruments when session is open
+    // Helper: normalize symbol/id/provider -> canonical upper provider-like form
+    const normalize = (raw: string|undefined|null) => String(raw||'').toUpperCase();
+
+    // Build set of enabled tradable US equities/ETFs candidates
+    const usCandidates = (eligibleInstruments || []).filter((inst:any) => {
+      try{
+        const currency = String(inst.currency || '').toUpperCase();
+        const assetType = String(inst.assetType || 'STOCK').toUpperCase();
+        const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
+        const tradable = enabled && (assetType === 'STOCK' || assetType === 'ETF') && currency === 'USD' && inst.enabled !== false;
+        return tradable;
+      }catch(_){ return false; }
+    });
+
+    // Deterministic stable ordering for rotation: sort by normalized providerSymbol or id
+    const candidateSymbols = Array.from(new Set(usCandidates.map((i:any) => normalize(i.providerSymbol || i.id || i.symbol)))).filter(s=> s).sort((a,b)=> a.localeCompare(b));
+
+    // If caller provided a custom watchlist (not the default), preserve those symbols first
+    try{
+      const isCustomWatchlist = JSON.stringify(watchlist || []) !== JSON.stringify(DEFAULT_WATCHLIST || []);
+      if (isCustomWatchlist){
+        const wl = getWatchlistSymbols(eligibleInstruments, watchlist) || [];
+        for (const s of wl) {
+          try{ const su = String(s||'').toUpperCase(); if (su && !out.map(x=>String(x).toUpperCase()).includes(su)) out.push(su); }catch(_){ }
+        }
+      }
+    }catch(_){ }
+
+    // Core symbols: always include SPY and QQQ when present and enabled
+    const coreRequested = ['SPY','QQQ'];
+    for (const c of coreRequested){
+      try{ if (candidateSymbols.includes(c)) out.push(c); }catch(_){ }
+    }
+
+    // Forex core: include EUR/USD when forex session open and instrument present
     let sessionOpen = false;
     try{ const diag = getForexSessionDiagnostics(now instanceof Date ? now : new Date()); sessionOpen = diag && diag.status === 'OPEN'; }catch(_){ sessionOpen = false; }
-
     if (sessionOpen){
-      const seen = new Set(out.map(s=> String(s||'').toUpperCase()));
-      const forexCandidates: string[] = [];
+      // find any forex instrument that maps to EUR/USD and is enabled
       for (const inst of eligibleInstruments){
         try{
           const type = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
           if (type !== 'FOREX') continue;
-          const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
-          if (!enabled) continue;
-          if (inst.enabled === false) continue;
           const provRaw = String(inst.providerSymbol || inst.id || '').toUpperCase();
           if (!provRaw) continue;
-          // Map canonical registry/provider forms to analysis symbol form:
-          // - Registry id often uses underscore (EUR_USD) -> use EUR/USD for analysis
-          // - If provider already uses slash, preserve it
-          // - If provider uses compact form (EURUSD) try inserting slash between currencies
-          let prov = provRaw;
           let analysisSymbol = provRaw;
-          try{
-            if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
-            else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
-            else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
-            else analysisSymbol = provRaw;
-          }catch(_){ analysisSymbol = provRaw; }
-          if (!prov) continue;
-          // normalize simple alphanumeric key for dedupe stability
-          const key = prov.replace(/[^A-Z0-9]/g,'');
-          if (!key) continue;
-          // append providerSymbol (preserve slash) but dedupe by normalized key
-          if (seen.has(prov) || forexCandidates.map(x=>x.replace(/[^A-Z0-9]/g,'')).includes(key)) continue;
-          // push the analysis symbol form (EUR/USD) so BUY-universe uses canonical analysis symbol
-          forexCandidates.push(analysisSymbol);
+          if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
+          else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
+          else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
+          if (String(analysisSymbol).toUpperCase() === 'EUR/USD' || String(provRaw).toUpperCase().replace(/[^A-Z0-9]/g,'') === 'EURUSD'){
+            out.push('EUR/USD');
+            break;
+          }
         }catch(_){ }
       }
-      // stable order: sort forexCandidates by normalized key
-      forexCandidates.sort((a,b)=> a.replace(/[^A-Z0-9]/g,'').localeCompare(b.replace(/[^A-Z0-9]/g,'')));
-      for (const s of forexCandidates) out.push(s);
     }
 
-    // Final dedupe while preserving order
+    // Fill remaining slots deterministically by rotating over candidateSymbols (excluding any core already added)
+    const existingSet = new Set(out.map(s=> String(s||'').toUpperCase()));
+    const rotationPool = candidateSymbols.filter(s => !existingSet.has(String(s).toUpperCase()));
+    const slotsLeft = Math.max(0, MAX_SLOTS - out.length);
+    if (rotationPool.length > 0 && slotsLeft > 0){
+      // Derive deterministic cycle index from time: use hourly cycle index to rotate across hours
+      const nowMs = (now instanceof Date) ? now.getTime() : Date.now();
+      const CYCLE_MS = 60 * 60 * 1000; // 1 hour cycles
+      const cycleIndex = Math.floor(nowMs / CYCLE_MS);
+      // Rotation stepping: shift start by the number of rotation positions that will be filled
+      // in each cycle (i.e. the actual slotsLeft). This ensures block-wise rotation and
+      // guarantees full coverage within ceil(pool.length / slotsPerCycle) cycles.
+      const rotationStep = Math.max(1, slotsLeft);
+      const start = rotationPool.length > 0 ? ((cycleIndex * rotationStep) % rotationPool.length) : 0;
+      for (let i = 0; i < Math.min(slotsLeft, rotationPool.length); i++){
+        const idx = (start + i) % rotationPool.length;
+        const sym = rotationPool[idx];
+        if (!existingSet.has(String(sym).toUpperCase())){ existingSet.add(String(sym).toUpperCase()); out.push(sym); }
+      }
+    }
+
+    // Final dedupe & normalize order preservation
     const final: string[] = [];
     const seen2 = new Set<string>();
     for (const s of out){ const u = String(s||'').toUpperCase(); if (!seen2.has(u)){ seen2.add(u); final.push(s); } }
-    return final;
+    return final.slice(0, MAX_SLOTS);
   }catch(_){ return getWatchlistSymbols(eligibleInstruments, watchlist); }
 }
 
