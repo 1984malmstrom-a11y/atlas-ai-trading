@@ -10,3 +10,4 @@ quotes_output.json
 .env.*.local
 
 # Local recovery and verification artifacts
+ /src/data/twelve-diagnostics.json

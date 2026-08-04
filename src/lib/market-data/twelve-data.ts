@@ -2,11 +2,10 @@
 import path from 'path';
 import type { MarketDataProvider, MarketQuote } from './types';
 import { TRADABLE_INSTRUMENTS, findInstrumentById } from './instruments';
-// Avoid static `fs` import which breaks client-side bundling in Next.
-// Resolve `fs` at runtime only when running on the server.
-const _so = 'server' + '-only';
-void import(_so).catch(()=>{});
 // Diagnostics file I/O is handled by a server-only helper to avoid client bundling.
+// NOTE: do not import 'server-only' or `fs` at module top-level — this file
+// is consumed by both server and client code paths. Diagnostics are handled
+// best-effort via an in-memory server-side queue to avoid client bundle leaks.
 
   // Get FX rate from `fromCurrency` to SEK. Returns positive finite number or null on failure.
 
@@ -726,8 +725,12 @@ export class TwelveDataMarketDataProvider implements MarketDataProvider {
             const diag = Object.assign({}, diagBase, { httpStatus, providerErrorCode, providerErrorMessage, responseFieldNames, rawPriceValue, parsedPrice, rawTimestampValue, parsedTimestamp, timestampUnitDetected, quoteAgeSeconds, stale: !!stale, instrumentId, finalRuntimeKey, accepted });
             if (typeof window === 'undefined'){
               try{
-                const mod = await import('./twelve-diagnostics-store.server');
-                await mod.appendTwelveDiagnostic(diag);
+                // Best-effort diagnostics: avoid importing server-only modules from
+                // a module that is included in both server and client bundles.
+                // Keep diagnostics in-memory on the server so failures don't block
+                // provider behavior. A separate server-only persistence hook may
+                // pick up these diagnostics if available.
+                try{ (globalThis as any).__twelveDiagnostics = (globalThis as any).__twelveDiagnostics || []; (globalThis as any).__twelveDiagnostics.push(diag); }catch(_){ }
               }catch(e){
                 // keep provider behavior unchanged if diagnostics fail
               }
