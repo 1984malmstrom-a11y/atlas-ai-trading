@@ -59,6 +59,16 @@ export function normalizeSignalForConfluence(s: unknown): ConfluenceSignalItem |
   }catch(_){ return null; }
 }
 
+// Normalize symbol strings for relevance checks (e.g. EUR/USD, EUR_USD, EURUSD -> EURUSD)
+export function normalizeSignalSymbol(symbol: any){
+  try{
+    if (!symbol && symbol !== 0) return '';
+    const s = String(symbol).toUpperCase();
+    // remove common separators and whitespace, keep only alphanumerics
+    return s.replace(/[\/_\-\s]+/g, '').replace(/[^A-Z0-9]/g, '');
+  }catch(_){ return '' }
+}
+
 function pickStrongest(items: ConfluenceSignalItem[] | undefined){
   if (!Array.isArray(items) || items.length === 0) return undefined;
   const arr = items.slice();
@@ -102,8 +112,9 @@ export function buildSignalConfluenceSummary(symbol: string, marketSignals: Mark
       if (s !== null && typeof s === 'object'){
         const sRec = s as Record<string, unknown>;
         if (Array.isArray(sRec['symbols']) && (sRec['symbols'] as unknown[]).length){
-          const upper = (sRec['symbols'] as unknown[]).map(x=> String(x).toUpperCase());
-          if (upper.includes(sym)) relevant.push(s);
+          const normTarget = normalizeSignalSymbol(sym);
+          const upp = (sRec['symbols'] as unknown[]).map(x=> normalizeSignalSymbol(x));
+          if (upp.includes(normTarget)) relevant.push(s);
           else continue;
         } else { relevant.push(s); }
       } else { continue; }
@@ -558,6 +569,18 @@ export function createPerCycleDecisionIntelligenceResolver(opts: { cycleId: stri
         try{ await appendAuditFn(snap); auditAppended.add(sym); }catch(_){ }
       }
       return snap;
+    },
+    // Invalidate cached summary/snapshot for a symbol so it will be rebuilt
+    invalidate(sym?: string){
+      try{
+        const s = normalize(String(sym||'').toUpperCase());
+        if (!s) return;
+        try{ summaryBySymbol.delete(s); }catch(_){ }
+        try{ snapshotBySymbol.delete(s); }catch(_){ }
+        try{ qualityBySymbol.delete(s); }catch(_){ }
+        try{ reasoningBySymbol.delete(s); }catch(_){ }
+        try{ auditAppended.delete(s); }catch(_){ }
+      }catch(_){ }
     },
     // convenience: run analysis then finalize if selectedSupportingSignalIds provided
     async resolve(opts2: { symbol: string; marketSignals?: MarketSignalsPackage; selectedSupportingSignalIds?: string[] }){

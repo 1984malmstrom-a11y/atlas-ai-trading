@@ -177,3 +177,15 @@ describe('audit payload helper', ()=>{
     expect(audit['warnings']).toBeDefined();
   });
 });
+
+describe('symbol normalization matches various formats', ()=>{
+  it('matches signals with symbols ["EUR/USD"] when confluence symbol is EUR_USD or EURUSD', ()=>{
+    const pkg = { signals: [ { id:'t1', type:'TECHNICAL_MOMENTUM', origin:'SYMBOL_PRICE_SERIES', direction:'BULLISH', symbols: ['EUR/USD'], strength: 0.8 } ] } as any;
+    const s1 = buildSignalConfluenceSummary('EUR_USD', pkg as any);
+    expect(s1.usableSignalCount).toBeGreaterThanOrEqual(1);
+    const s2 = buildSignalConfluenceSummary('EURUSD', pkg as any);
+    expect(s2.usableSignalCount).toBeGreaterThanOrEqual(1);
+    const s3 = buildSignalConfluenceSummary('EUR/USD', pkg as any);
+    expect(s3.usableSignalCount).toBeGreaterThanOrEqual(1);
+  });
+});

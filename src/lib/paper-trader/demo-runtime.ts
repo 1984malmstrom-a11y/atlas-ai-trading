@@ -83,6 +83,8 @@ type RuntimeState = {
   latestFinancialHealthContextBySymbol?: Record<string, any>;
   latestExternalFundamentalContextBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
+  latestQuoteSnapshotBySymbol?: Record<string, any>;
+  latestSignalBuildDiagnosticsBySymbol?: Record<string, any>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
   latestBenchmarkMarketContextBySymbol?: Record<string, any>;
@@ -116,7 +118,7 @@ export const DEFAULT_WATCHLIST = ['NVDA','MSFT','AAPL','META','AMZN','GOOGL','TS
 export function getWatchlistSymbols(eligibleInstruments: any[], watchlist = DEFAULT_WATCHLIST){
   try{
     if (!Array.isArray(eligibleInstruments)) return [];
-    const allowed = new Set((watchlist||[]).map((s:string)=> String(s).toUpperCase()));
+    const allowed = new Set((watchlist || []).map((s: string) => String(s).toUpperCase()));
     const res: string[] = [];
     for (const i of eligibleInstruments){
       try{
@@ -180,14 +182,28 @@ export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: 
           const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
           if (!enabled) continue;
           if (inst.enabled === false) continue;
-          const prov = String(inst.providerSymbol || inst.id || '').toUpperCase();
+          const provRaw = String(inst.providerSymbol || inst.id || '').toUpperCase();
+          if (!provRaw) continue;
+          // Map canonical registry/provider forms to analysis symbol form:
+          // - Registry id often uses underscore (EUR_USD) -> use EUR/USD for analysis
+          // - If provider already uses slash, preserve it
+          // - If provider uses compact form (EURUSD) try inserting slash between currencies
+          let prov = provRaw;
+          let analysisSymbol = provRaw;
+          try{
+            if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
+            else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
+            else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
+            else analysisSymbol = provRaw;
+          }catch(_){ analysisSymbol = provRaw; }
           if (!prov) continue;
           // normalize simple alphanumeric key for dedupe stability
           const key = prov.replace(/[^A-Z0-9]/g,'');
           if (!key) continue;
           // append providerSymbol (preserve slash) but dedupe by normalized key
           if (seen.has(prov) || forexCandidates.map(x=>x.replace(/[^A-Z0-9]/g,'')).includes(key)) continue;
-          forexCandidates.push(prov);
+          // push the analysis symbol form (EUR/USD) so BUY-universe uses canonical analysis symbol
+          forexCandidates.push(analysisSymbol);
         }catch(_){ }
       }
       // stable order: sort forexCandidates by normalized key
@@ -918,6 +934,7 @@ const runtime: RuntimeState = {
   lastUpdated: nowIso(),
   autonomousEnabled: true,
   latestDecisionIntelligenceBySymbol: {},
+  latestSignalBuildDiagnosticsBySymbol: {},
   latestHistoricalMarketContextBySymbol: {},
   latestCompanyNewsContextBySymbol: {},
   forexReadiness: null,
@@ -934,6 +951,7 @@ const runtime: RuntimeState = {
   forexLaunchControl: null,
   latestForexCycleStatus: null,
   forexNoTradeSummary: null,
+  latestQuoteSnapshotBySymbol: {},
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -1416,6 +1434,7 @@ export async function getPaperTradingState(){
     totalReturnPercent: Math.round(((computedTotalValue / runtime.startCapital - 1) * 100) * 100)/100,
     latestDecision: runtime.latestDecision || null,
     latestCycle: runtime.latestCycle || null,
+    latestQuoteSnapshotBySymbol: runtime.latestQuoteSnapshotBySymbol ? JSON.parse(JSON.stringify(runtime.latestQuoteSnapshotBySymbol)) : null,
     auditEntries: audits,
     lastUpdated: runtime.lastUpdated,
   };
@@ -1484,6 +1503,15 @@ export async function getPaperTradingState(){
       }
       out.latestMultiTimeframeTechnicalIntelligenceBySymbol = safeMapT;
     }catch(_){ out.latestMultiTimeframeTechnicalIntelligenceBySymbol = {}; }
+    // Expose latest sanitized Signal Build Diagnostics per symbol for UI/state
+    try{
+      const rawDiag = runtime.latestSignalBuildDiagnosticsBySymbol || {} as Record<string, any>;
+      const safeDiag: Record<string, any> = {};
+      for (const k of Object.keys(rawDiag || {})){
+        try{ const v = (rawDiag as any)[k]; if (!v) continue; safeDiag[k] = { symbol: v.symbol, pricesCount: typeof v.pricesCount === 'number' ? v.pricesCount : null, volumesCount: typeof v.volumesCount === 'number' ? v.volumesCount : null, technicalAnalysisStatus: v.technicalAnalysisStatus || null, historicalDataPoints: typeof v.historicalDataPoints === 'number' ? v.historicalDataPoints : null, cacheHit: !!v.cacheHit, builtSignalCount: typeof v.builtSignalCount === 'number' ? v.builtSignalCount : null, builtSignalTypes: Array.isArray(v.builtSignalTypes) ? v.builtSignalTypes.slice() : [] }; }catch(_){ }
+      }
+      out.latestSignalBuildDiagnosticsBySymbol = safeDiag;
+    }catch(_){ out.latestSignalBuildDiagnosticsBySymbol = {}; }
     // Expose latest sanitized Forex Session Intelligence per symbol for UI/state
     try{
       const rawMapF = runtime.latestForexSessionIntelligenceBySymbol || {};
@@ -1655,13 +1683,32 @@ async function fetchQuotes(){
   try{
     const prov = (await import('../../lib/market-data')).default;
     if (prov && typeof prov.getQuotes === 'function'){
-      // Ask provider for common demo instruments
-      const ids = ['nvidia','microsoft','apple'];
-      const fetched = await prov.getQuotes(ids);
-      if (Array.isArray(fetched) && fetched.length>0){
-        // Map to minimal quote shape expected by runtime
-        return fetched.map((f:any)=> ({ symbol: f.symbol || (f.providerSymbol||'').toUpperCase(), price: (f.price===undefined||f.price===null)? null : Number(f.price) }));
-      }
+      // Ask provider for all enabled tradable instruments (avoid hardcoded limited set)
+      try{
+        const ids = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.filter(i => (i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true)).map(i=> i.id) : ['nvidia','microsoft','apple'];
+        const fetched = await prov.getQuotes(ids);
+        if (Array.isArray(fetched) && fetched.length>0){
+          // Map to minimal quote shape expected by runtime.
+          // Preserve normalized fields when present and tolerate several provider field namings.
+          return fetched.map((f:any)=> {
+            const instrumentId = f && (f.instrumentId || f.id || f.instrument_id) ? String(f.instrumentId || f.id || f.instrument_id) : (f && f.providerSymbol ? String(f.providerSymbol).replace(/[^A-Z0-9]/ig,'_') : null);
+            const providerSymbol = f && (f.providerSymbol || f.provider_symbol || f.symbol) ? String(f.providerSymbol || f.provider_symbol || f.symbol) : null;
+            const symbol = f && (f.symbol || f.providerSymbol || f.provider_symbol) ? String(f.symbol || f.providerSymbol || f.provider_symbol) : (providerSymbol ? String(providerSymbol) : null);
+            const marketTimestamp = f && (f.marketTimestamp || f.timestamp || f.time) ? String(f.marketTimestamp || f.timestamp || f.time) : null;
+            const dataStatus = f && (f.dataStatus || f.status || f.data_status) ? String(f.dataStatus || f.status || f.data_status) : null;
+            const fetchedAt = f && (f.fetchedAt || f.fetched_at) ? String(f.fetchedAt || f.fetched_at) : null;
+            return {
+              instrumentId: instrumentId || null,
+              providerSymbol: providerSymbol || null,
+              symbol: symbol || null,
+              price: (f && (f.price === undefined || f.price === null)) ? null : (f && typeof f.price === 'number' ? Number(f.price) : (f && f.price ? Number(f.price) : null)),
+              marketTimestamp: marketTimestamp || null,
+              dataStatus: dataStatus || null,
+              fetchedAt: fetchedAt || null,
+            };
+          });
+        }
+      }catch(e){ /* ignore and try HTTP fallback */ }
     }
   }catch(e){ /* ignore */ }
 
@@ -1769,6 +1816,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // time-based rules and do not short-circuit eligibility based on the override
   // payload.
   const _earlyQuotes = (opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes)) ? null : await fetchQuotes();
+  const _isQuotesArray = (x:any) => Array.isArray(x) || (!!x && Array.isArray(x.quotes));
+  const _quotesAsArray = (x:any) => Array.isArray(x) ? x : (x && Array.isArray(x.quotes) ? x.quotes : null);
 
   // Determine eligible instruments for this cycle using module-scoped TRADABLE_INSTRUMENTS.
   const eligibleInstruments = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.filter(i => {
@@ -1780,10 +1829,10 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     // session boundaries or when provider data indicates liquidity).
     try{
       const type = i && i.assetType ? String(i.assetType).toUpperCase() : 'STOCK';
-      if ((type === 'FOREX' || type === 'COMMODITY') && Array.isArray(_earlyQuotes)){
+      if ((type === 'FOREX' || type === 'COMMODITY') && _isQuotesArray(_earlyQuotes)){
         const sym = (i.providerSymbol || i.id || '').toUpperCase();
         const normSym = String(sym).replace(/[^A-Z0-9]/g, '');
-        const q = _earlyQuotes.find((qq:any) => {
+        const q = (_quotesAsArray(_earlyQuotes) || []).find((qq:any) => {
           const candidate = String((qq.symbol||qq.providerSymbol||'')).toUpperCase();
           const normCandidate = candidate.replace(/[^A-Z0-9]/g, '');
           return normCandidate === normSym;
@@ -1810,23 +1859,63 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // For BUY candidates, analyze the configured automatic universe (includes watchlist and eligible FOREX when session open)
   const symbols = buildAutomaticAnalysisSymbols(eligibleInstruments, nowForCycle);
   const quotes = opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes) ? opts.overrideUniverse.quotes : await fetchQuotes();
+  const quotesList = _quotesAsArray(quotes);
+
+  // Persist latest quote snapshot per canonical symbol for runtime inspection.
+  try{
+    runtime.latestQuoteSnapshotBySymbol = runtime.latestQuoteSnapshotBySymbol || {};
+    if (Array.isArray(quotesList)){
+      const toCanonical = (q:any) => {
+        try{
+          const s = q && (q.symbol || q.providerSymbol || null) ? String(q.symbol || q.providerSymbol).toUpperCase() : null;
+          const iid = q && (q.instrumentId || q.id || null) ? String(q.instrumentId || q.id).toUpperCase() : null;
+          const pick = s || iid || '';
+          const cleaned = String(pick || '').replace(/[^A-Z0-9]/g,'');
+          if (/^[A-Z]{6}$/.test(cleaned)) return `${cleaned.slice(0,3)}/${cleaned.slice(3,6)}`;
+          const sep = (pick || '').match(/^([A-Z]{3})[^A-Z0-9]+([A-Z]{3})$/);
+          if (sep) return `${sep[1]}/${sep[2]}`;
+          if (iid && iid.indexOf('_')>0){ const parts = iid.split('_'); if (parts.length===2) return `${parts[0]}/${parts[1]}`; }
+          return (s || iid || '').toUpperCase();
+        }catch(e){ return (q && q.symbol) ? String(q.symbol).toUpperCase() : (q && q.providerSymbol) ? String(q.providerSymbol).toUpperCase() : (q && q.instrumentId) ? String(q.instrumentId).toUpperCase() : null; }
+      };
+
+      for (const q of quotesList){
+        try{
+          const key = toCanonical(q);
+          if (!key) continue;
+          const snapshot = {
+            instrumentId: q.instrumentId || q.id || q.instrument || null,
+            symbol: q.symbol || null,
+            providerSymbol: q.providerSymbol || null,
+            price: (typeof q.price === 'number' ? q.price : (typeof q.priceSek === 'number' ? q.priceSek : null)),
+            marketTimestamp: q.marketTimestamp || q.timestamp || null,
+            dataStatus: q.dataStatus || null,
+            fetchedAt: q.fetchedAt || null,
+          };
+          runtime.latestQuoteSnapshotBySymbol[String(key).toUpperCase()] = snapshot;
+        }catch(_){ }
+      }
+    }
+  }catch(_){ }
 
   // --- RUNTIME QUOTES SNAPSHOT (transient diagnostic for cycle troubleshooting) ---
   try{
     const fetchedAt = new Date().toISOString();
-    const quotesIsArray = Array.isArray(quotes);
+    const quotesIsArray = _isQuotesArray(quotes);
     const maxCount = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.length : 0;
     const limited: any[] = [];
-    if (Array.isArray(quotes)){
-      for (let i = 0; i < Math.min(quotes.length, maxCount); i++){
-        const q = quotes[i] || {};
+    if (Array.isArray(quotesList)){
+      for (let i = 0; i < Math.min(quotesList.length, maxCount); i++){
+        const q = quotesList[i] || {};
         limited.push({
           symbol: q.symbol ?? null,
           instrumentId: q.instrumentId ?? null,
           providerSymbol: q.providerSymbol ?? null,
           price: (typeof q.price === 'number' ? q.price : (typeof q.priceSek === 'number' ? q.priceSek : null)),
           timestamp: q.marketTimestamp ?? q.timestamp ?? null,
-          isStale: (typeof q.isStale === 'boolean') ? q.isStale : !!q.isStale
+          isStale: (typeof q.isStale === 'boolean') ? q.isStale : !!q.isStale,
+          fetchedAt: q.fetchedAt ?? (quotes && quotes.fetchedAt ? quotes.fetchedAt : null),
+          dataStatus: q.dataStatus ?? null
         });
       }
     }
@@ -1852,15 +1941,20 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   }catch(e){ /* do not impact runtime when diagnostics fail */ }
   // Build and attach forex readiness snapshot for this cycle (defensive copy)
   try{
-    const readiness = buildForexReadinessState({ now: nowForCycle, instruments: TRADABLE_INSTRUMENTS, quotes: (quotes && Array.isArray(quotes)) ? quotes : [] });
+    const readiness = buildForexReadinessState({ now: nowForCycle, instruments: TRADABLE_INSTRUMENTS, quotes: (quotesList && Array.isArray(quotesList)) ? quotesList : [] });
     try{ runtime.forexReadiness = JSON.parse(JSON.stringify(readiness)); }catch(_){ runtime.forexReadiness = readiness as any; }
   }catch(_){ runtime.forexReadiness = null; }
   // Build per-cycle instruments array and macro snapshot/signals once to reuse for BUY/SELL
   let cycleMacroSnapshot: any = undefined;
   let cycleMacroSignals: any[] | undefined = undefined;
   let cycleSectorSummaries: any[] | undefined = undefined;
+  // Per-cycle cache for signals built early for BUY path (keyed by canonical symbol uppercase)
+  const perCycleBuiltSignals: Record<string, any[]> = {};
+  // Per-cycle marketSignals and resolved Decision Intelligence cache to avoid duplicate work
+  const perCycleMarketSignals: Record<string, any> = {};
+  const perCycleResolvedDI: Record<string, any> = {};
   try{
-    const instrumentsForMacro: any[] = Array.isArray(quotes) ? (quotes as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, providerSymbol: q.providerSymbol, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+    const instrumentsForMacro: any[] = Array.isArray(quotesList) ? (quotesList as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, providerSymbol: q.providerSymbol, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
     // Build local snapshot from instruments (GOLD/OIL)
     const localSnapshot = buildMacroSnapshotFromInstruments(instrumentsForMacro, new Date().toISOString());
     // Build sector summaries once per cycle
@@ -2511,7 +2605,29 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   async function buildSignalsForSymbol(opts: { symbol: string; instEntry?: any; instruments?: any[]; prices?: number[]; volumes?: number[]; techMeta?: any; sectorSummaries?: any; macros?: any[] }){
     const sym = String(opts.symbol || '').toUpperCase();
     if (!sym) return [];
-    if (signalsBySymbol.has(sym)) return signalsBySymbol.get(sym) as Promise<any[]>;
+    // initialize diagnostics entry immediately when this function is invoked
+    try{
+      runtime.latestSignalBuildDiagnosticsBySymbol = runtime.latestSignalBuildDiagnosticsBySymbol || {} as Record<string, any>;
+      const existingDiag = runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] || { symbol: String(sym).toUpperCase(), pricesCount: null, volumesCount: null, technicalAnalysisStatus: null, historicalDataPoints: null, cacheHit: false, builtSignalCount: null, builtSignalTypes: [] };
+      existingDiag.symbol = String(sym).toUpperCase();
+      existingDiag.cacheHit = false;
+      runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] = existingDiag;
+    }catch(_){ }
+
+    if (signalsBySymbol.has(sym)){
+      // record cache hit and attach an updater when cached promise resolves
+      try{
+        runtime.latestSignalBuildDiagnosticsBySymbol = runtime.latestSignalBuildDiagnosticsBySymbol || {} as Record<string, any>;
+        const diag = runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] || { symbol: String(sym).toUpperCase(), pricesCount: null, volumesCount: null, technicalAnalysisStatus: null, historicalDataPoints: null, cacheHit: true, builtSignalCount: null, builtSignalTypes: [] };
+        diag.cacheHit = true;
+        runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] = diag;
+        const existing = signalsBySymbol.get(sym) as Promise<any[]>;
+        if (existing && typeof (existing as any).then === 'function'){
+          try{ (existing as any).then((res:any[])=>{ try{ diag.builtSignalCount = Array.isArray(res) ? res.length : null; diag.builtSignalTypes = Array.isArray(res) ? Array.from(new Set(res.map((s:any)=> s && s.type).filter(Boolean))) : []; }catch(_){ } }); }catch(_){ }
+        }
+      }catch(_){ }
+      return signalsBySymbol.get(sym) as Promise<any[]>;
+    }
     const p = (async ()=>{
       const out: any[] = [];
       try{
@@ -2519,6 +2635,18 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         // Normalize arrays (do not mutate originals)
         const prices = Array.isArray(pIn) ? pIn.slice() : (instEntry && Array.isArray(instEntry.prices) ? instEntry.prices.slice() : (instEntry && typeof instEntry.price === 'number' ? [instEntry.price] : []));
         const volumes = Array.isArray(vIn) ? vIn.slice() : (instEntry && Array.isArray(instEntry.volumes) ? instEntry.volumes.slice() : []);
+
+        // Update diagnostics with available inputs
+        try{
+          runtime.latestSignalBuildDiagnosticsBySymbol = runtime.latestSignalBuildDiagnosticsBySymbol || {} as Record<string, any>;
+          const d = runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] || { symbol: String(sym).toUpperCase(), pricesCount: null, volumesCount: null, technicalAnalysisStatus: null, historicalDataPoints: null, cacheHit: false, builtSignalCount: null, builtSignalTypes: [] };
+          d.pricesCount = Array.isArray(prices) ? prices.length : null;
+          d.volumesCount = Array.isArray(volumes) ? volumes.length : null;
+          d.technicalAnalysisStatus = techMeta && (techMeta.technicalAnalysisStatus || techMeta.technicalAnalysisMode) ? (techMeta.technicalAnalysisStatus || techMeta.technicalAnalysisMode) : null;
+          d.historicalDataPoints = Array.isArray(prices) ? prices.length : null;
+          d.cacheHit = false;
+          runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] = d;
+        }catch(_){ }
 
         // 1-4: Technical momentum, Relative Strength, Sector Strength (these are observation-only and safe to build first)
         try{ if (techMeta){ const techSig = createTechnicalSignalIfFresh(techMeta, sym, new Date(), TECHNICAL_MOMENTUM_MAX_AGE_DAYS); if (techSig) out.push(techSig); } }catch(_){ }
@@ -2533,10 +2661,42 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         // 8: Macro signals appended last
         try{ if (Array.isArray(macros)){ for (const m of macros){ if (m && m.id && !out.some(o=> String(o.id) === String(m.id))) out.push(m); } } }catch(_){ }
       }catch(_){ }
+      // Update diagnostics with built results before resolving
+      try{
+        runtime.latestSignalBuildDiagnosticsBySymbol = runtime.latestSignalBuildDiagnosticsBySymbol || {} as Record<string, any>;
+        const d2 = runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] || { symbol: String(sym).toUpperCase(), pricesCount: null, volumesCount: null, technicalAnalysisStatus: null, historicalDataPoints: null, cacheHit: false, builtSignalCount: null, builtSignalTypes: [] };
+        d2.builtSignalCount = Array.isArray(out) ? out.length : null;
+        d2.builtSignalTypes = Array.isArray(out) ? Array.from(new Set(out.map((s:any)=> s && s.type).filter(Boolean))) : [];
+        runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] = d2;
+      }catch(_){ }
       return out;
     })();
-    signalsBySymbol.set(sym, p);
-    return p;
+    // Cache the build promise but ensure we don't permanently cache an empty result.
+    const wrapped = (async () => {
+      try{
+        const res = await p;
+        try{
+          if (Array.isArray(res) && res.length === 0){
+            // remove cached empty result to allow rebuild when better inputs arrive
+            try{ signalsBySymbol.delete(sym); }catch(_){ }
+          }
+        }catch(_){ }
+        return res;
+      }catch(e){
+        try{ signalsBySymbol.delete(sym); }catch(_){ }
+        throw e;
+      }
+    })();
+    signalsBySymbol.set(sym, wrapped);
+    // Attach final updater to wrapped resolution to ensure diagnostics reflect resolved cache
+    try{
+      runtime.latestSignalBuildDiagnosticsBySymbol = runtime.latestSignalBuildDiagnosticsBySymbol || {} as Record<string, any>;
+      const diag = runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] || null;
+      if (diag && wrapped && typeof (wrapped as any).then === 'function'){
+        try{ (wrapped as any).then((res:any[])=>{ try{ diag.builtSignalCount = Array.isArray(res)? res.length : null; diag.builtSignalTypes = Array.isArray(res)? Array.from(new Set(res.map((s:any)=> s && s.type).filter(Boolean))) : []; if (runtime.latestSignalBuildDiagnosticsBySymbol) runtime.latestSignalBuildDiagnosticsBySymbol[String(sym).toUpperCase()] = diag; }catch(_){ } }); }catch(_){ }
+      }
+    }catch(_){ }
+    return wrapped;
   }
 
   // Helper to build meta object for appendEvaluation that may include fundamentalAnalysis
@@ -2559,7 +2719,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   if (Array.isArray(portfolio.holdings)){
     for (const h of portfolio.holdings){
       const symbol = (h.symbol||'').toUpperCase();
-      const q = quotes && Array.isArray(quotes) ? quotes.find((x:any)=> {
+      const q = (quotesList || []).find((x:any)=> {
         try{
           const sym = (x && x.symbol) ? String(x.symbol).toUpperCase() : null;
           const iid = (x && x.instrumentId) ? String(x.instrumentId).toUpperCase() : null;
@@ -2568,7 +2728,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           const nSymbol = normalize(symbol);
           return (sym && (sym === symbol || normalize(sym) === nSymbol)) || (iid && (iid === symbol || normalize(iid) === nSymbol)) || (pSym && (pSym === symbol || normalize(pSym) === nSymbol));
         }catch(e){ return false; }
-      }) : null;
+      });
       const evalRes = evaluateHoldingActionPublic(h,q);
       // diagnostics for this holding
       try{
@@ -2589,9 +2749,9 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       try{
 
         _techMeta_for_holding = await fetchAndAnalyze(symbol);
-        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, _techMeta_for_holding) } as any, cycleAuditStore); }catch(e){}
+        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (((q as any).priceSek) || ((q as any).price)) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, _techMeta_for_holding) } as any, cycleAuditStore); }catch(e){}
       }catch(_){
-        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' }) } as any, cycleAuditStore); }catch(_){ }
+        try{ await appendEvaluation({ kind: 'EVALUATION', decision: { id: `eval_${symbol}_${Date.now()}`, symbol, action: evalRes.action, confidence: 0, referencePrice: q && (((q as any).priceSek) || ((q as any).price)) || h.currentPrice, generatedAt: nowIso() }, reason: { action: evalRes.action, reason: evalRes.reason, score: evalRes.score }, portfolioBefore: portfolio, timestamp: nowIso(), meta: getMetaForSymbol(symbol, { technicalAnalysisMode: 'observe-only', technicalAnalysisStatus: 'unavailable', technicalAnalysisErrorCode: 'PROVIDER_ERROR', technicalAnalysisErrorMessage: 'Fetch failed' }) } as any, cycleAuditStore); }catch(_){ }
       }
       if (evalRes.action === 'SELL'){
           plannedSymbols.add(symbol);
@@ -2612,7 +2772,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
             // Build typed marketSignals from available quotes/analysis and attach to DecisionEngine input
             let marketSignalsForDecision: any = undefined;
             try{
-              const instruments: any[] = Array.isArray(quotes) ? (quotes as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+              const instruments: any[] = Array.isArray(quotesList) ? (quotesList as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
               const validInstruments = instruments.filter(i=> i.price !== null && i.changePercent !== null && i.dataStatus !== 'UNAVAILABLE');
               const instrumentCount = instruments.length;
               const advancing = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent > 0).length;
@@ -2627,6 +2787,13 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               const summary = { instrumentCount, advancing, declining, unchanged, unavailable, averageChangePercent: avg };
               const ctx = { generatedAt: new Date().toISOString(), marketDataStatus: (validInstruments.length === instruments.length && instruments.length > 0) ? 'READY' : (validInstruments.length > 0 ? 'PARTIAL' : 'UNAVAILABLE'), summary, strongest, weakest, instruments, warnings } as any;
               try{ const analysis = analyzeMarket(ctx as any); marketSignalsForDecision = buildMarketSignals(ctx as any, analysis as any); }catch(_){ marketSignalsForDecision = undefined; }
+              // Ensure marketSignalsForDecision is always an object with a signals array
+              try{
+                if (!marketSignalsForDecision || !Array.isArray((marketSignalsForDecision as any).signals)){
+                  const existingSignals = marketSignalsForDecision && Array.isArray((marketSignalsForDecision as any).signals) ? (marketSignalsForDecision as any).signals.slice() : [];
+                  marketSignalsForDecision = { generatedAt: new Date().toISOString(), confidence: 0, signals: existingSignals, warnings: [] } as any;
+                }
+              }catch(_){ marketSignalsForDecision = { generatedAt: new Date().toISOString(), confidence: 0, signals: [], warnings: [] } as any; }
               // Append TECHNICAL_MOMENTUM signal from historical price analysis when available
               try{
                 const techSignalObj = createTechnicalSignalIfFresh(_techMeta_for_holding, symbol, new Date(), TECHNICAL_MOMENTUM_MAX_AGE_DAYS);
@@ -2665,11 +2832,17 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                   for (const s of Array.isArray(built) ? built : []){
                     try{ if (s && s.id && !marketSignalsForDecision.signals.some((x:any)=> x && x.id === s.id)) marketSignalsForDecision.signals.push(s); }catch(_){ }
                   }
+                  // Invalidate cached confluence for this symbol so it will be rebuilt
+                  try{
+                    const key = String(symbol || '').toUpperCase();
+                    try{ if (confluenceBySymbol.has(key)) confluenceBySymbol.delete(key); }catch(_){ }
+                    try{ if (decisionIntelligenceResolver && typeof decisionIntelligenceResolver.invalidate === 'function') decisionIntelligenceResolver.invalidate(key); }catch(_){ }
+                  }catch(_){ }
                 }
               }catch(_){ }
             }catch(_){ marketSignalsForDecision = undefined; }
 
-            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (q.priceSek||q.price) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, performanceProfile: profile || undefined, expectedReturnPercent: expectedReturnForDecision, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext, marketSignals: marketSignalsForDecision } as any;
+            const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'SELL', symbol, quantity: h.quantity, referencePrice: q && (((q as any).priceSek) || ((q as any).price)) || h.currentPrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, performanceProfile: profile || undefined, expectedReturnPercent: expectedReturnForDecision, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext, marketSignals: marketSignalsForDecision } as any;
               // Ensure decision.signals references actual marketSignals ids (at least two distinct types when available)
             let _chosenSupportingSignalIdsForDecision: string[] | undefined = undefined;
             // Build analysis snapshot (resolve analysis) using per-cycle resolver if available
@@ -2710,8 +2883,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               }
             }catch(_){ }
             const decRes = DecisionEngine.evaluateDecision(decInput);
-            const candBase: PaperTradeDecision = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (q.priceSek||q.price) || h.currentPrice, generatedAt: nowIso() } as any;
-            const candExtras: any = { requestedNotionalSek: Math.round((h.quantity || 0) * (q && (q.priceSek||q.price) || h.currentPrice) || 0), tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect };
+            const candBase: PaperTradeDecision = { id: `sell_${symbol}_${Date.now()}`, symbol, action: 'SELL', confidence: decRes.confidence, referencePrice: q && (((q as any).priceSek) || ((q as any).price)) || h.currentPrice, generatedAt: nowIso() } as any;
+            const candExtras: any = { requestedNotionalSek: Math.round((h.quantity || 0) * (q && (((q as any).priceSek) || ((q as any).price)) || h.currentPrice) || 0), tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect };
             const cand = Object.assign({}, candBase, candExtras) as any;
             // Persist selected supporting signal ids on candidate (if any)
             try{
@@ -2797,10 +2970,10 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   }
 
   // Now consider buy candidates from symbols list, skip those already planned for sell
-  if (quotes && Array.isArray(quotes)){
+  if (quotesList && Array.isArray(quotesList)){
     for (const s of symbols){
       if (plannedSymbols.has(s)) continue;
-      const q = quotes.find((x:any)=>{
+      const q = (quotesList || []).find((x:any)=>{
         try{
           const sym = (x && x.symbol) ? String(x.symbol).toUpperCase() : null;
           const iid = (x && x.instrumentId) ? String(x.instrumentId).toUpperCase() : null;
@@ -2840,6 +3013,74 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
         try{ await cycleAuditStore.append({ kind: 'REJECT', decision: { id: `rej_${s}_${Date.now()}`, symbol: s, action: 'UNKNOWN' }, reason: { code: 'QUOTE_INVALID', message: 'Invalid price from quote' }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any); }catch(_){ }
         continue;
       }
+
+      // Pre-build technical signals and related analysis for this symbol once per cycle
+      try{
+        const keyU = String(s || '').toUpperCase();
+        // Only build if not already built this cycle
+        if (!perCycleBuiltSignals[keyU]){
+          // Fetch technical/historical inputs used by buildSignalsForSymbol
+          let _preTechMeta_for_buy: any = null;
+          try{ _preTechMeta_for_buy = await fetchAndAnalyze(s); }catch(e){ _preTechMeta_for_buy = null; }
+          // Build instruments array from quotesList
+          const instruments: any[] = Array.isArray(quotesList) ? (quotesList as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+          const instEntry = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(s).toUpperCase()) : null;
+          // Attempt to obtain historical prices/volumes used by signals builder
+          let prices: number[] = (instEntry && Array.isArray((instEntry as any).prices) ? (instEntry as any).prices.slice() : (instEntry && typeof instEntry.price === 'number' ? [instEntry.price] : []));
+          let volumes: number[] = (instEntry && Array.isArray((instEntry as any).volumes) ? (instEntry as any).volumes.slice() : []);
+          if ((!Array.isArray(prices) || prices.length < 2) || (!Array.isArray(volumes) || volumes.length === 0)){
+            try{ const hist = await getHistoricalForSymbol(s); if (hist && Array.isArray(hist.closes) && hist.closes.length) prices = hist.closes.slice(); if (hist && Array.isArray((hist as any).volumes) && (hist as any).volumes.length) volumes = (hist as any).volumes.slice(); }catch(_){ }
+          }
+          // Build signals using existing builder and cache per-cycle
+          try{
+            const built = await buildSignalsForSymbol({ symbol: s, instEntry, instruments, prices, volumes, techMeta: _preTechMeta_for_buy, sectorSummaries: cycleSectorSummaries, macros: cycleMacroSignals });
+            perCycleBuiltSignals[keyU] = Array.isArray(built) ? built : [];
+          }catch(_){ perCycleBuiltSignals[keyU] = []; }
+        }
+      }catch(_){ }
+
+      // Build and persist marketSignals + Decision Intelligence now, regardless of buySignal
+      try{
+        const keyU2 = String(s || '').toUpperCase();
+        if (!perCycleMarketSignals[keyU2]){
+          try{
+            const instruments2: any[] = Array.isArray(quotesList) ? (quotesList as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+            const validInstruments = instruments2.filter(i=> i.price !== null && i.changePercent !== null && i.dataStatus !== 'UNAVAILABLE');
+            const instrumentCount = instruments2.length;
+            const advancing = instruments2.filter(i=> typeof i.changePercent === 'number' && i.changePercent > 0).length;
+            const declining = instruments2.filter(i=> typeof i.changePercent === 'number' && i.changePercent < 0).length;
+            const unchanged = instruments2.filter(i=> typeof i.changePercent === 'number' && i.changePercent === 0).length;
+            const unavailable = instruments2.filter(i=> i.price === null || i.changePercent === null).length;
+            const avg = validInstruments.length > 0 ? Number((validInstruments.reduce((s,n)=> s + (Number(n.changePercent)||0),0)/validInstruments.length).toFixed(2)) : 0;
+            const strongest = validInstruments.length > 0 ? validInstruments.reduce((best,cur)=> (cur.changePercent > (best.changePercent||-Infinity) ? cur : best)) : null;
+            const weakest = validInstruments.length > 0 ? validInstruments.reduce((worst,cur)=> (cur.changePercent < (worst.changePercent||Infinity) ? cur : worst)) : null;
+            const warnings: string[] = [];
+            if ((quotes || []).some((qq:any)=> qq.dataStatus === 'DELAYED')) warnings.push('Marknadsdata är fördröjd.');
+            const summary = { instrumentCount, advancing, declining, unchanged, unavailable, averageChangePercent: avg };
+            const ctx = { generatedAt: new Date().toISOString(), marketDataStatus: (validInstruments.length === instruments2.length && instruments2.length > 0) ? 'READY' : (validInstruments.length > 0 ? 'PARTIAL' : 'UNAVAILABLE'), summary, strongest, weakest, instruments: instruments2, warnings } as any;
+            let marketSignalsPkg: any = undefined;
+            try{ const analysis = analyzeMarket(ctx as any); marketSignalsPkg = buildMarketSignals(ctx as any, analysis as any); }catch(_){ marketSignalsPkg = undefined; }
+            // Append any prebuilt signals for this symbol (deduped)
+            try{
+              if (!marketSignalsPkg) marketSignalsPkg = { generatedAt: new Date().toISOString(), signals: [] };
+              const pre = perCycleBuiltSignals[keyU2] || [];
+              for (const ss of Array.isArray(pre) ? pre : []){ try{ if (ss && ss.id && !marketSignalsPkg.signals.some((x:any)=> x && x.id === ss.id)) marketSignalsPkg.signals.push(ss); }catch(_){ } }
+            }catch(_){ }
+            perCycleMarketSignals[keyU2] = marketSignalsPkg;
+            // Invalidate confluence cache and request DI resolver to rebuild
+            try{ if (confluenceBySymbol.has(keyU2)) confluenceBySymbol.delete(keyU2); }catch(_){ }
+            try{ if (decisionIntelligenceResolver && typeof decisionIntelligenceResolver.invalidate === 'function') decisionIntelligenceResolver.invalidate(keyU2); }catch(_){ }
+            // Resolve Decision Intelligence snapshot now and persist for runtime inspection
+            try{
+              if (decisionIntelligenceResolver){
+                const snap = await decisionIntelligenceResolver.resolveAnalysis({ symbol: keyU2, marketSignals: perCycleMarketSignals[keyU2] });
+                perCycleResolvedDI[keyU2] = snap;
+                try{ runtime.latestDecisionIntelligenceBySymbol = runtime.latestDecisionIntelligenceBySymbol || {}; const existing = runtime.latestDecisionIntelligenceBySymbol[keyU2] || null; if (existing && typeof existing === 'object') runtime.latestDecisionIntelligenceBySymbol[keyU2] = Object.assign({}, existing, { symbol: keyU2, decisionIntelligenceSnapshot: snap, analysisQuality: snap.analysisQuality }); else runtime.latestDecisionIntelligenceBySymbol[keyU2] = { symbol: keyU2, decisionIntelligenceSnapshot: snap, analysisQuality: snap.analysisQuality }; }catch(_){ }
+              }
+            }catch(_){ }
+          }catch(_){ perCycleMarketSignals[keyU2] = undefined; }
+        }
+      }catch(_){ }
 
       // Determine buy signal: only buy on dip vs last evaluation for this symbol (prevents random buys)
       // Find last evaluation audit for symbol
@@ -2887,7 +3128,7 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
           // Build typed marketSignals from available quotes/analysis and attach to DecisionEngine input for BUY
           let marketSignalsForBuy: any = undefined;
           try{
-            const instruments: any[] = Array.isArray(quotes) ? (quotes as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
+            const instruments: any[] = Array.isArray(quotesList) ? (quotesList as any[]).map((q:any)=> ({ instrumentId: q.instrumentId, symbol: q.symbol, name: q.name, price: (typeof q.priceSek === 'number' ? q.priceSek : (typeof q.price === 'number' ? q.price : null)), change: q.change, changePercent: q.changePercent, dataStatus: q.dataStatus, isStale: q.isStale, marketTimestamp: q.marketTimestamp })) : [];
             const validInstruments = instruments.filter(i=> i.price !== null && i.changePercent !== null && i.dataStatus !== 'UNAVAILABLE');
             const instrumentCount = instruments.length;
             const advancing = instruments.filter(i=> typeof i.changePercent === 'number' && i.changePercent > 0).length;
@@ -2919,19 +3160,35 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
                   }
                 }
               }catch(_){ }
-              // Append related market-structure and sector/macros via per-symbol build to preserve ordering
-              try{
-                if (marketSignalsForBuy && Array.isArray(marketSignalsForBuy.signals)){
-                  const inst = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(s).toUpperCase()) : null;
-                  let prices = Array.isArray((inst && inst.prices) ? inst.prices : []) ? (inst.prices as any[]).slice() : (inst && typeof inst.price === 'number' ? [inst.price] : []);
-                  let volumes = Array.isArray((inst && inst.volumes) ? inst.volumes : []) ? (inst.volumes as any[]).slice() : [];
-                  if ((!Array.isArray(prices) || prices.length < 2) || (!Array.isArray(volumes) || volumes.length === 0)){
-                    try{ const hist = await getHistoricalForSymbol(s); if (hist && Array.isArray(hist.closes) && hist.closes.length) prices = hist.closes.slice(); if (hist && Array.isArray((hist as any).volumes) && (hist as any).volumes.length) volumes = (hist as any).volumes.slice(); }catch(_){ }
-                  }
-                  const built = await buildSignalsForSymbol({ symbol: s, instEntry: inst, instruments, prices, volumes, techMeta: _techMeta_for_buy, sectorSummaries: cycleSectorSummaries, macros: cycleMacroSignals });
-                  for (const ss of Array.isArray(built) ? built : []){ try{ if (ss && ss.id && !marketSignalsForBuy.signals.some((x:any)=> x && x.id === ss.id)) marketSignalsForBuy.signals.push(ss); }catch(_){ } }
-                }
-              }catch(_){ }
+                  // Append related market-structure and sector/macros via per-symbol build to preserve ordering
+                  try{
+                    if (marketSignalsForBuy && Array.isArray(marketSignalsForBuy.signals)){
+                      const inst = Array.isArray(instruments) ? instruments.find((ii:any)=> String(ii.symbol).toUpperCase() === String(s).toUpperCase()) : null;
+                      let prices = Array.isArray((inst && inst.prices) ? inst.prices : []) ? (inst.prices as any[]).slice() : (inst && typeof inst.price === 'number' ? [inst.price] : []);
+                      let volumes = Array.isArray((inst && inst.volumes) ? inst.volumes : []) ? (inst.volumes as any[]).slice() : [];
+                      if ((!Array.isArray(prices) || prices.length < 2) || (!Array.isArray(volumes) || volumes.length === 0)){
+                        try{ const hist = await getHistoricalForSymbol(s); if (hist && Array.isArray(hist.closes) && hist.closes.length) prices = hist.closes.slice(); if (hist && Array.isArray((hist as any).volumes) && (hist as any).volumes.length) volumes = (hist as any).volumes.slice(); }catch(_){ }
+                      }
+                      const keyU = String(s || '').toUpperCase();
+                      // If we already created per-cycle marketSignals, reuse and skip duplicate building
+                      if (perCycleMarketSignals && perCycleMarketSignals[keyU]){
+                        marketSignalsForBuy = perCycleMarketSignals[keyU];
+                      } else {
+                        let built: any[] | undefined = undefined;
+                        if (perCycleBuiltSignals && perCycleBuiltSignals[keyU] && Array.isArray(perCycleBuiltSignals[keyU]) && perCycleBuiltSignals[keyU].length > 0){
+                          built = perCycleBuiltSignals[keyU];
+                        }else{
+                          built = await buildSignalsForSymbol({ symbol: s, instEntry: inst, instruments, prices, volumes, techMeta: _techMeta_for_buy, sectorSummaries: cycleSectorSummaries, macros: cycleMacroSignals });
+                        }
+                        for (const ss of Array.isArray(built) ? built : []){ try{ if (ss && ss.id && !marketSignalsForBuy.signals.some((x:any)=> x && x.id === ss.id)) marketSignalsForBuy.signals.push(ss); }catch(_){ } }
+                        // Invalidate cached confluence for this symbol so it will be rebuilt (if not already handled)
+                        try{
+                          try{ if (!perCycleMarketSignals[keyU]){ if (confluenceBySymbol.has(keyU)) confluenceBySymbol.delete(keyU); } }catch(_){ }
+                          try{ if (decisionIntelligenceResolver && typeof decisionIntelligenceResolver.invalidate === 'function') decisionIntelligenceResolver.invalidate(keyU); }catch(_){ }
+                        }catch(_){ }
+                      }
+                    }
+                  }catch(_){ }
           }catch(_){ marketSignalsForBuy = undefined; }
 
           const decInput = { portfolio: { availableCash: portfolio.availableCash, totalValue: portfolio.totalValue, holdings: portfolio.holdings }, decision: { side: 'BUY', symbol: s, requestedNotionalSek: 8000, referencePrice: usePrice }, todaysTradeCount: 0, performanceReflection: perCycleReflection, performanceProfile: profile || undefined, expectedReturnPercent: estimateForBuy.expectedReturnPercent, tradeFeedbackSummary: await computeTradeFeedbackSummary(auditStore), adaptiveDecisionContext, marketSignals: marketSignalsForBuy } as any;
