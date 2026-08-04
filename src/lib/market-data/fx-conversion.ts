@@ -66,13 +66,24 @@ export function resolveCurrencyToSekRate(params: { currency: string; quotesByCan
     if (!q) return { ok: false, reason: 'MISSING' } as const;
     const price = Number(q.price ?? q.rate ?? null);
     if (!Number.isFinite(price) || price <= 0) return { ok: false, reason: 'INVALID' } as const;
-    const ts = q.marketTimestamp || q.fetchedAt || q.timestamp || q.observedAt || null;
+    const ts = q.marketTimestamp ?? q.fetchedAt ?? q.timestamp ?? q.observedAt ?? null;
     if (!ts) return { ok: false, reason: 'MISSING_TS' } as const;
-    const tsMs = Date.parse(String(ts));
-    if (!isFinite(tsMs)) return { ok: false, reason: 'INVALID_TS' } as const;
+    // Accept ISO strings, numeric epoch seconds, and numeric-ms values
+    let tsMs: number | null = null;
+    if (typeof ts === 'number') {
+      tsMs = ts > 1e12 ? ts : ts * 1000; // ms vs seconds
+    } else if (/^\d+$/.test(String(ts).trim())) {
+      // pure digits - treat as seconds when small
+      const n = Number(String(ts).trim());
+      tsMs = n > 1e12 ? n : n * 1000;
+    } else {
+      const parsed = Date.parse(String(ts));
+      tsMs = isFinite(parsed) ? parsed : null;
+    }
+    if (!tsMs || !isFinite(tsMs)) return { ok: false, reason: 'INVALID_TS' } as const;
     const age = nowDate.getTime() - tsMs;
     const leg: FxConversionLeg = { fromCurrency: from, toCurrency: to, rate: price, observedAt: new Date(tsMs).toISOString() };
-    return { ok: true, leg, age, tsMs } as const;
+    return { ok: true, leg, age, tsMs, q } as const;
   };
 
   // Direct USD->SEK path check (many triangulations depend on USD_SEK)
@@ -83,7 +94,12 @@ export function resolveCurrencyToSekRate(params: { currency: string; quotesByCan
   if (direct.ok){
     const reasons: string[] = [];
     if (direct.age! < 0){ outBase.status = 'FUTURE_RATE'; outBase.reasons.push('LEG_FUTURE'); return outBase; }
-    if (direct.age! > maxAge){ outBase.status = 'STALE_RATE'; outBase.reasons.push('LEG_STALE'); return outBase; }
+    // respect provider freshness flag when present
+    if ((direct as any).q && (direct as any).q.isStale){ outBase.status = 'STALE_RATE'; outBase.reasons.push('LEG_STALE'); return outBase; }
+    // If provider explicitly marked quote as fresh (isStale === false), accept regardless of raw age
+    if (!((direct as any).q && typeof (direct as any).q.isStale === 'boolean' && (direct as any).q.isStale === false)){
+      if (direct.age! > maxAge){ outBase.status = 'STALE_RATE'; outBase.reasons.push('LEG_STALE'); return outBase; }
+    }
     outBase.status = 'VERIFIED'; outBase.rateToSek = direct.leg.rate; outBase.isFresh = true; outBase.path = [direct.leg]; outBase.observedAt = direct.leg.observedAt; return outBase;
   }
 
@@ -91,7 +107,10 @@ export function resolveCurrencyToSekRate(params: { currency: string; quotesByCan
   if (src === 'USD'){
     if (!usdSek.ok){ outBase.status = 'MISSING_RATE'; outBase.reasons.push('USD_SEK_MISSING'); return outBase; }
     if (usdSek.age! < 0){ outBase.status = 'FUTURE_RATE'; outBase.reasons.push('USD_SEK_FUTURE'); return outBase; }
-    if (usdSek.age! > maxAge){ outBase.status = 'STALE_RATE'; outBase.reasons.push('USD_SEK_STALE'); return outBase; }
+    if ((usdSek as any).q && (usdSek as any).q.isStale){ outBase.status = 'STALE_RATE'; outBase.reasons.push('USD_SEK_STALE'); return outBase; }
+    if (!((usdSek as any).q && typeof (usdSek as any).q.isStale === 'boolean' && (usdSek as any).q.isStale === false)){
+      if (usdSek.age! > maxAge){ outBase.status = 'STALE_RATE'; outBase.reasons.push('USD_SEK_STALE'); return outBase; }
+    }
     outBase.status = 'VERIFIED'; outBase.rateToSek = usdSek.leg.rate; outBase.isFresh = true; outBase.path = [usdSek.leg]; outBase.observedAt = usdSek.leg.observedAt; return outBase;
   }
 
@@ -102,7 +121,11 @@ export function resolveCurrencyToSekRate(params: { currency: string; quotesByCan
     if (!usdSek.ok) return { status: 'MISSING_RATE', reason: 'USD_SEK_MISSING' } as const;
     // check freshness
     if (leg.age! < 0 || usdSek.age! < 0) return { status: 'FUTURE_RATE', reason: 'FUTURE_LEG' } as const;
-    if (leg.age! > maxAge || usdSek.age! > maxAge) return { status: 'STALE_RATE', reason: 'STALE_LEG' } as const;
+    // Respect provider/session-aware freshness flags when present
+    if (((leg as any).q && (leg as any).q.isStale) || ((usdSek as any).q && (usdSek as any).q.isStale)) return { status: 'STALE_RATE', reason: 'STALE_LEG' } as const;
+    if (!((leg as any).q && typeof (leg as any).q.isStale === 'boolean' && (leg as any).q.isStale === false) || !((usdSek as any).q && typeof (usdSek as any).q.isStale === 'boolean' && (usdSek as any).q.isStale === false)){
+      if (leg.age! > maxAge || usdSek.age! > maxAge) return { status: 'STALE_RATE', reason: 'STALE_LEG' } as const;
+    }
     const rateToSek = leg.leg.rate * usdSek.leg.rate; // e.g., EUR/USD * USD/SEK
     const observedAt = new Date(Math.min(Date.parse(leg.leg.observedAt), Date.parse(usdSek.leg.observedAt))).toISOString();
     return { status: 'VERIFIED', rateToSek, path: [ leg.leg, usdSek.leg ], observedAt } as const;

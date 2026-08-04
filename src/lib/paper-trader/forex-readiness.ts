@@ -68,11 +68,18 @@ export function buildForexReadinessState(opts: { now?: Date; instruments?: any[]
       let quoteFresh = false;
       if (!q){ unavailablePairCount++; reasonInc('QUOTE_UNAVAILABLE'); }
       else {
-        const ts = q.marketTimestamp || q.timestamp || q.observedAt || null;
+        const ts = q.marketTimestamp ?? q.timestamp ?? q.observedAt ?? null;
         const price = (typeof q.price === 'number' ? q.price : (typeof q.priceSek === 'number' ? q.priceSek : null));
-        if (!ts || !isFinite(Date.parse(String(ts))) ){ unavailablePairCount++; reasonInc('QUOTE_TIMESTAMP_INVALID'); }
+        if (!ts){ unavailablePairCount++; reasonInc('QUOTE_TIMESTAMP_INVALID'); }
         else {
-          const age = now.getTime() - Date.parse(String(ts));
+          // Accept ISO strings and numeric epoch values (seconds or ms)
+          let tsMs: number | null = null;
+          if (typeof ts === 'number') tsMs = ts > 1e12 ? ts : ts * 1000;
+          else if (/^\d+$/.test(String(ts).trim())){ const n = Number(String(ts).trim()); tsMs = n > 1e12 ? n : n * 1000; }
+          else { const p = Date.parse(String(ts)); tsMs = isFinite(p) ? p : null; }
+          if (!tsMs){ unavailablePairCount++; reasonInc('QUOTE_TIMESTAMP_INVALID'); }
+          else {
+            const age = now.getTime() - tsMs;
             if (age < 0){ stalePairCount++; reasonInc('QUOTE_TIMESTAMP_FUTURE'); }
             // Respect the normalized quote's `isStale` classification produced by
             // the centralized quotes-service. That service applies market-session
@@ -82,6 +89,7 @@ export function buildForexReadinessState(opts: { now?: Date; instruments?: any[]
             else if (q.isStale){ stalePairCount++; reasonInc('QUOTE_STALE'); }
             else if (!Number.isFinite(Number(price)) || price <= 0){ unavailablePairCount++; reasonInc('QUOTE_PRICE_INVALID'); }
             else { quoteReadyCount++; quoteFresh = true; }
+          }
         }
       }
 
