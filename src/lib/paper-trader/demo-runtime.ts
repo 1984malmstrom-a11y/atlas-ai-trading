@@ -57,7 +57,7 @@ import { acquireRunCycleLockWithOwner, releaseRunCycleLock } from './run-cycle-l
 import { createMarketNewsIntelligenceSummary, MarketNewsIntelligenceSummary } from './cycle-intelligence-snapshot';
 import { createMarketNewsActivity, MarketNewsActivity } from './market-news-activity';
 import { createPerCycleCompanyNewsResolver, sanitizeCompanyNewsContextForState } from './company-news-context';
-import { createPerCycleMacroEventResolver, sanitizeMacroEventContextForState } from './macro-event-context';
+import { createPerCycleMacroEventResolver, sanitizeMacroEventContextForState, isInstrumentBlockedByMacroEvent } from './macro-event-context';
 import { fetchFinnhubCompanyNews } from '../news-providers/finnhub';
 
 // Server-side in-memory runtime for demo-only Paper Trader V1
@@ -903,6 +903,11 @@ export async function __clearAudits(){
 // Test helper: expose raw audit entries for verification
 export async function __listAudits(){
   try{ const all = await auditStore.list(); return Array.isArray(all) ? all : []; }catch(_){ return []; }
+}
+
+// Test helper: set sanitized macro event context into runtime for deterministic tests
+export async function __setMacroEventContext(sanitizedCtx: any){
+  try{ runtime.latestMacroEventContext = runtime.latestMacroEventContext || {}; runtime.latestMacroEventContext['GLOBAL'] = sanitizedCtx; }catch(_){ }
 }
 
 // Test helper: expose internal runtime for assertions in unit tests
@@ -3221,6 +3226,19 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
               // Do not fabricate expectedReturnPercent; leave undefined if missing
             }catch(_){ }
           }catch(_){ }
+          // Macro event BUY gating: block creation of a new BUY candidate when a relevant HIGH-impact event
+          try{
+            const macroGlobal = runtime.latestMacroEventContext && runtime.latestMacroEventContext['GLOBAL'] ? runtime.latestMacroEventContext['GLOBAL'] : null;
+            const instDef = Array.isArray(TRADABLE_INSTRUMENTS) ? (TRADABLE_INSTRUMENTS as any[]).find(i=> { try{ const pid = String(i.providerSymbol||i.id||i.symbol||'').toUpperCase(); return pid === String(s).toUpperCase(); }catch(_){ return false; } }) : null;
+            const gate = isInstrumentBlockedByMacroEvent({ macroContext: macroGlobal, instrument: instDef || { symbol: s, providerSymbol: s }, now: new Date(), beforeMinutes: 120, afterMinutes: 30 });
+            if (gate && gate.blocked){
+              try{ await cycleAuditStore.append({ kind: 'REJECT', decision: { id: `rej_macro_${s}_${Date.now()}`, symbol: s, action: 'BUY' }, reason: { code: 'MACRO_EVENT_WINDOW', message: 'Blocked by macro event window', evidence: gate.evidence }, portfolioBefore: portfolio, timestamp: nowIso(), meta: { automatic: true } } as any); }catch(_){ }
+              try{ const d3 = ensureDiag(s); if (d3){ d3.rejectionReason = 'MACRO_EVENT_WINDOW'; d3.rejectionEvidence = gate.evidence; } }catch(_){ }
+              // Skip creating BUY candidate
+              continue;
+            }
+          }catch(_){ /* best-effort gating: on error do not block */ }
+
           const decRes = DecisionEngine.evaluateDecision(decInput);
           const candBase: PaperTradeDecision = { id: `buy_${s}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, symbol: s, action: 'BUY', confidence: decRes.confidence, referencePrice: usePrice, generatedAt: nowIso() } as any;
           const candExtras: any = { reasoning: ['Buy-on-dip'], requestedNotionalSek: 8000, tradeFeedbackEffect: (decRes as any).tradeFeedbackEffect, signalFeedbackEffect: (decRes as any).signalFeedbackEffect };

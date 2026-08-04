@@ -65,7 +65,10 @@ export function buildMacroEventContext(opts: { events?: any[] | null; now?: Date
       if (!scheduled || !isFinite(scheduled.getTime())){ warnings.add('MACRO_EVENT_TIMESTAMP_INVALID'); continue; }
       const dt = scheduled.getTime();
       const offset = dt - nowMs;
-      if (offset < 0) continue; // passed events excluded
+      // allow events up to 30 minutes in the past (recently published) so downstream gates
+      // can still observe just-passed HIGH-impact events. Older past events are excluded.
+      const allowPastMs = 30 * 60 * 1000;
+      if (offset < -allowPastMs) continue; // too far in the past
       if (offset > sevenDaysMs) continue; // beyond 7 days excluded
 
       const hoursUntil = Number(((offset) / (1000*60*60)).toFixed(2));
@@ -140,6 +143,62 @@ export function sanitizeMacroEventContextForState(ctx: MacroEventContext | null)
     riskLevel: ctx.riskLevel,
     warnings: Array.isArray(ctx.warnings) ? ctx.warnings.slice(0,10) : [],
   } as MacroEventContext;
+}
+
+// Determine whether a given instrument is affected by any relevant HIGH-impact macro event
+export function isInstrumentBlockedByMacroEvent(opts: { macroContext?: MacroEventContext | null; instrument?: { id?: string; providerSymbol?: string; baseAsset?: string | null; quoteCurrency?: string | null; assetType?: string | null; symbol?: string | null } | null; now?: Date; beforeMinutes?: number; afterMinutes?: number }): { blocked: boolean; evidence?: any } {
+  try{
+    const macro = opts && opts.macroContext ? opts.macroContext : null;
+    const inst = opts && opts.instrument ? opts.instrument : null;
+    const now = opts && opts.now ? opts.now : new Date();
+    const before = typeof (opts && opts.beforeMinutes) === 'number' ? Number(opts!.beforeMinutes) : 120;
+    const after = typeof (opts && opts.afterMinutes) === 'number' ? Number(opts!.afterMinutes) : 30;
+    if (!macro || !Array.isArray(macro.upcomingEvents) || macro.upcomingEvents.length === 0) return { blocked: false };
+    if (!inst) return { blocked: false };
+
+    const sym = String(inst.symbol || inst.providerSymbol || inst.id || '').toUpperCase();
+    const base = inst.baseAsset ? String(inst.baseAsset).toUpperCase() : null;
+    const quote = inst.quoteCurrency ? String(inst.quoteCurrency).toUpperCase() : null;
+    const assetType = inst.assetType ? String(inst.assetType).toUpperCase() : null;
+
+    for (const ev of macro.upcomingEvents){
+      try{
+        if (!ev || String(ev.importance || '').toUpperCase() !== 'HIGH') continue;
+        const evCurrency = ev.currency ? String(ev.currency).toUpperCase() : null;
+        if (!evCurrency) continue;
+        // compute minutesUntil using scheduledAt if present else hoursUntil
+        let minutesUntil: number | null = null;
+        if (ev.scheduledAt){
+          const ts = Date.parse(String(ev.scheduledAt));
+          if (!isNaN(ts)) minutesUntil = Math.round((ts - now.getTime()) / 60000);
+        }
+        if (minutesUntil === null && typeof ev.hoursUntil === 'number') minutesUntil = Math.round(ev.hoursUntil * 60);
+        if (minutesUntil === null) continue;
+
+        const beforeMatch = minutesUntil > 0 && minutesUntil <= before;
+        const afterMatch = minutesUntil <= 0 && minutesUntil >= -after;
+        if (!(beforeMatch || afterMatch)) continue;
+
+        // Matching rules:
+        // - Forex: block when event currency matches base OR quote
+        // - USD events additionally block equities/US stocks (quoteCurrency === 'USD')
+        let matchesInstrument = false;
+        if (assetType === 'FOREX' || base || quote){
+          if (evCurrency === base || evCurrency === quote) matchesInstrument = true;
+        }
+        // equities / stocks exposed to USD
+        if (!matchesInstrument){
+          if (evCurrency === 'USD' && assetType && (assetType === 'STOCK' || assetType === 'EQUITY')) matchesInstrument = true;
+        }
+
+        if (matchesInstrument){
+          const evidence = { symbol: sym || null, eventTitle: ev.event || ev.name || null, eventCurrency: ev.currency || null, importance: ev.importance || null, scheduledAt: ev.scheduledAt || null, minutesUntil, blockWindowBeforeMinutes: before, blockWindowAfterMinutes: after };
+          return { blocked: true, evidence };
+        }
+      }catch(_){ continue; }
+    }
+    return { blocked: false };
+  }catch(_){ return { blocked: false }; }
 }
 
 export function createPerCycleMacroEventResolver(opts?: { fetchMacroCalendar?: (o?:{ now?: Date })=>Promise<any[]|null>, timeoutMs?: number, updateState?: (k:string, r:MacroEventContext|null)=>void }){
