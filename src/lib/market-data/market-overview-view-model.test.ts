@@ -161,4 +161,33 @@ describe('market overview view model', ()=>{
     // NVDA instrument id is 'nvidia' in registry
     expect(vm.rows.find(r=> r.instrumentId === nv!.id)!.price).toBe(600);
   });
+
+  it('aggregated counts include commodities and no duplicates', ()=>{
+    const vm = buildMarketOverviewViewModel({} as any);
+    const total = vm.rows.length;
+    const byType = { STOCK:0, ETF:0, FOREX:0, COMMODITY:0 } as any;
+    for(const r of vm.rows){ const t = (r.assetType||'').toUpperCase(); if(t==='STOCK') byType.STOCK++; else if(t==='ETF') byType.ETF++; else if(t==='FOREX') byType.FOREX++; else if(t==='COMMODITY') byType.COMMODITY++; }
+    expect(total).toBe(TRADABLE_INSTRUMENTS.length);
+    expect(byType.STOCK).toBeGreaterThanOrEqual(0);
+    // exact expected counts from registry
+    expect(total).toBe(67);
+    expect(byType.STOCK).toBe(48);
+    expect(byType.ETF).toBe(4);
+    expect(byType.FOREX).toBe(13);
+    expect(byType.COMMODITY).toBe(2);
+    // no duplicate instrumentIds
+    const ids = vm.rows.map(r=>r.instrumentId); const uniq = new Set(ids);
+    expect(uniq.size).toBe(ids.length);
+  });
+
+  it('launch control null status not treated as BLOCKED and preserves blockers', ()=>{
+    const snapshot:any = { latestQuoteSnapshotBySymbol:{}, latestDecisionIntelligenceBySymbol:{}, latestSignalBuildDiagnosticsBySymbol:{}, latestCycle:{ decisionSummary:{ analyzedSymbols:[] } }, forexLaunchControl: null };
+    const vm = buildMarketOverviewViewModel(snapshot);
+    expect(vm.health.forexLaunchControl).toBeNull();
+    // when missing, UI should consider it unavailable (presentation-level)
+    const snapshot2:any = { latestQuoteSnapshotBySymbol:{}, latestDecisionIntelligenceBySymbol:{}, latestSignalBuildDiagnosticsBySymbol:{}, latestCycle:{ decisionSummary:{ analyzedSymbols:[] } }, forexLaunchControl: { status: 'BLOCKED', blockingReasons: ['NO_EXECUTION_READY_PAIRS'] } };
+    const vm2 = buildMarketOverviewViewModel(snapshot2);
+    expect(vm2.health.forexLaunchControl).toBeDefined();
+    expect(vm2.health.forexLaunchControl && vm2.health.forexLaunchControl.blockingReasons).toBeDefined();
+  });
 });

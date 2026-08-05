@@ -55,7 +55,7 @@ export default function MarketMonitorPage() {
   const [error, setError] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(Math.floor(POLL_MS/1000));
   const inProgressRef = React.useRef(false);
-  const [activeTab, setActiveTab] = useState<'overview'|'stocks'|'etf'|'forex'|'analyzing'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview'|'stocks'|'etf'|'forex'|'commodities'|'analyzing'>('overview');
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<'symbol'|'change'|'updated'|'confidence'|'signals'>('symbol');
@@ -123,14 +123,15 @@ export default function MarketMonitorPage() {
   // derive metrics
   const rows = viewModel ? viewModel.rows : [];
   const total = rows.length;
-  const byType = { STOCK: 0, ETF: 0, FOREX: 0 } as Record<string, number>;
+  const byType = { STOCK: 0, ETF: 0, FOREX: 0, COMMODITY: 0 } as Record<string, number>;
   const statusCounts: Record<string, number> = { LIVE:0, DELAYED:0, STALE:0, UNAVAILABLE:0 };
   let analyzedCount = 0; let diCount = 0;
   for(const r of rows){
     const t = (r.assetType||'').toUpperCase();
-    if (t.includes('FOREX')) byType.FOREX++;
-    else if (t.includes('ETF')) byType.ETF++;
-    else byType.STOCK++;
+    if (t === 'FOREX') byType.FOREX++;
+    else if (t === 'ETF') byType.ETF++;
+    else if (t === 'COMMODITY') byType.COMMODITY++;
+    else if (t === 'STOCK') byType.STOCK++;
     const s = (r.dataStatus||'UNAVAILABLE').toUpperCase(); if (!statusCounts[s]) statusCounts[s]=0; statusCounts[s]++;
     if (r.analyzedInLatestCycle) analyzedCount++;
     if (r.hasDecisionIntelligence) diCount++;
@@ -138,9 +139,10 @@ export default function MarketMonitorPage() {
 
   // filtering/search
   let filtered = rows.filter(r => {
-    if (activeTab === 'stocks' && !( (r.assetType||'').toUpperCase().includes('STOCK') )) return false;
-    if (activeTab === 'etf' && !( (r.assetType||'').toUpperCase().includes('ETF') )) return false;
-    if (activeTab === 'forex' && !( (r.assetType||'').toUpperCase().includes('FOREX') )) return false;
+    if (activeTab === 'stocks' && (r.assetType||'').toUpperCase() !== 'STOCK') return false;
+    if (activeTab === 'etf' && (r.assetType||'').toUpperCase() !== 'ETF') return false;
+    if (activeTab === 'forex' && (r.assetType||'').toUpperCase() !== 'FOREX') return false;
+    if (activeTab === 'commodities' && (r.assetType||'').toUpperCase() !== 'COMMODITY') return false;
     if (activeTab === 'analyzing' && !r.analyzedInLatestCycle) return false;
     if (statusFilter && (r.dataStatus||'').toUpperCase() !== statusFilter) return false;
     if (search){ const s = search.toLowerCase(); if (!r.symbol.toLowerCase().includes(s) && !(r.name||'').toLowerCase().includes(s)) return false; }
@@ -169,8 +171,8 @@ export default function MarketMonitorPage() {
               <div className="text-sm text-gray-500">Snapshot: {viewModel ? viewModel.generatedAt : '—'}</div>
             </div>
             <div className="flex items-center gap-3">
-                <div className="text-xs text-gray-500">Uppdatering om {secondsLeft}s</div>
-                <button onClick={() => { void fetchSnapshot(); }} className="bg-white px-3 py-1 rounded border">Uppdatera</button>
+              <div className="text-xs text-gray-500">Uppdateras automatiskt var 30:e sekund</div>
+              <button onClick={() => { void fetchSnapshot(); }} className="bg-white px-3 py-1 rounded border">Uppdatera</button>
             </div>
           </div>
 
@@ -185,8 +187,20 @@ export default function MarketMonitorPage() {
             </div>
             <div className="col-span-2 bg-white rounded-md p-4 border">
               <div className="text-xs text-gray-500">Launch Control</div>
-              <div className="text-sm font-semibold">{viewModel && viewModel.health.forexLaunchControl && (viewModel.health.forexLaunchControl.armed ? 'ARMED' : 'BLOCKED')}</div>
-              <div className="text-xs text-gray-500">Blocker: {viewModel && viewModel.rows && viewModel.rows.length ? (viewModel.health.forexLaunchControl && viewModel.health.forexLaunchControl.blockingReason ? String(viewModel.health.forexLaunchControl.blockingReason) : '—') : '—'}</div>
+              <div className="text-sm font-semibold">{(() => {
+                const lc = viewModel && viewModel.health && viewModel.health.forexLaunchControl;
+                if (!lc) return 'Ej tillgänglig';
+                const st = lc.status || (lc.armed === true ? 'ARMED' : (lc.armed === false ? 'BLOCKED' : null));
+                return st ? String(st) : 'Ej tillgänglig';
+              })()}</div>
+              <div className="text-xs text-gray-500">Blocker: {(() => {
+                const lc = viewModel && viewModel.health && viewModel.health.forexLaunchControl;
+                if (!lc) return '—';
+                const reasons = lc.blockingReasons || lc.blockingReason || null;
+                if (Array.isArray(reasons) && reasons.length) return String(reasons.join(', '));
+                if (lc.status === 'BLOCKED') return 'Ingen blockeringsorsak angiven';
+                return '—';
+              })()}</div>
             </div>
             <div className="col-span-2 bg-white rounded-md p-4 border">
               <div className="text-xs text-gray-500">Quotes</div>
@@ -204,6 +218,7 @@ export default function MarketMonitorPage() {
             <button className={`px-3 py-1 rounded ${activeTab==='stocks'?'bg-slate-200':''}`} onClick={()=>setActiveTab('stocks')}>Aktier</button>
             <button className={`px-3 py-1 rounded ${activeTab==='etf'?'bg-slate-200':''}`} onClick={()=>setActiveTab('etf')}>ETF:er</button>
             <button className={`px-3 py-1 rounded ${activeTab==='forex'?'bg-slate-200':''}`} onClick={()=>setActiveTab('forex')}>Valutapar</button>
+            <button className={`px-3 py-1 rounded ${activeTab==='commodities'?'bg-slate-200':''}`} onClick={()=>setActiveTab('commodities')}>Råvaror</button>
             <button className={`px-3 py-1 rounded ${activeTab==='analyzing'?'bg-slate-200':''}`} onClick={()=>setActiveTab('analyzing')}>Analyseras nu</button>
             <input placeholder="Sök symbol eller namn" value={search} onChange={e=>setSearch(e.target.value)} className="ml-auto px-2 py-1 border rounded" />
             <select value={statusFilter||''} onChange={e=>setStatusFilter(e.target.value||null)} className="px-2 py-1 border rounded ml-2">
@@ -226,7 +241,7 @@ export default function MarketMonitorPage() {
             <div className="bg-white rounded-md p-8 border text-center">Laddar marknadsdata…</div>
           ) : (
             <div className="bg-white rounded-md p-4 border">
-              <div className="text-xs text-gray-500 mb-2">Nyckeltal: Totalt {total} · Aktier {byType.STOCK} · ETF {byType.ETF} · Valutapar {byType.FOREX} · LIVE {statusCounts.LIVE||0} · DELAYED {statusCounts.DELAYED||0} · STALE {statusCounts.STALE||0} · UNAVAILABLE {statusCounts.UNAVAILABLE||0} · DI {diCount}</div>
+              <div className="text-xs text-gray-500 mb-2">Nyckeltal: Totalt {total} · Aktier {byType.STOCK} · ETF {byType.ETF} · Valutapar {byType.FOREX} · Råvaror {byType.COMMODITY} · LIVE {statusCounts.LIVE||0} · DELAYED {statusCounts.DELAYED||0} · STALE {statusCounts.STALE||0} · UNAVAILABLE {statusCounts.UNAVAILABLE||0} · DI {diCount}</div>
 
               {total === 0 ? (
                 <div className="p-6 text-center text-gray-600">Inga instrument i registret</div>
