@@ -1008,6 +1008,7 @@ type SchedulerState = {
   inProgress: boolean;
   lastRunAt: number | null;
   intervalMs: number;
+  nextRunAt?: number | null;
   // diagnostics persisted on the singleton
   lastAutomaticRunStatus?: 'success' | 'skipped' | 'error' | null;
   lastAutomaticRunMessage?: string | null;
@@ -1033,7 +1034,7 @@ function getGlobalScheduler(): SchedulerState {
   if (g.__ATLAS_PAPER_TRADER_SCHEDULER__ && typeof g.__ATLAS_PAPER_TRADER_SCHEDULER__ === 'object'){
     return g.__ATLAS_PAPER_TRADER_SCHEDULER__ as SchedulerState;
   }
-  const initial: SchedulerState = { timerId: null, inProgress: false, lastRunAt: null, intervalMs: 60_000, runTick: null, lastAutomaticRunStatus: null, lastAutomaticRunMessage: null, lastAutomaticEvaluationCount: null, lastAutomaticAuditCountBefore: null, lastAutomaticAuditCountAfter: null } as SchedulerState;
+  const initial: SchedulerState = { timerId: null, inProgress: false, lastRunAt: null, intervalMs: 60_000, nextRunAt: null, runTick: null, lastAutomaticRunStatus: null, lastAutomaticRunMessage: null, lastAutomaticEvaluationCount: null, lastAutomaticAuditCountBefore: null, lastAutomaticAuditCountAfter: null } as SchedulerState;
   try{ g.__ATLAS_PAPER_TRADER_SCHEDULER__ = initial; }catch(_){ /* ignore in restricted envs */ }
   return initial;
 }
@@ -1347,21 +1348,51 @@ function startAutonomousScheduler(intervalMs?: number){
     try{
       const s = getGlobalScheduler();
       const p = s.runTick && s.runTick();
-      if (p && typeof (p as any).catch === 'function'){
-        (p as any).catch((err:any) => {
-          try{ s.lastAutomaticRunStatus = 'error'; s.lastAutomaticRunMessage = String(err && err.message ? err.message : err); }catch(_){ }
-          try{ s.lastRunAt = Date.now(); }catch(_){ s.lastRunAt = null; }
-        });
-      }
+      // Ensure nextRunAt is recorded for the upcoming tick regardless of outcome.
+      try{
+        if (p && typeof (p as any).finally === 'function'){
+          (p as any).finally(() => { try{ const t = getGlobalScheduler(); t.nextRunAt = Date.now() + t.intervalMs; }catch(_){ } });
+        } else {
+          try{ s.nextRunAt = Date.now() + s.intervalMs; }catch(_){ }
+        }
+        if (p && typeof (p as any).catch === 'function'){
+          (p as any).catch((err:any) => {
+            try{ s.lastAutomaticRunStatus = 'error'; s.lastAutomaticRunMessage = String(err && err.message ? err.message : err); }catch(_){ }
+            try{ s.lastRunAt = Date.now(); }catch(_){ s.lastRunAt = null; }
+          });
+        }
+      }catch(_){ }
     }catch(e){
       try{ const s = getGlobalScheduler(); s.lastAutomaticRunStatus = 'error'; s.lastAutomaticRunMessage = String((e as any) && (e as any).message ? (e as any).message : e); s.lastRunAt = Date.now(); }catch(_){ }
     }
   }, sched.intervalMs);
+  // Register nextRunAt immediately after scheduling so readiness can report it.
+  try{ sched.nextRunAt = Date.now() + sched.intervalMs; }catch(_){ sched.nextRunAt = null; }
 }
 
 function stopAutonomousScheduler(){
   const sched = getGlobalScheduler();
   if (sched.timerId){ clearInterval(sched.timerId); sched.timerId = null; }
+  try{ sched.nextRunAt = null; }catch(_){ }
+}
+
+// Idempotent helper to ensure the autonomous scheduler is started in the current
+// runtime instance. Designed to be safe to call from HTTP route handlers so the
+// scheduler gets registered in the same process/module cache that serves the
+// API. Respects test and mode guards.
+export function ensureAutonomousSchedulerStarted(){
+  try{
+    // In test environments we avoid starting real background timers.
+    if (process.env.NODE_ENV === 'test') return { status: 'test' };
+    // Only start when explicitly running in in-memory scheduler mode.
+    if (process.env.PAPER_TRADER_SCHEDULER_MODE !== 'in_memory') return { status: 'modeIneligible' };
+    const sched = getGlobalScheduler();
+    if (sched.timerId) return { status: 'alreadyRunning' };
+    startAutonomousScheduler();
+    return { status: 'started' };
+  }catch(e:any){
+    return { status: 'error', message: String(e && e.message ? e.message : e) };
+  }
 }
 
 

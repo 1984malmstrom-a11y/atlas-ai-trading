@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import runtime, { executePaperTradeDecision } from '../../../lib/paper-trader/demo-runtime';
+import runtime, { executePaperTradeDecision, ensureAutonomousSchedulerStarted } from '../../../lib/paper-trader/demo-runtime';
 import { getNormalizedQuotes } from '../../../lib/market-data/quotes-service';
 import { findInstrumentById } from '../../../lib/market-data/instruments';
 import type { PaperTradeDecision } from '../../../lib/paper-trader/types';
@@ -7,6 +7,7 @@ import { getMarketDataProvider } from '../../../lib/market-data/index';
 
 export async function GET(){
   try{
+    try{ ensureAutonomousSchedulerStarted(); }catch(_){ }
     const state = await runtime.getPaperTradingState();
     return NextResponse.json(state);
   }catch(e:any){
@@ -16,6 +17,7 @@ export async function GET(){
 
 export async function POST(req: Request){
   try{
+    try{ ensureAutonomousSchedulerStarted(); }catch(_){ }
     const body = await req.json().catch(()=> null);
     if (!body) return NextResponse.json({ error: 'Invalid body' }, { status: 400 });
 

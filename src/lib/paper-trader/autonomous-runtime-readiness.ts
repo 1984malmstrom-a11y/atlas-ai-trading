@@ -44,7 +44,16 @@ export async function buildAutonomousRuntimeReadiness(opts?: { now?: Date, runti
   try{ overlapProtectionActive = typeof acquireRunCycleLockWithOwner === 'function'; }catch(_){ overlapProtectionActive = false; }
 
   const lastAutomaticRunAt = isoOrNull(sched.lastRunAt);
-  const nextAutomaticRunAt = (sched.lastRunAt && typeof sched.intervalMs === 'number') ? isoOrNull(Number(sched.lastRunAt) + Number(sched.intervalMs)) : null;
+  let nextAutomaticRunAt: string | null = null;
+  try{
+    if (sched && sched.timerId && typeof sched.nextRunAt === 'number'){
+      nextAutomaticRunAt = isoOrNull(sched.nextRunAt);
+    } else if (sched.lastRunAt && typeof sched.intervalMs === 'number'){
+      nextAutomaticRunAt = isoOrNull(Number(sched.lastRunAt) + Number(sched.intervalMs));
+    } else {
+      nextAutomaticRunAt = null;
+    }
+  }catch(_){ nextAutomaticRunAt = null; }
 
   const lastCycleStatus = sched.lastAutomaticRunStatus || null;
   // duration: try to infer from lastAutomaticRunMessage if it encodes timestamps; otherwise null
