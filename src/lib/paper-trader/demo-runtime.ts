@@ -99,6 +99,7 @@ type RuntimeState = {
   forexLaunchControl?: ForexLaunchControlState | null;
   latestForexCycleStatus?: any;
   forexNoTradeSummary?: any;
+  latestAutomaticQuotesError?: Record<string, string>;
   // scheduler is represented by the global singleton; do not duplicate state here
 };
 
@@ -1896,7 +1897,78 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
 
   // For BUY candidates, analyze the configured automatic universe (includes watchlist and eligible FOREX when session open)
   const symbols = buildAutomaticAnalysisSymbols(eligibleInstruments, nowForCycle);
-  const quotes = opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes) ? opts.overrideUniverse.quotes : await fetchQuotes();
+  let quotes: any = null;
+  if (opts && opts.overrideUniverse && Array.isArray((opts as any).overrideUniverse.quotes)){
+    quotes = (opts as any).overrideUniverse.quotes;
+  } else if (opts && (opts as any).allowWhenScheduler){
+    // Automatic scheduler path: build cycle-scoped instrument ids and fetch scoped quotes
+    try{
+      const mod = await import('../market-data/quotes-service');
+      // Build union of: cycle symbols (max 10), holdings, SPY/QQQ if enabled, and required forex pairs
+      const idsSet = new Set<string>();
+      const norm = (s:string) => String(s||'').toUpperCase();
+      // Map analysis symbols to instrument ids using TRADABLE_INSTRUMENTS
+      try{
+        for (const sym of Array.isArray(symbols) ? symbols : []){
+          try{
+            const up = norm(sym).replace(/[^A-Z0-9]/g,'');
+            const found = TRADABLE_INSTRUMENTS.find(i => {
+              try{ if (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) return true; }catch(_){ }
+              try{ if (String(i.id).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) return true; }catch(_){ }
+              return false;
+            });
+            if (found && found.id && (found.marketDataEnabled === true || (found.marketDataEnabled === undefined && found.enabled === true))) idsSet.add(found.id);
+          }catch(_){ }
+        }
+      }catch(_){ }
+
+      // Include holdings (never omit)
+      try{
+        const p = await (((runtime as any) && (runtime as any).portfolioAdapter && typeof (runtime as any).portfolioAdapter.getPortfolio === 'function') ? (runtime as any).portfolioAdapter.getPortfolio() : portfolioAdapter.getPortfolio());
+        if (p && Array.isArray(p.holdings)){
+          for (const h of p.holdings){
+            try{
+              if (!h) continue;
+              if (h.instrumentId){ const cand = TRADABLE_INSTRUMENTS.find(i => String(i.id).toLowerCase() === String(h.instrumentId).toLowerCase()); if (cand && cand.id) idsSet.add(cand.id); }
+              else if (h.symbol){ const up = String(h.symbol||'').toUpperCase(); const cand2 = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase() === up) || String(i.id).toUpperCase() === up); if (cand2 && cand2.id) idsSet.add(cand2.id); }
+            }catch(_){ }
+          }
+        }
+      }catch(_){ }
+
+      // Ensure SPY/QQQ present if enabled
+      try{
+        for (const core of ['SPY','QQQ']){
+          const f = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase() === core) || String(i.id).toUpperCase() === core);
+          if (f && f.id && (f.marketDataEnabled === true || (f.marketDataEnabled === undefined && f.enabled === true))) idsSet.add(f.id);
+        }
+      }catch(_){ }
+
+      // Include Forex dependencies where present
+      try{
+        const forexCandidates = ['EUR/USD','GBP/USD','USD/JPY','USD/SEK'];
+        for (const s of forexCandidates){ const up = String(s).toUpperCase().replace(/[^A-Z0-9]/g,''); const f = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) || String(i.id).toUpperCase().replace(/[^A-Z0-9]/g,'') === up); if (f && f.id && (f.marketDataEnabled === true || (f.marketDataEnabled === undefined && f.enabled === true))) idsSet.add(f.id); }
+      }catch(_){ }
+
+      const cycleIds = Array.from(idsSet);
+      try{
+        const res = await mod.getNormalizedQuotes(undefined, { instrumentIds: cycleIds, fallbackStrategy: 'limited', maxFallbacks: 2 });
+        quotes = res && Array.isArray(res.quotes) ? res.quotes : [];
+      }catch(e){
+        // Fail-closed: do NOT fall back to full-market fetch here to avoid
+        // reintroducing large registry requests (rate-limit storms).
+        quotes = [];
+        try{ runtime.latestAutomaticQuotesError = runtime.latestAutomaticQuotesError || {}; runtime.latestAutomaticQuotesError[cycleId || 'unknown'] = String((e as any) && (e as any).message ? (e as any).message : e); }catch(_){ }
+      }
+    }catch(e){
+      // If any error occurs while building the scoped union, fail-closed
+      // instead of calling fetchQuotes() which may request the full registry.
+      quotes = [];
+      try{ runtime.latestAutomaticQuotesError = runtime.latestAutomaticQuotesError || {}; runtime.latestAutomaticQuotesError[cycleId || 'unknown'] = String((e as any) && (e as any).message ? (e as any).message : e); }catch(_){ }
+    }
+  } else {
+    quotes = await fetchQuotes();
+  }
   const quotesList = _quotesAsArray(quotes);
 
   // Persist latest quote snapshot per canonical symbol for runtime inspection.

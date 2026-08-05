@@ -107,14 +107,19 @@ export type FxRatePayload = {
 
 // FxRateGetter may return either a primitive number (for convenience) or a richer payload object, or null on failure.
 export type FxRateGetter = (fromCurrency: string, toCurrency: 'SEK') => Promise<number | FxRatePayload | null>;
-export type GetNormalizedQuotesOptions = { getFxRate?: FxRateGetter };
+export type NormalizedQuotesOptions = {
+  instrumentIds?: string[];
+  fallbackStrategy?: 'full' | 'limited' | 'none';
+  maxFallbacks?: number;
+  getFxRate?: FxRateGetter;
+};
 
 // Module-scoped cache and in-flight dedupe for standard getNormalizedQuotes() calls
 const STANDARD_CACHE_TTL_MS = 15 * 60_000; // 15 minutes
 let _standardNormalizedCache: { expires: number; v: any } | null = null;
 let _standardNormalizedPending: Promise<any> | null = null;
 
-export async function getNormalizedQuotes(providerOverride?: MarketDataProvider, options?: GetNormalizedQuotesOptions){
+export async function getNormalizedQuotes(providerOverride?: MarketDataProvider, options?: NormalizedQuotesOptions){
   // Lazy import provider to avoid requiring Twelve Data API key in modules that only import helpers
   const provider = providerOverride || (await import('./index')).default;
   const getFxRate = options?.getFxRate;
@@ -221,51 +226,93 @@ export async function getNormalizedQuotes(providerOverride?: MarketDataProvider,
       return { quotes: [], errors: [], disabledInstruments, fetchedAt: new Date().toISOString() };
     }
 
-    const idsToFetch = enabledInstruments.map(i => i.id);
+    // Determine idsToFetch: if caller provided explicit instrumentIds -> normalize & dedupe
+    let idsToFetch: string[];
+    if (options && Array.isArray(options.instrumentIds) && options.instrumentIds.length > 0){
+      const seen = new Set<string>();
+      const normalized: string[] = [];
+      for (const raw of options.instrumentIds){
+        try{
+          if (!raw) continue;
+          const s = String(raw).trim(); if (!s) continue;
+          const byId = TRADABLE_INSTRUMENTS.find(i => String(i.id).toLowerCase() === s.toLowerCase());
+          if (byId && byId.id && !seen.has(byId.id)){ seen.add(byId.id); normalized.push(byId.id); continue; }
+          const up = s.toUpperCase();
+          const byProv = TRADABLE_INSTRUMENTS.find(i => i.providerSymbol && String(i.providerSymbol).toUpperCase() === up);
+          if (byProv && byProv.id && !seen.has(byProv.id)){ seen.add(byProv.id); normalized.push(byProv.id); continue; }
+          const alt = s.replace(/[^A-Z0-9]/ig,'').toUpperCase();
+          const byAlt = TRADABLE_INSTRUMENTS.find(i => String(i.id).toUpperCase().replace(/[^A-Z0-9]/g,'') === alt || (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === alt));
+          if (byAlt && byAlt.id && !seen.has(byAlt.id)){ seen.add(byAlt.id); normalized.push(byAlt.id); continue; }
+        }catch(_){ }
+      }
+      idsToFetch = normalized.length > 0 ? normalized : enabledInstruments.map(i => i.id);
+    } else {
+      idsToFetch = enabledInstruments.map(i => i.id);
+    }
+
+    // Build normalization universe: when caller provided explicit instrumentIds,
+    // limit normalization/error-generation and per-instrument FX conversion to
+    // the enabled instruments that are present in idsToFetch. Otherwise keep
+    // full enabledInstruments behavior.
+    let normalizationUniverse = enabledInstruments;
+    try{
+      if (options && Array.isArray(options.instrumentIds) && options.instrumentIds.length > 0){
+        const idSet = new Set(idsToFetch);
+        normalizationUniverse = enabledInstruments.filter(i => idSet.has(i.id));
+      }
+    }catch(e){ /* keep full enabledInstruments on error */ }
 
     let fetched: MarketQuote[] = [];
     const providerErrorIds = new Set<string>();
     const fxErrorIds = new Set<string>();
+    // fallback strategy defaults to 'full' to preserve previous robust behavior
+    const fallbackStrategy = (options && options.fallbackStrategy) ? options.fallbackStrategy : 'full';
+    const maxFallbacks = (options && typeof options.maxFallbacks === 'number') ? Math.max(0, Math.floor(options.maxFallbacks)) : 0;
     try{
       fetched = await provider.getQuotes(idsToFetch);
       if (Array.isArray(fetched) && fetched.length === 0){
-        type AttemptResult = { id: string; quote: MarketQuote | null; err: string | null };
-        const attempt = await Promise.all(idsToFetch.map(async (id: string): Promise<AttemptResult> => {
-          try{
-            const q = await provider.getQuote(id);
-            return { id, quote: q, err: null };
-          }catch(e: unknown){
-            const msg = ((): string => {
-              if (e && typeof e === 'object' && 'message' in e && typeof (e as Record<string, unknown>).message === 'string') return String((e as Record<string, unknown>).message);
-              return String(e);
-            })();
-            // record a provider-level error for this instrument
-            errors.push({ instrumentId: id, symbol: (TRADABLE_INSTRUMENTS.find(x=>x.id===id)?.providerSymbol) || null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) });
-            providerErrorIds.add(id);
-            return { id, quote: null, err: msg };
-          }
-        }));
-        fetched = attempt.filter((r): r is AttemptResult & { quote: MarketQuote } => r.quote !== null).map((r)=>r.quote);
+        if (fallbackStrategy === 'none'){
+          fetched = [];
+        } else if (fallbackStrategy === 'limited'){
+          const toTry = maxFallbacks > 0 ? idsToFetch.slice(0, maxFallbacks) : [];
+          const attempt = await Promise.all(toTry.map(async (id: string) => {
+            try{ const q = await provider.getQuote(id); return { id, quote: q, err: null } as any; }catch(e:any){ const msg = e && e.message ? String(e.message) : String(e); errors.push({ instrumentId: id, symbol: (TRADABLE_INSTRUMENTS.find(x=>x.id===id)?.providerSymbol) || null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) }); providerErrorIds.add(id); return { id, quote: null, err: msg }; }
+          }));
+          fetched = attempt.filter((r:any) => r && r.quote).map((r:any)=> r.quote);
+        } else {
+          type AttemptResult = { id: string; quote: MarketQuote | null; err: string | null };
+          const attempt = await Promise.all(idsToFetch.map(async (id: string): Promise<AttemptResult> => {
+            try{ const q = await provider.getQuote(id); return { id, quote: q, err: null }; }catch(e: any){ const msg = e && e.message ? String(e.message) : String(e); errors.push({ instrumentId: id, symbol: (TRADABLE_INSTRUMENTS.find(x=>x.id===id)?.providerSymbol) || null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) }); providerErrorIds.add(id); return { id, quote: null, err: msg }; }
+          }));
+          fetched = attempt.filter((r): r is AttemptResult & { quote: MarketQuote } => r.quote !== null).map((r)=>r.quote);
+        }
       }
     }catch(e: unknown){
-      const fallbackPromises = idsToFetch.map(async id => {
-        try{ return await provider.getQuote(id); }catch(err: unknown){
-          const msg = ((): string => {
-            if (err && typeof err === 'object' && 'message' in err && typeof (err as Record<string, unknown>).message === 'string') return String((err as Record<string, unknown>).message);
-            return String(err);
-          })();
-          if (!providerErrorIds.has(id)){ errors.push({ instrumentId: id, symbol: null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) }); providerErrorIds.add(id); }
-          return null;
-        }
-      });
-      const results = await Promise.all(fallbackPromises);
-      fetched = results.filter((r): r is MarketQuote => Boolean(r));
+      const msg = ((): string => { if (e && typeof e === 'object' && 'message' in e && typeof (e as Record<string, unknown>).message === 'string') return String((e as Record<string, unknown>).message); return String(e); })();
+      if (fallbackStrategy === 'none'){
+        errors.push({ instrumentId: 'provider', symbol: null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) });
+        fetched = [];
+      } else if (fallbackStrategy === 'limited'){
+        errors.push({ instrumentId: 'provider', symbol: null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) });
+        const toTry = maxFallbacks > 0 ? idsToFetch.slice(0, maxFallbacks) : [];
+        const attempt = await Promise.all(toTry.map(async (id: string) => {
+          try{ const q = await provider.getQuote(id); return { id, quote: q, err: null } as any; }catch(err:any){ const em = err && err.message ? String(err.message) : String(err); errors.push({ instrumentId: id, symbol: null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(em) }); providerErrorIds.add(id); return { id, quote: null, err: em }; }
+        }));
+        fetched = attempt.filter((r:any) => r && r.quote).map((r:any)=> r.quote);
+      } else {
+        errors.push({ instrumentId: 'provider', symbol: null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(msg) });
+        const fallbackPromises = idsToFetch.map(async id => {
+          try{ return await provider.getQuote(id); }catch(err: unknown){ const em = (err && typeof err === 'object' && 'message' in err && typeof (err as Record<string, unknown>).message === 'string') ? String((err as Record<string, unknown>).message) : String(err); if (!providerErrorIds.has(id)){ errors.push({ instrumentId: id, symbol: null, code: 'PROVIDER_ERROR', message: sanitizeErrorMessage(em) }); providerErrorIds.add(id); } return null; }
+        });
+        const results = await Promise.all(fallbackPromises);
+        fetched = results.filter((r): r is MarketQuote => Boolean(r));
+      }
     }
 
     const fetchedById = new Map<string, MarketQuote>();
     for (const f of fetched){ if (f && f.instrumentId) fetchedById.set(f.instrumentId, f); }
 
-    for (const inst of enabledInstruments){
+    for (const inst of normalizationUniverse){
       const raw = fetchedById.get(inst.id);
       if (!raw){
         // if we already recorded a provider-level error for this instrument, do not add a NO_DATA entry
