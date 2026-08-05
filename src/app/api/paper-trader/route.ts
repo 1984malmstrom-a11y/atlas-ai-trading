@@ -1,13 +1,23 @@
 import { NextResponse } from 'next/server';
-import runtime, { executePaperTradeDecision, ensureAutonomousSchedulerStarted } from '../../../lib/paper-trader/demo-runtime';
+import runtime, { executePaperTradeDecision, ensureAutonomousSchedulerStarted, getPaperTradingRuntimeSnapshot } from '../../../lib/paper-trader/demo-runtime';
 import { getNormalizedQuotes } from '../../../lib/market-data/quotes-service';
 import { findInstrumentById } from '../../../lib/market-data/instruments';
 import type { PaperTradeDecision } from '../../../lib/paper-trader/types';
 import { getMarketDataProvider } from '../../../lib/market-data/index';
 
-export async function GET(){
+export async function GET(req: Request){
   try{
     try{ ensureAutonomousSchedulerStarted(); }catch(_){ }
+    // If client requests safe snapshot, return runtime snapshot WITHOUT triggering provider fetches
+    try{
+      const url = new URL(req.url);
+      const snapParam = url.searchParams.get('snapshot');
+      if (url.searchParams.get('safe') === '1' || snapParam === '1' || snapParam === 'market'){
+        // use lightweight snapshot that does not call providers
+        const snap = getPaperTradingRuntimeSnapshot();
+        return NextResponse.json({ ok: true, snapshot: snap });
+      }
+    }catch(_){ }
     const state = await runtime.getPaperTradingState();
     return NextResponse.json(state);
   }catch(e:any){

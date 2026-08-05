@@ -1,10 +1,11 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import LeftSidebar from '../../components/dashboard-v1/LeftSidebar';
 import { getMockMarketData } from "../../lib/mock-market-monitor";
 import { computeUSMarketStatus } from "../../lib/us-market";
 import CompanyLogo from "../../components/CompanyLogo";
+import { buildMarketOverviewViewModel, MarketOverviewViewModel } from '../../lib/market-data/market-overview-view-model';
 // polling provided by MarketPollingClient mounted in root layout
 
 type UIQuote = {
@@ -48,30 +49,17 @@ function Badge({ children, className = "" }: { children: React.ReactNode; classN
 }
 
 export default function MarketMonitorPage() {
-  const mockInitial = useMemo(() => getMockMarketData(), []);
-  // Do not mark initial rows as MOCK; treat them as empty until we know
-  // whether live or mock data is actually used. We'll display a LADDAR
-  // label during the initial fetch.
-  const [quotes, setQuotes] = useState<UIQuote[]>(() => TARGET_SYMBOLS.map(sym => ({ symbol: sym, name: null, price: null, prevPrice: null, volume: 0, updatedAt: null, dataStatus: null })));
-  const [initialFetchInProgress, setInitialFetchInProgress] = useState(true);
-  const [hasLive, setHasLive] = useState(false);
-  const hasLiveRef = React.useRef<boolean>(false);
-  const POLL_MS = 30 * 1000; // used for display only (30s)
-  const POLL_SECONDS = Math.floor(POLL_MS / 1000);
-  const [secondsLeft, setSecondsLeft] = useState(POLL_SECONDS);
-  const [usingProvider, setUsingProvider] = useState(false);
-  const [usingMock, setUsingMock] = useState(false);
-  const [lastFetchedAt, setLastFetchedAt] = useState<string | null>(null);
-  const lastFetchedAtRef = React.useRef<string | null>(null);
-  // Client-side timestamp for when the Atlas client last successfully received
-  // a non-error HTTP response and parsed JSON. This represents the client's
-  // successful fetch time (not market/provider time) and is safe to set to
-  // `new Date().toISOString()` on each successful fetch.
-  const [lastSuccessfulFetchAt, setLastSuccessfulFetchAt] = useState<string | null>(null);
-  const lastSuccessfulFetchAtRef = React.useRef<string | null>(null);
-  const [flashMap, setFlashMap] = useState<Record<string, 'up'|'down'|undefined>>({});
-  // Forex session history for sparklines (not persisted)
-  const forexHistoryRef = React.useRef<Record<string, number[]>>({ 'USD/SEK': [], 'EUR/SEK': [] });
+  const POLL_MS = 30 * 1000;
+  const [viewModel, setViewModel] = useState<MarketOverviewViewModel | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(Math.floor(POLL_MS/1000));
+  const inProgressRef = React.useRef(false);
+  const [activeTab, setActiveTab] = useState<'overview'|'stocks'|'etf'|'forex'|'analyzing'>('overview');
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<'symbol'|'change'|'updated'|'confidence'|'signals'>('symbol');
+  const [sortDir, setSortDir] = useState<'asc'|'desc'>('asc');
 
   // Helper: get ET (America/New_York) wall-clock parts
   function getETParts() {
@@ -100,518 +88,180 @@ export default function MarketMonitorPage() {
 
   // Use shared helper `computeUSMarketStatus` from src/lib/us-market.ts
 
+  const mountedRef = useRef(true);
+  const inFlightRef = useRef(false);
+
+  const fetchSnapshot = useCallback(async ()=>{
+    if (!mountedRef.current) return;
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    // show loading overlay only if we have no data yet
+    if (!viewModel) setLoading(true);
+    setError(null);
+    try{
+      const resp = await fetch('/api/paper-trader?snapshot=market', { cache: 'no-store' });
+      if (!resp.ok) throw new Error('snapshot fetch failed');
+      const body = await resp.json();
+      if (!body || !body.ok || !body.snapshot) throw new Error('invalid snapshot');
+      const vm = buildMarketOverviewViewModel(body.snapshot);
+      if (!mountedRef.current) return;
+      setViewModel(vm);
+      setLoading(false);
+      setSecondsLeft(Math.floor(POLL_MS/1000));
+    }catch(err:any){ if (!mountedRef.current) return; setError(String(err)); setLoading(false); }
+    finally{ inFlightRef.current = false; }
+  }, [viewModel]);
+
   useEffect(()=>{
-    // subscribe to shared market polling events
-    let mounted = true;
+    mountedRef.current = true;
+    void fetchSnapshot();
+    const interval = setInterval(()=>{ void fetchSnapshot(); setSecondsLeft(Math.floor(POLL_MS/1000)); }, POLL_MS);
+    const tick = setInterval(()=> setSecondsLeft(prev => prev > 0 ? prev-1 : Math.floor(POLL_MS/1000)), 1000);
+    return ()=>{ mountedRef.current = false; clearInterval(interval); clearInterval(tick); };
+  }, [fetchSnapshot]);
 
-    // If the shared client store already has a snapshot (poller mounted earlier), apply it immediately
-    try{
-      const snap = (window as any).__atlas_quotesById;
-      if (snap && typeof snap === 'object' && Object.keys(snap).length > 0){
-        // Do not synthesize a fetchedAt for the initial snapshot; provider did not supply it.
-        const detail = { quotes: Object.keys(snap).map(k=>snap[k]), fetchedAt: null, usingProvider: true };
-        // call the handler directly to populate UI immediately
-        (function immediate(d:any){
-              const fetched: any[] = Array.isArray(d.quotes) ? d.quotes : [];
-              
-              const map = new Map<string, any>();
-              for (const f of fetched){ if (f && f.symbol) map.set(String(f.symbol).toUpperCase(), f); }
-              setHasLive(true);
-              hasLiveRef.current = true;
-              setQuotes(prevQs => {
-                const out: UIQuote[] = TARGET_SYMBOLS.map(sym => {
-                  const s = map.get(sym.toUpperCase());
-                  const prev = prevQs.find(p => p.symbol === sym);
-                  const prevPrice = prev ? prev.price : null;
-                  if (!s) { return { symbol: sym, name: null, price: null, prevPrice: prevPrice, volume: 0, updatedAt: null, dataStatus: 'UNAVAILABLE' }; }
-                  const newPrice = typeof s.price === 'number' ? s.price : (s.price ? Number(s.price) : null);
-                  // determine timestamp priority: marketTimestamp -> timestamp -> quote fetchedAt -> batch fetchedAt
-                  const candidate = s.marketTimestamp || s.timestamp || s.fetchedAt || d.fetchedAt || null;
-                  let finalUpdatedAt: string | null = null;
-                  if (typeof candidate === 'string' && !/^[0-9]+$/.test(candidate)){
-                    const parsed = Date.parse(candidate);
-                    if (!isNaN(parsed)) finalUpdatedAt = new Date(parsed).toISOString();
-                  } else if (typeof candidate === 'number' || (/^[0-9]+$/.test(String(candidate)))){
-                    const n = Number(candidate);
-                    const ms = Math.abs(n) < 1e12 ? n * 1000 : n;
-                    const dts = new Date(ms);
-                    if (!isNaN(dts.getTime())) finalUpdatedAt = dts.toISOString();
-                  }
-                  
-                  return {
-                    symbol: s.symbol || sym,
-                    name: s.name || null,
-                    price: newPrice,
-                    prevPrice: prevPrice,
-                    volume: s.volume ?? 0,
-                    updatedAt: finalUpdatedAt,
-                    dataStatus: s.dataStatus || s.status || null,
-                    currency: s.currency || null,
-                    change: s.change ?? null,
-                    changePercent: s.changePercent ?? s.change_percent ?? null,
-                    previousClose: s.previousClose ?? s.previous_close ?? null,
-                    provider: s.provider || null,
-                    marketTimestamp: s.marketTimestamp || null,
-                  };
-                });
-                return out;
-              });
-              setUsingProvider(true);
-              // Only set lastFetchedAt from the snapshot's fetchedAt if valid
-              if (d && !d.error){
-                const norm = normalizeTimestamp(d.fetchedAt);
-                
-                if (norm) { setLastFetchedAt(norm); lastFetchedAtRef.current = norm; }
-              }
-              // we already have a snapshot so initial fetch is considered done
-              setInitialFetchInProgress(false);
-          // seed forex history from snapshot
-          try{
-            for(const s of d.quotes){
-              if (s && s.symbol && (s.symbol==='USD/SEK' || s.symbol==='EUR/SEK')){
-                const hist = forexHistoryRef.current[s.symbol] || [];
-                const p = typeof s.price==='number' ? s.price : (s.price ? Number(s.price) : null);
-                if (p !== null && hist.length===0) hist.push(p);
-                forexHistoryRef.current[s.symbol]=hist.slice(-20);
-              }
-            }
-          }catch(e){}
-        })(detail);
-      }
-    }catch(e){}
-
-    function onQuotes(e: any){
-      if (!mounted) return;
-      
-      const d = e.detail || {};
-      const fetched: any[] = Array.isArray(d.quotes) ? d.quotes : [];
-      
-      // If we receive a successful provider snapshot (live or mock), stop initial loading
-      if (!d.error && (Boolean(d.usingProvider) || Boolean(d.isMock) || fetched.length > 0)){
-        setInitialFetchInProgress(false);
-      }
-      if (!fetched.length && d.error){
-        // If we don't have live data yet, show mock/fallback; otherwise ignore transient provider errors
-        if (!hasLiveRef.current){
-            if (process.env.NODE_ENV !== 'production'){
-            setUsingProvider(false);
-            const mock = getMockMarketData();
-            setQuotes(TARGET_SYMBOLS.map(s => {
-              const m = mock.find(mm => mm.symbol === s);
-              return m ? { symbol: m.symbol, name: m.name, price: m.price, prevPrice: m.prevPrice, volume: m.volume, updatedAt: m.updatedAt, dataStatus: 'MOCK' } : { symbol: s, name: null, price: null, prevPrice: null, volume: 0, updatedAt: null, dataStatus: 'UNAVAILABLE' };
-            }));
-            // Do NOT update lastFetchedAt on fetch error
-            return;
-          }
-          setUsingProvider(false);
-          setQuotes(TARGET_SYMBOLS.map(s => ({ symbol: s, name: null, price: null, prevPrice: null, volume: 0, updatedAt: null, dataStatus: 'UNAVAILABLE' })));
-          return;
-        }
-        return;
-      }
-
-      // map fetched quotes to UIQuote[] and compute transient flashes for changed prices
-      const map = new Map<string, any>();
-      for (const f of fetched){ if (f && f.symbol) map.set(String(f.symbol).toUpperCase(), f); }
-
-      // Normalize batch fetchedAt if present
-      const normBatch = normalizeTimestamp(d.fetchedAt);
-      
-
-      setHasLive(true);
-      hasLiveRef.current = true;
-
-      setQuotes(prevQs => {
-        let latestQuoteMs: number | null = null;
-        const out: UIQuote[] = TARGET_SYMBOLS.map(sym => {
-          const s = map.get(sym.toUpperCase());
-          const prev = prevQs.find(p => p.symbol === sym);
-          const prevPrice = prev ? prev.price : null;
-          if (!s) { return { symbol: sym, name: null, price: null, prevPrice: prevPrice, volume: 0, updatedAt: null, dataStatus: 'UNAVAILABLE' }; }
-          const newPrice = typeof s.price === 'number' ? s.price : (s.price ? Number(s.price) : null);
-          if (prevPrice !== null && newPrice !== null && prevPrice !== newPrice){
-            setFlashMap(fm => ({ ...fm, [sym]: newPrice > prevPrice ? 'up' : 'down' }));
-            setTimeout(()=> setFlashMap(fm => ({ ...fm, [sym]: undefined })), 900);
-          }
-          // update forex history when price changes
-          try{
-            if ((s.symbol === 'USD/SEK' || s.symbol === 'EUR/SEK') && typeof newPrice === 'number'){
-              const key = s.symbol;
-              const hist = forexHistoryRef.current[key] || [];
-              const last = hist.length ? hist[hist.length-1] : null;
-              if (last === null || last !== newPrice){
-                hist.push(newPrice);
-                if (hist.length > 20) hist.splice(0, hist.length - 20);
-              }
-              forexHistoryRef.current[key] = hist;
-            }
-          }catch(e){}
-
-          // Determine timestamp priority: marketTimestamp -> timestamp -> quote fetchedAt
-          const candidate = s.marketTimestamp || s.timestamp || s.fetchedAt || null;
-          let finalUpdatedAt: string | null = null;
-          if (candidate){
-            if (typeof candidate === 'string' && !/^[0-9]+$/.test(candidate)){
-              const parsed = Date.parse(candidate);
-              if (!isNaN(parsed)) finalUpdatedAt = new Date(parsed).toISOString();
-            } else {
-              const n = Number(candidate);
-              const ms = Math.abs(n) < 1e12 ? n * 1000 : n;
-              const dts = new Date(ms);
-              if (!isNaN(dts.getTime())) finalUpdatedAt = dts.toISOString();
-            }
-          }
-          if (finalUpdatedAt){
-            const ms = Date.parse(finalUpdatedAt);
-            if (!isNaN(ms)){
-              latestQuoteMs = latestQuoteMs === null ? ms : Math.max(latestQuoteMs, ms);
-            }
-          }
-          
-
-          return {
-            symbol: s.symbol || sym,
-            name: s.name || null,
-            price: newPrice,
-            prevPrice: prevPrice,
-            previousClose: s.previousClose ?? s.previous_close ?? null,
-            volume: s.volume ?? 0,
-            updatedAt: finalUpdatedAt,
-            dataStatus: s.dataStatus || s.status || null,
-            currency: s.currency || null,
-            change: s.change ?? null,
-            changePercent: s.changePercent ?? s.change_percent ?? null,
-            provider: s.provider || null,
-            marketTimestamp: s.marketTimestamp || null,
-          };
-        });
-
-        // Compute latest quote timestamp ISO if any
-        const latestQuoteIso = latestQuoteMs ? new Date(latestQuoteMs).toISOString() : null;
-        
-
-        // Choose response timestamp: batch -> latest quote -> null
-        const chosenResponse = normBatch || latestQuoteIso || null;
-        
-        if (chosenResponse){
-          
-          setLastFetchedAt(chosenResponse);
-          lastFetchedAtRef.current = chosenResponse;
-        }
-
-        return out;
-      });
-      setUsingProvider(Boolean(d.usingProvider));
-      // determine if we are showing mock data
-      const isMock = Boolean(d.isMock) || ((!d.quotes || d.quotes.length === 0) && process.env.NODE_ENV !== 'production');
-      setUsingMock(Boolean(isMock));
-      // Only update global lastFetchedAt when this event is a successful fetch
-      if (!d.error){
-        const norm = normalizeTimestamp(d.fetchedAt);
-        
-        if (norm){
-        
-          setLastFetchedAt(norm);
-          lastFetchedAtRef.current = norm;
-        }
-        
-      }
-    }
-
-    // Internal fetch helper to request quotes from API and update UI.
-    const fetchInProgressRef = { current: false } as { current: boolean };
-    async function fetchAndUpdate(){
-      if (fetchInProgressRef.current) return;
-      fetchInProgressRef.current = true;
-      try{
-        const resp = await fetch('/api/market-data/quotes', { cache: 'no-store' });
-        if (!resp.ok) throw new Error('fetch failed');
-        const data = await resp.json();
-        // Mark the client-side successful fetch timestamp (Atlas client received a valid response)
-        const successAt = new Date().toISOString();
-        setLastSuccessfulFetchAt(successAt);
-        lastSuccessfulFetchAtRef.current = successAt;
-        
-        const quotesArr = data.quotes || [];
-        
-        const isMock = Boolean(data.isMock) || (data.source === 'mock') || (Array.isArray(quotesArr) && quotesArr.length === 0 && process.env.NODE_ENV !== 'production');
-        const usingProviderVal = (data.source && data.source !== 'mock') || (Array.isArray(quotesArr) && quotesArr.length > 0);
-        // Use fetchedAt only if provider provided it. Do not synthesize local time.
-        const detail: any = { quotes: quotesArr, fetchedAt: data.fetchedAt ?? null, usingProvider: Boolean(usingProviderVal), isMock: Boolean(isMock), source: data.source || (isMock ? 'mock' : 'twelvedata') };
-        
-        // Dispatch same event shape as the shared poller would
-        window.dispatchEvent(new CustomEvent('atlas:market-quotes', { detail }));
-      }catch(e){
-        // On fetch error: do not clear existing quotes. Dispatch an error flag so
-        // listeners can decide whether to fallback. This avoids wiping UI data
-        // before a successful response arrives.
-        
-        // On error, dispatch without a synthetic fetchedAt
-        const detail:any = { error: true, fetchedAt: null, usingProvider: false, source: 'network-error' };
-        
-        window.dispatchEvent(new CustomEvent('atlas:market-quotes', { detail }));
-      }finally{
-        fetchInProgressRef.current = false;
-      }
-    }
-
-    function onTick(e:any){ if (!mounted) return; const rem = e?.detail?.secondsLeft; if (typeof rem === 'number') setSecondsLeft(rem); }
-
-    // internal per-second countdown and auto-fetch when reaching 0
-    let internalTimer: any = null;
-    const externalTickSeenRef = { current: false } as { current: boolean };
-    function startInternalTimer(){
-      // initialize
-      setSecondsLeft(POLL_SECONDS);
-      internalTimer = setInterval(() => {
-        setSecondsLeft(prev => {
-          const next = prev - 1;
-          if (next <= 0){
-            // trigger fetch and reset (fetch is internally locked)
-            
-            void fetchAndUpdate();
-            return POLL_SECONDS;
-          }
-          return next;
-        });
-      }, 1000);
-    }
-
-    // Listen for shared poller ticks; if we see a tick quickly after mount
-    // we will prefer the shared poller and avoid starting our own interval.
-    function _tempTickListener(ev: any){ externalTickSeenRef.current = true; }
-    window.addEventListener('atlas:market-quotes', onQuotes as EventListener);
-    window.addEventListener('atlas:market-quotes-tick', onTick as EventListener);
-    window.addEventListener('atlas:market-quotes-tick', _tempTickListener as EventListener);
-    // Run one immediate refresh on mount using the same refresh function.
-    // fetchInProgressRef prevents concurrent double-calls if another poller runs.
-    void fetchAndUpdate();
-    // start internal timer only if no external tick observed shortly after mount
-    setTimeout(() => {
-      window.removeEventListener('atlas:market-quotes-tick', _tempTickListener as EventListener);
-      if (!externalTickSeenRef.current) startInternalTimer();
-    }, 200);
-
-    return ()=>{ mounted = false; window.removeEventListener('atlas:market-quotes', onQuotes as EventListener); window.removeEventListener('atlas:market-quotes-tick', onTick as EventListener); if (internalTimer) clearInterval(internalTimer); };
-  }, []);
-
-  // Keep a dev log each time the header renders with current lastFetchedAt
-  useEffect(()=>{}, [lastFetchedAt]);
-
-  // Log when component renders (after paint)
-  useEffect(()=>{});
-
-  // Log when quotes or lastFetchedAt update
-  useEffect(()=>{}, [quotes, lastFetchedAt]);
-
-  // Determine market status for the top card
-  const hasRealQuote = quotes.some(q => q.dataStatus === 'LIVE' || (usingProvider && q.price !== null));
-  const marketCardStatus = hasRealQuote ? 'LIVE' : 'DEGRADED';
-
-  function badgeForStatus(s?: string) {
-    const st = (s || 'UNAVAILABLE').toUpperCase();
-    if (st === 'LIVE') return 'bg-green-100 text-green-800 border border-green-200';
-    if (st === 'DELAYED' || st === 'STALE' || st === 'MARKNAD STÄNGD') return 'bg-amber-100 text-amber-800 border border-amber-200';
-    if (st === 'MOCK') return 'bg-sky-50 text-sky-800 border border-sky-100';
-    if (st === 'UNAVAILABLE') return 'bg-rose-50 text-rose-800 border border-rose-100';
-    return 'bg-gray-50 text-gray-800 border border-gray-100';
+  // derive metrics
+  const rows = viewModel ? viewModel.rows : [];
+  const total = rows.length;
+  const byType = { STOCK: 0, ETF: 0, FOREX: 0 } as Record<string, number>;
+  const statusCounts: Record<string, number> = { LIVE:0, DELAYED:0, STALE:0, UNAVAILABLE:0 };
+  let analyzedCount = 0; let diCount = 0;
+  for(const r of rows){
+    const t = (r.assetType||'').toUpperCase();
+    if (t.includes('FOREX')) byType.FOREX++;
+    else if (t.includes('ETF')) byType.ETF++;
+    else byType.STOCK++;
+    const s = (r.dataStatus||'UNAVAILABLE').toUpperCase(); if (!statusCounts[s]) statusCounts[s]=0; statusCounts[s]++;
+    if (r.analyzedInLatestCycle) analyzedCount++;
+    if (r.hasDecisionIntelligence) diCount++;
   }
 
-  function formatTimeOrDash(ts: string | null | undefined){
-    if (!ts) return '—';
-    try{
-      const d = new Date(ts);
-      if (!isFinite(d.getTime())) return '—';
-      return d.toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    }catch(e){ return '—'; }
-  }
+  // filtering/search
+  let filtered = rows.filter(r => {
+    if (activeTab === 'stocks' && !( (r.assetType||'').toUpperCase().includes('STOCK') )) return false;
+    if (activeTab === 'etf' && !( (r.assetType||'').toUpperCase().includes('ETF') )) return false;
+    if (activeTab === 'forex' && !( (r.assetType||'').toUpperCase().includes('FOREX') )) return false;
+    if (activeTab === 'analyzing' && !r.analyzedInLatestCycle) return false;
+    if (statusFilter && (r.dataStatus||'').toUpperCase() !== statusFilter) return false;
+    if (search){ const s = search.toLowerCase(); if (!r.symbol.toLowerCase().includes(s) && !(r.name||'').toLowerCase().includes(s)) return false; }
+    return true;
+  });
 
-  // Normalize various timestamp representations to an ISO string or null.
-  // Accepts ISO strings, numeric seconds, numeric milliseconds.
-  function normalizeTimestamp(v: any): string | null {
-    if (v === null || typeof v === 'undefined') return null;
-    // If it's already an ISO-like string, try Date.parse
-    if (typeof v === 'string'){
-      const s = v.trim();
-      // quick ISO-ish check
-      const parsed = Date.parse(s);
-      if (!isNaN(parsed)) return new Date(parsed).toISOString();
-      // if purely numeric string, fallthrough
-      if (/^[0-9]+$/.test(s)){
-        const n = Number(s);
-        const ms = Math.abs(n) < 1e12 ? n * 1000 : n;
-        const d = new Date(ms);
-        if (!isNaN(d.getTime())) return d.toISOString();
-        return null;
-      }
-      return null;
-    }
-    if (typeof v === 'number'){
-      const n = v;
-      const ms = Math.abs(n) < 1e12 ? n * 1000 : n;
-      const d = new Date(ms);
-      if (!isNaN(d.getTime())) return d.toISOString();
-      return null;
-    }
-    return null;
-  }
+  // apply sorting
+  filtered = filtered.slice().sort((a,b)=>{
+    const dir = sortDir === 'asc' ? 1 : -1;
+    if (sortKey === 'symbol') return a.symbol.localeCompare(b.symbol) * dir;
+    if (sortKey === 'change') return ((a.changePercent||0) - (b.changePercent||0)) * dir;
+    if (sortKey === 'updated') return ((a.fetchedAt ? Date.parse(a.fetchedAt) : 0) - (b.fetchedAt ? Date.parse(b.fetchedAt) : 0)) * dir;
+    if (sortKey === 'confidence') return ((a.confidence||0) - (b.confidence||0)) * dir;
+    if (sortKey === 'signals') return (a.usableSignalCount - b.usableSignalCount) * dir;
+    return 0;
+  });
 
   return (
     <>
       <LeftSidebar />
       <div style={{ marginLeft: 240 }} className="py-8 px-4 bg-[#F9F6F1] min-h-[200px]">
-        <div className="max-w-5xl mx-auto">
-        <div className="mb-4">
-          {/* Market hours and Forex status */}
-          <div style={{ display:'flex', gap:24, alignItems:'center', marginBottom:8 }}>
+        <div className="max-w-6xl mx-auto">
+          <div className="flex items-center justify-between mb-4">
             <div>
-              <div className="text-xs text-gray-500">USA</div>
-              <div className="text-sm font-semibold">{computeUSMarketStatus()}</div>
+              <h1 className="text-2xl font-semibold">MARKNADSÖVERVAKNING</h1>
+              <div className="text-sm text-gray-500">Snapshot: {viewModel ? viewModel.generatedAt : '—'}</div>
             </div>
-            <div>
-              <div className="text-xs text-gray-500">FOREX</div>
-              <div className="text-sm font-semibold">Öppen</div>
-            </div>
-          </div>
-          <h1 className="text-2xl font-semibold">MARKNADSÖVERVAKNING</h1>
-          <p className="text-sm text-gray-600">Kurser uppdateras automatiskt från Atlas marknadsflöde.</p>
-          <div className="mt-2 text-xs text-gray-500">Riktig marknadsdata där providerdata finns. Fördröjd eller otillgänglig data markeras tydligt.</div>
-          <div className="mt-2">
-            <div style={{ display:'inline-flex', alignItems:'center', gap:8, fontSize:13, color:'#374151' }}>
-              <div style={{ width:10, height:10, borderRadius:9999, background: '#10B981' }} />
-              <div style={{ fontWeight:700 }}>Live</div>
-              <div style={{ color:'#6B7280' }}>{lastSuccessfulFetchAt ? `Hämtad ${new Date(lastSuccessfulFetchAt).toLocaleTimeString('sv-SE', { timeZone: 'Europe/Stockholm', hour12:false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : 'Hämtning: —'}</div>
-              <div style={{ color:'#9CA3AF' }}>·</div>
-              <div style={{ color:'#6B7280' }}>{`Ny hämtning om ${secondsLeft}s`}</div>
+            <div className="flex items-center gap-3">
+                <div className="text-xs text-gray-500">Uppdatering om {secondsLeft}s</div>
+                <button onClick={() => { void fetchSnapshot(); }} className="bg-white px-3 py-1 rounded border">Uppdatera</button>
             </div>
           </div>
-        </div>
 
-        <div className="flex flex-col md:flex-row items-start gap-4 mb-6">
-          <div className="grid grid-cols-4 gap-3 flex-1 w-full">
-            <div className="col-span-1 bg-white rounded-md p-2.5 flex flex-col gap-0.5 border border-gray-100 h-14 flex justify-center">
-              <div className="text-xs text-gray-500">Bevakade instrument</div>
-              <div className="text-sm font-semibold">{quotes.length}</div>
+          <div className="grid grid-cols-6 gap-4 mb-6">
+            <div className="col-span-2 bg-white rounded-md p-4 border">
+              <div className="text-xs text-gray-500">Victor Health</div>
+              <div className="text-sm font-semibold">Scheduler: {viewModel && viewModel.health.scheduler && viewModel.health.scheduler.running ? 'Aktiv' : 'Stoppad'}</div>
+              <div className="text-xs text-gray-500">Cykel: {viewModel && viewModel.health.scheduler && viewModel.health.scheduler.cycleInProgress ? 'Pågår' : 'Väntar'}</div>
+              <div className="text-xs text-gray-500">Nästa körning: {viewModel && viewModel.health.scheduler && viewModel.health.scheduler.nextRunAt ? new Date(viewModel.health.scheduler.nextRunAt).toLocaleString() : '—'}</div>
+              <div className="text-xs text-gray-500">Senaste körning: {viewModel && viewModel.health.scheduler && viewModel.health.scheduler.lastRunAt ? new Date(viewModel.health.scheduler.lastRunAt).toLocaleString() : '—'}</div>
+              <div className="text-xs text-gray-500">Senaste status: {viewModel && viewModel.health.scheduler && viewModel.health.scheduler.lastStatus ? String(viewModel.health.scheduler.lastStatus) : '—'}</div>
             </div>
-            <div className="col-span-3 bg-white rounded-md p-3 border border-gray-100 flex flex-col justify-center" style={{ minHeight: 56 }}>
-              <div className="text-xs text-gray-500">VICTOR</div>
-              <div className="text-sm font-semibold">Marknaden bevakas just nu.</div>
-              <div className="text-xs text-gray-500 mt-1">
-                {hasRealQuote ? `${quotes.filter(q=>q.dataStatus==='LIVE' || (usingProvider && q.price!==null)).length} instrument analyseras inför nästa uppdatering.` : 'Väntar på tillgänglig marknadsdata.'}
-              </div>
-              <div className="text-xs text-gray-400 mt-2">Senaste AI-analys: —</div>
+            <div className="col-span-2 bg-white rounded-md p-4 border">
+              <div className="text-xs text-gray-500">Launch Control</div>
+              <div className="text-sm font-semibold">{viewModel && viewModel.health.forexLaunchControl && (viewModel.health.forexLaunchControl.armed ? 'ARMED' : 'BLOCKED')}</div>
+              <div className="text-xs text-gray-500">Blocker: {viewModel && viewModel.rows && viewModel.rows.length ? (viewModel.health.forexLaunchControl && viewModel.health.forexLaunchControl.blockingReason ? String(viewModel.health.forexLaunchControl.blockingReason) : '—') : '—'}</div>
+            </div>
+            <div className="col-span-2 bg-white rounded-md p-4 border">
+              <div className="text-xs text-gray-500">Quotes</div>
+              <div className="text-sm font-semibold">Senaste fel: {viewModel && viewModel.health.latestAutomaticQuotesError ? String(viewModel.health.latestAutomaticQuotesError) : '—'}</div>
+              <div className="text-xs text-gray-500">Analyserade senast: {analyzedCount}</div>
             </div>
           </div>
-        </div>
 
-        <div className="space-y-2">
-          {quotes.map((q) => {
-            const status = (q.dataStatus || 'UNAVAILABLE').toUpperCase();
-            const pricePresent = q.price !== null && q.price !== undefined;
-            const positive = typeof q.change === 'number' && q.change > 0;
-            const negative = typeof q.change === 'number' && q.change < 0;
-            const flash = flashMap[q.symbol];
-            // Determine display status: for US symbols with a delayed quote that represents
-            // a latest valid close (timestamp not today) show MARKNAD STÄNGD instead of DELAYED
-            let displayStatus = status;
-            try{
-              const sym = (q.symbol || '').toUpperCase();
-              const isUS = !!(sym.match(/^[A-Z]{1,5}$/));
-              if (isUS && status === 'DELAYED' && pricePresent && q.marketTimestamp){
-                const mq = new Date(q.marketTimestamp);
-                const now = new Date();
-                if (isFinite(mq.getTime()) && mq.toDateString() !== now.toDateString()){
-                  displayStatus = 'MARKNAD STÄNGD';
-                }
-              }
-            }catch(e){}
+          {error ? (
+            <div className="mb-3 text-sm text-red-700">Fel: {error} {viewModel ? <span className="text-gray-600">(Visar senaste snapshot, kan vara inaktuell)</span> : null}</div>
+          ) : null}
 
-            // During the very first successful fetch we want to show a loading
-            // label instead of pre-populated MOCK. If the row actually uses
-            // mock data later, it will get `MOCK` as its `dataStatus`.
-            if (initialFetchInProgress && !q.dataStatus){
-              displayStatus = 'LADDAR';
-            }
-
-            return (
-              <div key={q.symbol} className="bg-white rounded-md border border-transparent hover:bg-slate-50 hover:shadow-sm transition-all duration-150" style={{ cursor: 'default', padding: '10px 12px', minHeight: 72 }}>
-                <div className="grid items-center" style={{ gridTemplateColumns: '52px minmax(220px, 1fr) 150px 140px 140px', columnGap: '12px', alignItems: 'center' }}>
-                  {/* logo */}
-                  <div style={{ width: 44, height: 44, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    { (q.symbol === 'USD/SEK' || q.symbol === 'EUR/SEK') ? (
-                      <div style={{ width: 44, height: 44, borderRadius: 8, background: '#FEF7ED', border: '1px solid #F5E6D0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <div style={{ fontSize: 16, fontWeight: 700, color: '#0B2140' }}>{q.symbol === 'USD/SEK' ? '$' : '€'}</div>
-                      </div>
-                    ) : (
-                      <div style={{ width: 44, height: 44, borderRadius: 8, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <CompanyLogo symbol={q.symbol} name={q.name || undefined} size={44} />
-                      </div>
-                    )}
-                  </div>
-
-                  {/* name / ticker */}
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <div style={{ fontSize: 14, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q.name || q.symbol}</div>
-                      {(() => { const sym = (q.symbol||'').toUpperCase(); const isFX = (sym==='USD/SEK' || sym==='EUR/SEK'); const isUS = !!(sym.match(/^[A-Z]{1,5}$/)); if (isUS && !isFX) return <div style={{ fontSize: 10, background: '#F3F4F6', color: '#374151', padding: '2px 6px', borderRadius: 4 }}>US</div>; return null; })()}
-                    </div>
-                    <div style={{ fontSize: 12, color: '#6B7280', marginTop: 4 }}>{q.symbol}</div>
-                  </div>
-
-                  {/* price column */}
-                  <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
-                    <div style={{ fontSize: 22, fontWeight: 700, lineHeight: 1 }}>{pricePresent ? Number(q.price).toFixed(2) : '—'}</div>
-                    <div style={{ fontSize: 12, color: '#6B7280', marginTop: 2 }}>{q.currency || '—'}</div>
-                  </div>
-
-                  {/* change column */}
-                  <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
-                    <div style={{ fontSize: 16, fontWeight: 600, color: positive ? '#166534' : (negative ? '#B91C1C' : '#374151') }}>{q.changePercent !== null && q.changePercent !== undefined ? `${q.changePercent.toFixed(2)}%` : '—'}</div>
-                    <div style={{ fontSize: 12, color: positive ? '#166534' : (negative ? '#B91C1C' : '#6B7280'), opacity: 0.9, marginTop: 4 }}>{q.change !== null && q.change !== undefined ? `${(q.change as number).toFixed(2)} ${q.currency || ''}` : '—'}</div>
-                  </div>
-
-                  {/* status */}
-                  <div style={{ textAlign: 'right', display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
-                    <div style={{ fontSize: 11, padding: '4px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.04)', background: '#F8FAF7', color: '#194D33' }}>{displayStatus === 'MARKNAD STÄNGD' ? 'Marknad stängd' : displayStatus === 'LIVE' ? 'Live' : displayStatus}</div>
-                  </div>
-                </div>
-                {(!pricePresent || status === 'UNAVAILABLE') && (
-                  <div style={{ marginTop: 6, fontSize: 12, color: '#6B7280' }}>Ingen kursdata från aktuell provider</div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="mt-6 max-w-5xl mx-auto">
-          <h2 className="text-sm font-semibold mb-3">MARKNADSÖVERSIKT</h2>
-          <div className="flex items-center gap-3">
-            <div className="bg-white rounded-md p-3 border border-gray-100 flex items-center gap-3">
-              <div className="text-lg">🇺🇸</div>
-              <div>
-                <div className="text-sm font-semibold">USA</div>
-                <div className="text-xs text-gray-500">Nasdaq — BEVAKAS</div>
-              </div>
-            </div>
-            <div className="bg-white rounded-md p-3 border border-gray-100 flex items-center gap-3">
-              <div className="text-lg">🇸🇪</div>
-              <div>
-                <div className="text-sm font-semibold">Sverige</div>
-                <div className="text-xs text-gray-500">OMXS30 — BEVAKAS</div>
-              </div>
-            </div>
-            <div className="bg-white rounded-md p-3 border border-gray-100 flex items-center gap-3">
-              <div className="text-lg">🇩🇰</div>
-              <div>
-                <div className="text-sm font-semibold">Danmark</div>
-                <div className="text-xs text-gray-500">C25 — BEVAKAS</div>
-              </div>
-            </div>
-            <div className="text-xs text-gray-400 ml-4">Indexdata kopplas in senare.</div>
+          <div className="flex items-center gap-3 mb-3">
+            <button className={`px-3 py-1 rounded ${activeTab==='overview'?'bg-slate-200':''}`} onClick={()=>setActiveTab('overview')}>Översikt</button>
+            <button className={`px-3 py-1 rounded ${activeTab==='stocks'?'bg-slate-200':''}`} onClick={()=>setActiveTab('stocks')}>Aktier</button>
+            <button className={`px-3 py-1 rounded ${activeTab==='etf'?'bg-slate-200':''}`} onClick={()=>setActiveTab('etf')}>ETF:er</button>
+            <button className={`px-3 py-1 rounded ${activeTab==='forex'?'bg-slate-200':''}`} onClick={()=>setActiveTab('forex')}>Valutapar</button>
+            <button className={`px-3 py-1 rounded ${activeTab==='analyzing'?'bg-slate-200':''}`} onClick={()=>setActiveTab('analyzing')}>Analyseras nu</button>
+            <input placeholder="Sök symbol eller namn" value={search} onChange={e=>setSearch(e.target.value)} className="ml-auto px-2 py-1 border rounded" />
+            <select value={statusFilter||''} onChange={e=>setStatusFilter(e.target.value||null)} className="px-2 py-1 border rounded ml-2">
+              <option value="">All</option>
+              <option value="LIVE">LIVE</option>
+              <option value="DELAYED">DELAYED</option>
+              <option value="STALE">STALE</option>
+              <option value="UNAVAILABLE">UNAVAILABLE</option>
+            </select>
+            <select value={sortKey} onChange={e=>setSortKey(e.target.value as any)} className="px-2 py-1 border rounded ml-2">
+              <option value="symbol">Symbol</option>
+              <option value="change">Förändring</option>
+              <option value="updated">Senast uppdaterad</option>
+              <option value="confidence">Confidence</option>
+              <option value="signals">Signaler</option>
+            </select>
+            <button onClick={()=>setSortDir(s=>s==='asc'?'desc':'asc')} className="px-2 py-1 border rounded">{sortDir==='asc'?'▲':'▼'}</button>
           </div>
+          {loading && !viewModel ? (
+            <div className="bg-white rounded-md p-8 border text-center">Laddar marknadsdata…</div>
+          ) : (
+            <div className="bg-white rounded-md p-4 border">
+              <div className="text-xs text-gray-500 mb-2">Nyckeltal: Totalt {total} · Aktier {byType.STOCK} · ETF {byType.ETF} · Valutapar {byType.FOREX} · LIVE {statusCounts.LIVE||0} · DELAYED {statusCounts.DELAYED||0} · STALE {statusCounts.STALE||0} · UNAVAILABLE {statusCounts.UNAVAILABLE||0} · DI {diCount}</div>
+
+              {total === 0 ? (
+                <div className="p-6 text-center text-gray-600">Inga instrument i registret</div>
+              ) : filtered.length === 0 ? (
+                <div className="p-6 text-center text-gray-600">Inga instrument matchar dina filter</div>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-gray-500">
+                      <th>Symbol</th><th>Namn</th><th>Typ</th><th>Valuta</th><th>Kurs</th><th>Förändring</th><th>Datastatus</th><th>Victor</th><th>Confidence</th><th>Signaler</th><th>Senast analyserad</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map(r => (
+                      <tr key={r.instrumentId} className="border-t">
+                        <td className="py-2">{r.symbol}</td>
+                        <td>{r.name||'—'}</td>
+                        <td>{r.assetType||'—'}</td>
+                        <td>{r.currency||'—'}</td>
+                        <td>{r.price !== null ? r.price.toFixed(2) : '—'}</td>
+                        <td>{r.changePercent !== null ? `${r.changePercent.toFixed(2)}%` : '—'}</td>
+                        <td>{r.dataStatus}</td>
+                        <td>{r.victorAction|| (r.analyzedInLatestCycle ? 'Analyseras' : '—')}</td>
+                        <td>{r.confidence !== null ? r.confidence : '—'}</td>
+                        <td>{r.usableSignalCount}</td>
+                        <td>{r.latestAnalysisAt ? new Date(r.latestAnalysisAt).toLocaleString() : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
         </div>
       </div>
-    </div>
     </>
   );
 }

@@ -1795,6 +1795,47 @@ export async function getPaperTradingState(){
   return out;
 }
 
+// Lightweight runtime snapshot that explicitly DOES NOT trigger provider calls.
+// Intended for UI consumption where no new market-data provider fetches are desired.
+export function getPaperTradingRuntimeSnapshot(){
+  try{
+    const sched = getGlobalScheduler();
+    return {
+      latestQuoteSnapshotBySymbol: runtime.latestQuoteSnapshotBySymbol || {},
+      latestDecisionIntelligenceBySymbol: runtime.latestDecisionIntelligenceBySymbol || {},
+      latestSignalBuildDiagnosticsBySymbol: runtime.latestSignalBuildDiagnosticsBySymbol || {},
+      latestMultiTimeframeTechnicalIntelligenceBySymbol: runtime.latestMultiTimeframeTechnicalIntelligenceBySymbol || {},
+      // Backwards-compatible array copy
+      latestCycleAnalyzedSymbols: (runtime.latestCycle && runtime.latestCycle.decisionSummary && Array.isArray(runtime.latestCycle.decisionSummary.analyzedSymbols)) ? runtime.latestCycle.decisionSummary.analyzedSymbols.slice() : [],
+      // Canonical nested latestCycle structure for consumers
+      latestCycle: {
+        decisionSummary: {
+          analyzedSymbols: (runtime.latestCycle && runtime.latestCycle.decisionSummary && Array.isArray(runtime.latestCycle.decisionSummary.analyzedSymbols)) ? runtime.latestCycle.decisionSummary.analyzedSymbols.slice() : []
+        }
+      },
+      latestAutonomousRuntimeReadiness: runtime.latestAutonomousRuntimeReadiness || null,
+      forexLaunchControl: runtime.forexLaunchControl || null,
+      latestAutomaticQuotesError: runtime.latestAutomaticQuotesError || null,
+      // Scheduler health: explicit fields
+      schedulerRunning: !!(sched && sched.timerId),
+      cycleInProgress: Boolean(sched && sched.inProgress),
+      nextAutomaticRunAt: sched && sched.nextRunAt ? new Date(sched.nextRunAt).toISOString() : null,
+      lastAutomaticRunAt: sched && sched.lastRunAt ? new Date(sched.lastRunAt).toISOString() : null,
+      lastAutomaticRunStatus: sched && sched.lastAutomaticRunStatus ? sched.lastAutomaticRunStatus : null,
+      // Keep compat object but do not expose sensitive internals
+      scheduler: {
+        inProgress: sched.inProgress || false,
+        lastRunAt: sched.lastRunAt || null,
+        nextRunAt: sched.nextRunAt || null,
+        lastAutomaticRunStatus: sched.lastAutomaticRunStatus || null,
+      },
+      // Snapshot metadata
+      snapshotGeneratedAt: new Date().toISOString(),
+      lastUpdated: runtime.lastUpdated || null,
+    };
+  }catch(_){ return { latestQuoteSnapshotBySymbol: {}, latestDecisionIntelligenceBySymbol: {}, latestSignalBuildDiagnosticsBySymbol: {}, latestMultiTimeframeTechnicalIntelligenceBySymbol: {}, latestCycleAnalyzedSymbols: [], latestAutonomousRuntimeReadiness: null, forexLaunchControl: null, latestAutomaticQuotesError: null, scheduler: {}, lastUpdated: null }; }
+}
+
 export async function getPerformanceSummary(){
   // Read all audits and extract valid TradeEvaluation objects from EVALUATION entries
   try{
