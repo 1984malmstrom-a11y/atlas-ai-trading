@@ -32,6 +32,7 @@ import evaluateShadowDecisionOutcome from './shadow-decision-outcome-evaluator';
 import aggregateShadowDecisionPerformance from './shadow-decision-performance-aggregator';
 import { createPerCycleContextAwareShadowResolver, sanitizeContextAwareShadowDecisionForState } from './context-aware-shadow-decision';
 import { TRADABLE_INSTRUMENTS } from '../market-data/instruments';
+import * as LQC from '../market-data/latest-quote-cache';
 import { TwelveDataMarketDataProvider } from '../market-data/twelve-data';
 import { getMarketDataProvider } from '../market-data';
 import { buildIntradayMarketContext, sanitizeIntradayMarketContextForState, buildIntradayDataReadiness, IntradayMarketContext } from './intraday-market-context';
@@ -84,6 +85,16 @@ type RuntimeState = {
   latestExternalFundamentalContextBySymbol?: Record<string, any>;
   latestHistoricalMarketContextBySymbol?: Record<string, HistoricalMarketContextSnapshot>;
   latestQuoteSnapshotBySymbol?: Record<string, any>;
+  latestAutomaticQuoteRequestDiagnostics?: {
+    requestedAt?: string;
+    requestedInstrumentIds?: string[];
+    requestedSymbols?: string[];
+    requestedCount?: number;
+    returnedInstrumentIds?: string[];
+    returnedSymbols?: string[];
+    returnedCount?: number;
+    missingInstrumentIds?: string[];
+  };
   latestSignalBuildDiagnosticsBySymbol?: Record<string, any>;
   latestMarketRegimeIntelligenceBySymbol?: Record<string, any>;
   latestIntradayMarketContextBySymbol?: Record<string, any>;
@@ -184,56 +195,128 @@ export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: 
     // Deterministic stable ordering for rotation: sort by normalized providerSymbol or id
     const candidateSymbols = Array.from(new Set(usCandidates.map((i:any) => normalize(i.providerSymbol || i.id || i.symbol)))).filter(s=> s).sort((a,b)=> a.localeCompare(b));
 
-    // If caller provided a custom watchlist (not the default), preserve those symbols first
+    // If caller provided a custom watchlist (not the default), capture those symbols (do not append yet)
+    let watchlistSymbols: string[] = [];
     try{
       const isCustomWatchlist = JSON.stringify(watchlist || []) !== JSON.stringify(DEFAULT_WATCHLIST || []);
       if (isCustomWatchlist){
         const wl = getWatchlistSymbols(eligibleInstruments, watchlist) || [];
-        for (const s of wl) {
-          try{ const su = String(s||'').toUpperCase(); if (su && !out.map(x=>String(x).toUpperCase()).includes(su)) out.push(su); }catch(_){ }
-        }
+        for (const s of wl) { try{ const su = String(s||'').toUpperCase(); if (su && !watchlistSymbols.includes(su)) watchlistSymbols.push(su); }catch(_){ } }
       }
     }catch(_){ }
 
-    // Core symbols: always include SPY and QQQ when present and enabled
-    const coreRequested = ['SPY','QQQ'];
-    for (const c of coreRequested){
-      try{ if (candidateSymbols.includes(c)) out.push(c); }catch(_){ }
+    // Determine session states
+    let forexSessionOpen = false;
+    try{ const diag = getForexSessionDiagnostics(now instanceof Date ? now : new Date()); forexSessionOpen = diag && diag.status === 'OPEN'; }catch(_){ forexSessionOpen = false; }
+    let usMarketOpen = false;
+    try{ const ny = getNextNYOpenInstant(now instanceof Date ? now : new Date()); usMarketOpen = !!ny && ny.open === true; }catch(_){ usMarketOpen = false; }
+
+    // Build separate pools: STOCK (only STOCK), ETF, FOREX
+    const stockPool: string[] = [];
+    const etfPool: string[] = [];
+    const forexPool: string[] = [];
+    for (const inst of eligibleInstruments){
+      try{
+        const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
+        if (!enabled) continue;
+        const provRaw = String(inst.providerSymbol || inst.id || inst.symbol || '').toUpperCase();
+        if (!provRaw) continue;
+        const assetType = inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
+        let analysisSymbol = provRaw;
+        if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
+        else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
+        else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
+        analysisSymbol = String(analysisSymbol).toUpperCase();
+        if (assetType === 'FOREX') forexPool.push(analysisSymbol);
+        else if (assetType === 'ETF') etfPool.push(analysisSymbol);
+        else stockPool.push(analysisSymbol);
+      }catch(_){ }
     }
 
-    // Forex core: when forex session open include ALL enabled/tradable FOREX instruments
-    let sessionOpen = false;
-    try{ const diag = getForexSessionDiagnostics(now instanceof Date ? now : new Date()); sessionOpen = diag && diag.status === 'OPEN'; }catch(_){ sessionOpen = false; }
-    if (sessionOpen){
+    // deterministic dedupe & sort
+    const uniqStock = Array.from(new Set(stockPool)).sort((a,b)=> a.localeCompare(b));
+    const uniqEtf = Array.from(new Set(etfPool)).sort((a,b)=> a.localeCompare(b));
+    const uniqForex = Array.from(new Set(forexPool)).sort((a,b)=> a.localeCompare(b));
+
+    // When US market is open, build strict slot groups and then merge
+    if (usMarketOpen){
+      const MAX_FOREX_WHEN_OPEN = 3;
+      const DESIRED_STOCKS = 5;
+      const ROTATION_BUCKET_MS = 60 * 1000; // 1 minute cycles
+      const nowMs = (now instanceof Date) ? now.getTime() : Date.now();
+      const cycleIndex = Math.floor(nowMs / ROTATION_BUCKET_MS);
+
+      // Selected groups
+      const selectedStocks: string[] = [];
+      const selectedCoreEtfs: string[] = [];
+      const selectedForex: string[] = [];
+
+      // 1) Custom watchlist STOCK symbols first (limit within stock quota)
       try{
-        const forexCandidates: string[] = [];
-        for (const inst of eligibleInstruments){
+        for (const s of watchlistSymbols){
           try{
-            const type = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
-            if (type !== 'FOREX') continue;
-            const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
-            if (!enabled) continue;
-            // ensure tradable now (respects session rules)
-            if (!isInstrumentTradableNow(inst, now)) continue;
-            const provRaw = String(inst.providerSymbol || inst.id || '').toUpperCase();
-            if (!provRaw) continue;
-            let analysisSymbol = provRaw;
-            if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
-            else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
-            else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
-            analysisSymbol = String(analysisSymbol).toUpperCase();
-            forexCandidates.push(analysisSymbol);
+            const up = String(s||'').toUpperCase();
+            if (selectedStocks.length >= DESIRED_STOCKS) break;
+            if (uniqStock.includes(up) && !selectedStocks.includes(up)) selectedStocks.push(up);
           }catch(_){ }
         }
-        // deterministic order, dedupe
-        const uniq = Array.from(new Set(forexCandidates)).sort((a,b)=> a.localeCompare(b));
-        // Determine slots available for forex after watchlist and core
-        const slotsAfterCore = Math.max(0, 10 - out.length);
+      }catch(_){ }
+
+      // 2) Rotated STOCK symbols to reach DESIRED_STOCKS
+      try{
+        const need = Math.max(0, Math.min(DESIRED_STOCKS, uniqStock.length) - selectedStocks.length);
+        if (need > 0){
+          const choose = Math.min(need, uniqStock.length);
+          const start = (cycleIndex * choose) % uniqStock.length;
+          for (let i = 0; i < choose; i++){
+            const idx = (start + i) % uniqStock.length; const cand = uniqStock[idx]; if (!selectedStocks.includes(cand)) selectedStocks.push(cand);
+          }
+        }
+      }catch(_){ }
+
+      // 3) Include SPY and QQQ if enabled/tradable (they are ETFs, not STOCK)
+      try{
+        for (const core of ['SPY','QQQ']){ if (uniqEtf.includes(core) && !selectedCoreEtfs.includes(core)) selectedCoreEtfs.push(core); }
+      }catch(_){ }
+
+      // 4) Rotated FOREX up to MAX_FOREX_WHEN_OPEN, but respect total slots
+      try{
+        const slotsAfterStocksAndCore = Math.max(0, MAX_SLOTS - (selectedStocks.length + selectedCoreEtfs.length));
+        const chooseFx = Math.min(MAX_FOREX_WHEN_OPEN, slotsAfterStocksAndCore, uniqForex.length);
+        if (chooseFx > 0){
+          const startFx = (cycleIndex * chooseFx) % uniqForex.length;
+          for (let i = 0; i < chooseFx; i++){ const idx = (startFx + i) % uniqForex.length; const fx = uniqForex[idx]; if (!selectedForex.includes(fx)) selectedForex.push(fx); }
+        }
+      }catch(_){ }
+
+      // 5) Fill remaining slots: STOCK first (rotating remaining), then ETF (non-core), then FOREX (remaining), then others
+      const remaining: string[] = [];
+      try{
+        const used = new Set<string>([...selectedStocks.map(s=>s.toUpperCase()), ...selectedCoreEtfs.map(s=>s.toUpperCase()), ...selectedForex.map(s=>s.toUpperCase())]);
+        // remaining stocks
+        for (const s of uniqStock){ if (remaining.length + selectedStocks.length + selectedCoreEtfs.length + selectedForex.length >= MAX_SLOTS) break; if (!used.has(s.toUpperCase())){ remaining.push(s); used.add(s.toUpperCase()); } }
+        // remaining ETFs (exclude core)
+        for (const s of uniqEtf){ if (remaining.length + selectedStocks.length + selectedCoreEtfs.length + selectedForex.length >= MAX_SLOTS) break; if (!['SPY','QQQ'].includes(s) && !used.has(s.toUpperCase())){ remaining.push(s); used.add(s.toUpperCase()); } }
+        // remaining forex
+        for (const s of uniqForex){ if (remaining.length + selectedStocks.length + selectedCoreEtfs.length + selectedForex.length >= MAX_SLOTS) break; if (!used.has(s.toUpperCase())){ remaining.push(s); used.add(s.toUpperCase()); } }
+        // fallback rotation pool items
+        for (const s of candidateSymbols){ if (remaining.length + selectedStocks.length + selectedCoreEtfs.length + selectedForex.length >= MAX_SLOTS) break; const up = String(s||'').toUpperCase(); if (!used.has(up)) { remaining.push(s); used.add(up); } }
+      }catch(_){ }
+
+      const combined = [...selectedStocks, ...selectedCoreEtfs, ...selectedForex, ...remaining];
+      const final: string[] = [];
+      const seen = new Set<string>();
+      for (const s of combined){ const u = String(s||'').toUpperCase(); if (!seen.has(u)){ seen.add(u); final.push(s); } if (final.length >= MAX_SLOTS) break; }
+      return final.slice(0, MAX_SLOTS);
+    } else {
+      // US closed -> prioritize forex rotation to fill analysis slots
+      try{
+        const uniq = uniqForex;
+        const slotsAfterCore = Math.max(0, MAX_SLOTS - out.length);
         if (uniq.length > 0 && slotsAfterCore > 0){
-          // rotate forex pool per cycle using hourly cycle index
           const nowMs = (now instanceof Date) ? now.getTime() : Date.now();
-          const CYCLE_MS = 60 * 60 * 1000; // 1 hour
-          const cycleIndex = Math.floor(nowMs / CYCLE_MS);
+          const ROTATION_BUCKET_MS = 60 * 1000; // 1 minute cycles
+          const cycleIndex = Math.floor(nowMs / ROTATION_BUCKET_MS);
           const forexSlots = Math.min(slotsAfterCore, uniq.length);
           const startIndex = (cycleIndex * forexSlots) % uniq.length;
           for (let i = 0; i < forexSlots; i++){
@@ -252,8 +335,8 @@ export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: 
     if (rotationPool.length > 0 && slotsLeft > 0){
       // Derive deterministic cycle index from time: use hourly cycle index to rotate across hours
       const nowMs = (now instanceof Date) ? now.getTime() : Date.now();
-      const CYCLE_MS = 60 * 60 * 1000; // 1 hour cycles
-      const cycleIndex = Math.floor(nowMs / CYCLE_MS);
+      const ROTATION_BUCKET_MS = 60 * 1000; // 1 minute cycles
+      const cycleIndex = Math.floor(nowMs / ROTATION_BUCKET_MS);
       // Rotation stepping: shift start by the number of rotation positions that will be filled
       // in each cycle (i.e. the actual slotsLeft). This ensures block-wise rotation and
       // guarantees full coverage within ceil(pool.length / slotsPerCycle) cycles.
@@ -1079,6 +1162,10 @@ export function setForexAutonomyArmed(armed: boolean){
   try{ runtime.forexAutonomyArmed = !!armed; }catch(_){ }
 }
 
+// Load persisted latest-quote cache (best-effort, defensive)
+let latestQuoteCache: LQC.LatestQuoteCache = LQC.loadPersistedLatestQuoteCache();
+try{ runtime.latestQuoteSnapshotBySymbol = LQC.projectLatestQuoteCache(latestQuoteCache); }catch(e){ runtime.latestQuoteSnapshotBySymbol = runtime.latestQuoteSnapshotBySymbol || {}; }
+
 export function getForexAutonomyArmed(){
   try{ return !!runtime.forexAutonomyArmed; }catch(_){ return false; }
 }
@@ -1829,6 +1916,8 @@ export function getPaperTradingRuntimeSnapshot(){
         nextRunAt: sched.nextRunAt || null,
         lastAutomaticRunStatus: sched.lastAutomaticRunStatus || null,
       },
+      // Expose latestAutomaticQuoteRequestDiagnostics as a sanitized deep copy
+      latestAutomaticQuoteRequestDiagnostics: (function(){ try{ const d = runtime.latestAutomaticQuoteRequestDiagnostics; if (!d) return null; const copy = { requestedAt: d.requestedAt || null, requestedInstrumentIds: Array.isArray(d.requestedInstrumentIds) ? d.requestedInstrumentIds.slice() : [], requestedSymbols: Array.isArray(d.requestedSymbols) ? d.requestedSymbols.slice() : [], requestedCount: typeof d.requestedCount === 'number' ? d.requestedCount : (Array.isArray(d.requestedInstrumentIds) ? d.requestedInstrumentIds.length : 0), returnedInstrumentIds: Array.isArray(d.returnedInstrumentIds) ? d.returnedInstrumentIds.slice() : [], returnedSymbols: Array.isArray(d.returnedSymbols) ? d.returnedSymbols.slice() : [], returnedCount: typeof d.returnedCount === 'number' ? d.returnedCount : (Array.isArray(d.returnedInstrumentIds) ? d.returnedInstrumentIds.length : 0), missingInstrumentIds: Array.isArray(d.missingInstrumentIds) ? d.missingInstrumentIds.slice() : [] }; return copy; }catch(_){ return null; } })(),
       // Snapshot metadata
       snapshotGeneratedAt: new Date().toISOString(),
       lastUpdated: runtime.lastUpdated || null,
@@ -1906,6 +1995,12 @@ async function fetchQuotes(){
               providerSymbol: providerSymbol || null,
               symbol: symbol || null,
               price: (f && (f.price === undefined || f.price === null)) ? null : (f && typeof f.price === 'number' ? Number(f.price) : (f && f.price ? Number(f.price) : null)),
+              previousClose: (f && (f.previousClose === undefined || f.previousClose === null)) ? (f && (f.previous_close === undefined || f.previous_close === null) ? null : (typeof f.previous_close === 'number' ? Number(f.previous_close) : (f.previous_close ? Number(f.previous_close) : null))) : (typeof f.previousClose === 'number' ? Number(f.previousClose) : (f.previousClose ? Number(f.previousClose) : null)),
+              change: (f && (f.change === undefined || f.change === null)) ? null : (typeof f.change === 'number' ? Number(f.change) : (f.change ? Number(f.change) : null)),
+              changePercent: (f && (f.changePercent === undefined || f.changePercent === null)) ? (f && (f.change_percent === undefined || f.change_percent === null) ? null : (typeof f.change_percent === 'number' ? Number(f.change_percent) : (f.change_percent ? Number(f.change_percent) : null))) : (typeof f.changePercent === 'number' ? Number(f.changePercent) : (f.changePercent ? Number(f.changePercent) : null)),
+              isStale: (typeof f.isStale === 'boolean') ? f.isStale : !!(f && (f.is_stale || f.isStale)),
+              provider: f && (f.provider || f.source) ? (f.provider || f.source) : null,
+              currency: f && (f.currency || null) ? f.currency : null,
               marketTimestamp: marketTimestamp || null,
               dataStatus: dataStatus || null,
               fetchedAt: fetchedAt || null,
@@ -2074,13 +2169,38 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
       // Build cycle-scoped instrument ids using centralized helper.
       const cycleIds = await buildAutomaticCycleQuoteInstrumentIds();
       try{
+        // record requested diagnostics (sanitized)
+        try{ runtime.latestAutomaticQuoteRequestDiagnostics = { requestedAt: new Date().toISOString(), requestedInstrumentIds: Array.isArray(cycleIds)? cycleIds.slice() : [], requestedSymbols: Array.isArray(cycleIds)? cycleIds.slice().map(id=>{ const f = TRADABLE_INSTRUMENTS.find(x=> String(x.id) === String(id)); return f && f.providerSymbol ? String(f.providerSymbol) : String(id); }) : [], requestedCount: Array.isArray(cycleIds)? cycleIds.length : 0 }; }catch(_){ }
         const res = await mod.getNormalizedQuotes(undefined, { instrumentIds: cycleIds, fallbackStrategy: 'limited', maxFallbacks: 2 });
         quotes = res && Array.isArray(res.quotes) ? res.quotes : [];
+        // record returned diagnostics
+        try{
+          const returnedIds = Array.isArray(quotes) ? quotes.map((q:any)=> String(q.instrumentId)) : [];
+          const returnedSymbols = Array.isArray(quotes) ? quotes.map((q:any)=> String(q.providerSymbol || q.symbol || '')) : [];
+          const missing = Array.isArray(cycleIds) ? cycleIds.filter((id:string)=> !returnedIds.includes(String(id))) : [];
+          runtime.latestAutomaticQuoteRequestDiagnostics = Object.assign(runtime.latestAutomaticQuoteRequestDiagnostics || {}, { returnedInstrumentIds: returnedIds, returnedSymbols, returnedCount: returnedIds.length, missingInstrumentIds: missing });
+        }catch(_){ }
       }catch(e){
         // Fail-closed: do NOT fall back to full-market fetch here to avoid
         // reintroducing large registry requests (rate-limit storms).
         quotes = [];
         try{ runtime.latestAutomaticQuotesError = runtime.latestAutomaticQuotesError || {}; runtime.latestAutomaticQuotesError[cycleId || 'unknown'] = String((e as any) && (e as any).message ? (e as any).message : e); }catch(_){ }
+        try{
+          // Ensure diagnostics reflect failed fetch: preserve requested list, mark returned empty, missing = requested
+          const existing = runtime.latestAutomaticQuoteRequestDiagnostics || {};
+          const reqIds = Array.isArray(existing.requestedInstrumentIds) ? existing.requestedInstrumentIds.slice() : (Array.isArray(cycleIds) ? cycleIds.slice() : []);
+          const reqSymbols = Array.isArray(existing.requestedSymbols) ? existing.requestedSymbols.slice() : (Array.isArray(cycleIds) ? cycleIds.slice().map(id=>{ const f = TRADABLE_INSTRUMENTS.find(x=> String(x.id) === String(id)); return f && f.providerSymbol ? String(f.providerSymbol) : String(id); }) : []);
+          runtime.latestAutomaticQuoteRequestDiagnostics = {
+            requestedAt: existing.requestedAt || new Date().toISOString(),
+            requestedInstrumentIds: reqIds,
+            requestedSymbols: reqSymbols,
+            requestedCount: Array.isArray(reqIds) ? reqIds.length : 0,
+            returnedInstrumentIds: [],
+            returnedSymbols: [],
+            returnedCount: 0,
+            missingInstrumentIds: Array.isArray(reqIds) ? reqIds.slice() : []
+          };
+        }catch(_){ }
       }
     }catch(e){
       // If any error occurs while building the scoped union, fail-closed
@@ -2093,40 +2213,19 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   }
   const quotesList = _quotesAsArray(quotes);
 
-  // Persist latest quote snapshot per canonical symbol for runtime inspection.
+  // Persist latest quote snapshot per canonical symbol for runtime inspection using persistent cache.
   try{
-    runtime.latestQuoteSnapshotBySymbol = runtime.latestQuoteSnapshotBySymbol || {};
-    if (Array.isArray(quotesList)){
-      const toCanonical = (q:any) => {
-        try{
-          const s = q && (q.symbol || q.providerSymbol || null) ? String(q.symbol || q.providerSymbol).toUpperCase() : null;
-          const iid = q && (q.instrumentId || q.id || null) ? String(q.instrumentId || q.id).toUpperCase() : null;
-          const pick = s || iid || '';
-          const cleaned = String(pick || '').replace(/[^A-Z0-9]/g,'');
-          if (/^[A-Z]{6}$/.test(cleaned)) return `${cleaned.slice(0,3)}/${cleaned.slice(3,6)}`;
-          const sep = (pick || '').match(/^([A-Z]{3})[^A-Z0-9]+([A-Z]{3})$/);
-          if (sep) return `${sep[1]}/${sep[2]}`;
-          if (iid && iid.indexOf('_')>0){ const parts = iid.split('_'); if (parts.length===2) return `${parts[0]}/${parts[1]}`; }
-          return (s || iid || '').toUpperCase();
-        }catch(e){ return (q && q.symbol) ? String(q.symbol).toUpperCase() : (q && q.providerSymbol) ? String(q.providerSymbol).toUpperCase() : (q && q.instrumentId) ? String(q.instrumentId).toUpperCase() : null; }
-      };
-
-      for (const q of quotesList){
-        try{
-          const key = toCanonical(q);
-          if (!key) continue;
-          const snapshot = {
-            instrumentId: q.instrumentId || q.id || q.instrument || null,
-            symbol: q.symbol || null,
-            providerSymbol: q.providerSymbol || null,
-            price: (typeof q.price === 'number' ? q.price : (typeof q.priceSek === 'number' ? q.priceSek : null)),
-            marketTimestamp: q.marketTimestamp || q.timestamp || null,
-            dataStatus: q.dataStatus || null,
-            fetchedAt: q.fetchedAt || null,
-          };
-          runtime.latestQuoteSnapshotBySymbol[String(key).toUpperCase()] = snapshot;
-        }catch(_){ }
-      }
+    if (Array.isArray(quotesList) && quotesList.length > 0){
+      try{
+        // merge incoming provider quotes into cache
+        latestQuoteCache = LQC.mergeLatestQuotes(latestQuoteCache || {}, quotesList, new Date().toISOString(), (instrumentId:string)=>{
+          try{ const inst = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.find(i => String(i.id).toLowerCase() === String(instrumentId).toLowerCase()) : undefined; return inst && inst.assetType ? String(inst.assetType) : null; }catch(e){ return null; }
+        });
+        // persist atomically (best-effort)
+        try{ LQC.persistLatestQuoteCacheAtomic(latestQuoteCache); }catch(e){}
+        // project canonical snapshot for runtime inspection
+        try{ runtime.latestQuoteSnapshotBySymbol = LQC.projectLatestQuoteCache(latestQuoteCache); }catch(e){ /* noop */ }
+      }catch(e){ /* swallow cache errors to keep runtime robust */ }
     }
   }catch(_){ }
 
