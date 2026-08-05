@@ -253,6 +253,66 @@ export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: 
   }catch(_){ return getWatchlistSymbols(eligibleInstruments, watchlist); }
 }
 
+// Build the exact cycle-scoped instrument id union used for automatic quote fetches.
+// Returns stable, deterministic array of instrument ids (strings).
+export async function buildAutomaticCycleQuoteInstrumentIds(overridePortfolio?: any){
+  try{
+    const idsSet = new Set<string>();
+    const now = new Date();
+    // eligible instruments: same rule as used elsewhere
+    const eligibleInstruments = Array.isArray(TRADABLE_INSTRUMENTS) ? TRADABLE_INSTRUMENTS.filter(i => {
+      try{ const enabled = (i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true); if (!enabled) return false; return isInstrumentTradableNow(i, now); }catch(_){ return false; }
+    }) : [];
+
+    // 1) analysis symbols (preserve order and rotation rules)
+    try{
+      const analysisSymbols = buildAutomaticAnalysisSymbols(eligibleInstruments, now);
+      for (const sym of Array.isArray(analysisSymbols) ? analysisSymbols : []){
+        try{
+          const up = String(sym || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
+          const found = TRADABLE_INSTRUMENTS.find(i => {
+            try{ if (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) return true; }catch(_){ }
+            try{ if (String(i.id).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) return true; }catch(_){ }
+            return false;
+          });
+          if (found && found.id) idsSet.add(found.id);
+        }catch(_){ }
+      }
+    }catch(_){ }
+
+    // 2) include holdings (never omit)
+    try{
+      const p = overridePortfolio || (typeof portfolioAdapter !== 'undefined' && portfolioAdapter && typeof portfolioAdapter.getPortfolio === 'function' ? await portfolioAdapter.getPortfolio() : null);
+      if (p && Array.isArray(p.holdings)){
+        for (const h of p.holdings){
+          try{
+            if (!h) continue;
+            if (h.instrumentId){ const cand = TRADABLE_INSTRUMENTS.find(i => String(i.id).toLowerCase() === String(h.instrumentId).toLowerCase()); if (cand && cand.id) idsSet.add(cand.id); }
+            else if (h.symbol){ const up = String(h.symbol||'').toUpperCase(); const cand2 = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase() === up) || String(i.id).toUpperCase() === up); if (cand2 && cand2.id) idsSet.add(cand2.id); }
+          }catch(_){ }
+        }
+      }
+    }catch(_){ }
+
+    // 3) ensure SPY/QQQ present if enabled
+    try{
+      for (const core of ['SPY','QQQ']){
+        const f = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase() === core) || String(i.id).toUpperCase() === core);
+        if (f && f.id && (f.marketDataEnabled === true || (f.marketDataEnabled === undefined && f.enabled === true))) idsSet.add(f.id);
+      }
+    }catch(_){ }
+
+    // 4) include Forex dependencies where present
+    try{
+      const forexCandidates = ['EUR/USD','GBP/USD','USD/JPY','USD/SEK'];
+      for (const s of forexCandidates){ const up = String(s).toUpperCase().replace(/[^A-Z0-9]/g,''); const f = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) || String(i.id).toUpperCase().replace(/[^A-Z0-9']/g,'') === up); if (f && f.id && (f.marketDataEnabled === true || (f.marketDataEnabled === undefined && f.enabled === true))) idsSet.add(f.id); }
+    }catch(_){ }
+
+    // Return deterministic array preserving insertion order
+    return Array.from(idsSet);
+  }catch(_){ return []; }
+}
+
 // Small helper exposed for diagnostics: returns forex session status for a given instant.
 export function forexSessionStatus(now?: Date){
   try{ return getForexSessionDiagnostics(now instanceof Date ? now : new Date()); }catch(e){ return { status: 'INVALID_DATE' }; }
@@ -1245,9 +1305,21 @@ async function runAutomaticCycleImplementation(){
         // of stale runtime.forexReadiness from a previous cycle.
         let fr: any = null;
         try{
-          const fetchedQuotes = await fetchQuotes().catch(()=>null);
-          fr = buildForexReadinessState({ now: new Date(), instruments: TRADABLE_INSTRUMENTS, quotes: Array.isArray(fetchedQuotes) ? fetchedQuotes : [] });
-          try{ runtime.forexReadiness = JSON.parse(JSON.stringify(fr)); }catch(_){ runtime.forexReadiness = fr as any; }
+          // Use scoped, cycle-specific quote fetch for preflight to avoid
+          // full-registry provider requests. Fail-closed on errors.
+          try{
+            const qs = await import('../market-data/quotes-service');
+            const cycleIds = await buildAutomaticCycleQuoteInstrumentIds();
+            if (qs && typeof qs.getNormalizedQuotes === 'function'){
+              const res = await qs.getNormalizedQuotes(undefined, { instrumentIds: cycleIds, fallbackStrategy: 'limited', maxFallbacks: 2 });
+              const fetchedQuotes = res && Array.isArray(res.quotes) ? res.quotes : [];
+              fr = buildForexReadinessState({ now: new Date(), instruments: TRADABLE_INSTRUMENTS, quotes: Array.isArray(fetchedQuotes) ? fetchedQuotes : [] });
+              try{ runtime.forexReadiness = JSON.parse(JSON.stringify(fr)); }catch(_){ runtime.forexReadiness = fr as any; }
+            } else {
+              // If normalization not available, fail closed and reuse existing readiness
+              fr = runtime.forexReadiness || null;
+            }
+          }catch(e){ fr = runtime.forexReadiness || null; }
         }catch(_){ fr = runtime.forexReadiness || null; }
         const schedState = getGlobalScheduler();
         // compute real daily counters for launch control
@@ -1884,8 +1956,10 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
   // Only use provider-fetched quotes for early eligibility checks. When callers
   // provide `overrideUniverse.quotes` (typically tests), respect the configured
   // time-based rules and do not short-circuit eligibility based on the override
-  // payload.
-  const _earlyQuotes = (opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes)) ? null : await fetchQuotes();
+  // payload. For automatic scheduler runs we avoid calling the broad `fetchQuotes()`
+  // to prevent full-registry provider requests; scheduler path uses a scoped
+  // normalized fetch later.
+  const _earlyQuotes = (opts && opts.overrideUniverse && Array.isArray(opts.overrideUniverse.quotes)) ? null : ((opts && (opts as any).allowWhenScheduler) ? null : await fetchQuotes());
   const _isQuotesArray = (x:any) => Array.isArray(x) || (!!x && Array.isArray(x.quotes));
   const _quotesAsArray = (x:any) => Array.isArray(x) ? x : (x && Array.isArray(x.quotes) ? x.quotes : null);
 
@@ -1935,53 +2009,8 @@ export async function runManualPaperTradingCycle(opts?: { allowWhenScheduler?: b
     // Automatic scheduler path: build cycle-scoped instrument ids and fetch scoped quotes
     try{
       const mod = await import('../market-data/quotes-service');
-      // Build union of: cycle symbols (max 10), holdings, SPY/QQQ if enabled, and required forex pairs
-      const idsSet = new Set<string>();
-      const norm = (s:string) => String(s||'').toUpperCase();
-      // Map analysis symbols to instrument ids using TRADABLE_INSTRUMENTS
-      try{
-        for (const sym of Array.isArray(symbols) ? symbols : []){
-          try{
-            const up = norm(sym).replace(/[^A-Z0-9]/g,'');
-            const found = TRADABLE_INSTRUMENTS.find(i => {
-              try{ if (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) return true; }catch(_){ }
-              try{ if (String(i.id).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) return true; }catch(_){ }
-              return false;
-            });
-            if (found && found.id && (found.marketDataEnabled === true || (found.marketDataEnabled === undefined && found.enabled === true))) idsSet.add(found.id);
-          }catch(_){ }
-        }
-      }catch(_){ }
-
-      // Include holdings (never omit)
-      try{
-        const p = await (((runtime as any) && (runtime as any).portfolioAdapter && typeof (runtime as any).portfolioAdapter.getPortfolio === 'function') ? (runtime as any).portfolioAdapter.getPortfolio() : portfolioAdapter.getPortfolio());
-        if (p && Array.isArray(p.holdings)){
-          for (const h of p.holdings){
-            try{
-              if (!h) continue;
-              if (h.instrumentId){ const cand = TRADABLE_INSTRUMENTS.find(i => String(i.id).toLowerCase() === String(h.instrumentId).toLowerCase()); if (cand && cand.id) idsSet.add(cand.id); }
-              else if (h.symbol){ const up = String(h.symbol||'').toUpperCase(); const cand2 = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase() === up) || String(i.id).toUpperCase() === up); if (cand2 && cand2.id) idsSet.add(cand2.id); }
-            }catch(_){ }
-          }
-        }
-      }catch(_){ }
-
-      // Ensure SPY/QQQ present if enabled
-      try{
-        for (const core of ['SPY','QQQ']){
-          const f = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase() === core) || String(i.id).toUpperCase() === core);
-          if (f && f.id && (f.marketDataEnabled === true || (f.marketDataEnabled === undefined && f.enabled === true))) idsSet.add(f.id);
-        }
-      }catch(_){ }
-
-      // Include Forex dependencies where present
-      try{
-        const forexCandidates = ['EUR/USD','GBP/USD','USD/JPY','USD/SEK'];
-        for (const s of forexCandidates){ const up = String(s).toUpperCase().replace(/[^A-Z0-9]/g,''); const f = TRADABLE_INSTRUMENTS.find(i => (i.providerSymbol && String(i.providerSymbol).toUpperCase().replace(/[^A-Z0-9]/g,'') === up) || String(i.id).toUpperCase().replace(/[^A-Z0-9]/g,'') === up); if (f && f.id && (f.marketDataEnabled === true || (f.marketDataEnabled === undefined && f.enabled === true))) idsSet.add(f.id); }
-      }catch(_){ }
-
-      const cycleIds = Array.from(idsSet);
+      // Build cycle-scoped instrument ids using centralized helper.
+      const cycleIds = await buildAutomaticCycleQuoteInstrumentIds();
       try{
         const res = await mod.getNormalizedQuotes(undefined, { instrumentIds: cycleIds, fallbackStrategy: 'limited', maxFallbacks: 2 });
         quotes = res && Array.isArray(res.quotes) ? res.quotes : [];
