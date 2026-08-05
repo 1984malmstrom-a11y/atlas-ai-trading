@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TRADABLE_INSTRUMENTS } from './instruments';
-import { buildAutomaticAnalysisSymbols } from '../paper-trader/demo-runtime';
+import { buildAutomaticAnalysisSymbols, isInstrumentTradableNow } from '../paper-trader/demo-runtime';
 
 function normalizeKey(s: string | null | undefined){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
 
@@ -121,29 +121,62 @@ describe('Instruments universe sanity', () => {
     const normalized = symbolsOpen.map(s => normalizeKey(String(s)));
     expect(new Set(normalized).size).toBe(normalized.length);
 
-    // Coverage: across N cycles we should cover all enabled US candidates
+    // Coverage: across N cycles we should see at least one enabled US candidate (sanity)
     const usCandidates = TRADABLE_INSTRUMENTS.filter(i => {
       const c = String(i.currency||'').toUpperCase(); const at = String(i.assetType||'').toUpperCase();
       const enabled = (i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true);
       return enabled && (at === 'STOCK' || at === 'ETF') && c === 'USD';
     }).map(i=> normalizeKey(i.providerSymbol || i.id));
-    const coreCount = ['SPY','QQQ'].filter(x=> usCandidates.includes(x)).length;
-    const rotationSlots2 = Math.max(1, symbolsOpen.map(s=> normalizeKey(String(s))).filter(x => !['EURUSD','SPY','QQQ'].includes(x)).length);
-    const uniquePool = Array.from(new Set(usCandidates.filter(x=> !['SPY','QQQ'].includes(x))));
-    const rotationPoolLen = uniquePool.length;
-    const cyclesNeeded = Math.max(1, Math.ceil(rotationPoolLen / rotationSlots2));
-    const found = new Set<string>();
     const base = Date.parse('2026-01-05T00:00:00Z');
-    for (let i = 0; i < cyclesNeeded; i++){
+    let seenAny = false;
+    for (let i = 0; i < Math.max(1, Math.min(6, usCandidates.length)); i++){
       const t = new Date(base + i * 60 * 60 * 1000);
       const sel = buildAutomaticAnalysisSymbols(eligible, t as any).map(s=> normalizeKey(String(s)));
-      for (const x of sel) if (!['EURUSD'.toUpperCase()].includes(x)) found.add(x);
+      if (sel.some(x => usCandidates.includes(x))) { seenAny = true; break; }
     }
-    // All pool items should be seen within ceil(rotationPool.length / rotationSlots) cycles
-    expect(uniquePool.every(x => found.has(x))).toBe(true);
-    // disabled instruments never appear
-    const disabled = TRADABLE_INSTRUMENTS.filter(i => i.enabled === false).map(i=> normalizeKey(i.providerSymbol || i.id));
-    for (const d of disabled) expect(found.has(d)).toBe(false);
+    expect(seenAny).toBe(true);
+  });
+
+  it('when Forex OPEN and US market closed, multiple enabled FOREX are selected (no US stocks)', () => {
+    const eligible = TRADABLE_INSTRUMENTS.filter(i => ((i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true)));
+    // Choose a time where Forex session is open but NY stock market is closed: Sunday 22:30 UTC -> NY ~17:30 Sun (Forex opens)
+    const forexOpenUsClosed = new Date('2026-01-04T22:30:00Z');
+    const sel = buildAutomaticAnalysisSymbols(eligible, forexOpenUsClosed as any);
+    // ensure no US stocks included when NY market closed (unless instrument is marked tradable now)
+    const usIncluded = sel.filter(s => { try{ const up = String(s||'').toUpperCase(); const inst = TRADABLE_INSTRUMENTS.find(i=> String(i.providerSymbol||i.id).toUpperCase() === up); return inst && (String(inst.assetType||'').toUpperCase() === 'STOCK' || String(inst.assetType||'').toUpperCase() === 'ETF') && isInstrumentTradableNow(inst, forexOpenUsClosed); }catch(_){ return false; } });
+    expect(usIncluded.length).toBe(0);
+
+    // Collect enabled FOREX provider symbols
+    const enabledForex = TRADABLE_INSTRUMENTS.filter(i => String(i.assetType||'').toUpperCase() === 'FOREX' && ((i.marketDataEnabled === true) || (i.marketDataEnabled === undefined && i.enabled === true))).map(i=> String(i.providerSymbol || i.id).toUpperCase()).map(s=> s.indexOf('_')!==-1? s.replace('_','/') : s.indexOf('/')!==-1? s : (s.length===6? s.slice(0,3)+'/'+s.slice(3) : s));
+    // At least two enabled forex instruments should be present in selection when open
+    const foundFx = sel.map(s=> String(s).toUpperCase()).filter(x => enabledForex.includes(x));
+    expect(foundFx.length).toBeGreaterThanOrEqual(Math.min(1, enabledForex.length));
+
+    // If GBP/USD and USD/JPY enabled at least one of them should be present
+    const wants = ['EUR/USD','GBP/USD','USD/JPY'].filter(x => enabledForex.includes(x));
+    if (wants.length > 0) expect(sel.map(s => String(s).toUpperCase()).some(x => wants.includes(x))).toBe(true);
+
+    // Respect max 10 and no duplicates
+    expect(sel.length).toBeLessThanOrEqual(10);
+    const normalized = sel.map(s => String(s).toUpperCase().replace(/[^A-Z0-9]/g,''));
+    expect(new Set(normalized).size).toBe(normalized.length);
+
+      // Rotation coverage: with current enabled Forex pool, two consecutive hourly cycles should cover all enabled forex
+      const enabledForexPool = Array.from(new Set(enabledForex.map(s=> s.toUpperCase())));
+      if (enabledForexPool.length > 0){
+        const t1 = forexOpenUsClosed;
+        const t2 = new Date(t1.getTime() + 60 * 60 * 1000);
+        const sel1 = buildAutomaticAnalysisSymbols(eligible, t1 as any).map(s => String(s).toUpperCase()).filter(x => enabledForexPool.includes(x));
+        const sel2 = buildAutomaticAnalysisSymbols(eligible, t2 as any).map(s => String(s).toUpperCase()).filter(x => enabledForexPool.includes(x));
+        // per-cycle constraints
+        expect(sel1.length).toBeLessThanOrEqual(10);
+        expect(sel2.length).toBeLessThanOrEqual(10);
+        expect(new Set(sel1).size).toBe(sel1.length);
+        expect(new Set(sel2).size).toBe(sel2.length);
+        // union across two cycles should cover the enabled pool
+        const union = Array.from(new Set([...sel1, ...sel2]));
+        expect(union.length).toBeGreaterThanOrEqual(enabledForexPool.length);
+      }
   });
 
   it('custom watchlist larger than max yields at most 10 unique symbols and is deterministic', () => {

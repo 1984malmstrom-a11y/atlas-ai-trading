@@ -201,27 +201,48 @@ export function buildAutomaticAnalysisSymbols(eligibleInstruments: any[], now?: 
       try{ if (candidateSymbols.includes(c)) out.push(c); }catch(_){ }
     }
 
-    // Forex core: include EUR/USD when forex session open and instrument present
+    // Forex core: when forex session open include ALL enabled/tradable FOREX instruments
     let sessionOpen = false;
     try{ const diag = getForexSessionDiagnostics(now instanceof Date ? now : new Date()); sessionOpen = diag && diag.status === 'OPEN'; }catch(_){ sessionOpen = false; }
     if (sessionOpen){
-      // find any forex instrument that maps to EUR/USD and is enabled
-      for (const inst of eligibleInstruments){
-        try{
-          const type = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
-          if (type !== 'FOREX') continue;
-          const provRaw = String(inst.providerSymbol || inst.id || '').toUpperCase();
-          if (!provRaw) continue;
-          let analysisSymbol = provRaw;
-          if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
-          else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
-          else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
-          if (String(analysisSymbol).toUpperCase() === 'EUR/USD' || String(provRaw).toUpperCase().replace(/[^A-Z0-9]/g,'') === 'EURUSD'){
-            out.push('EUR/USD');
-            break;
+      try{
+        const forexCandidates: string[] = [];
+        for (const inst of eligibleInstruments){
+          try{
+            const type = inst && inst.assetType ? String(inst.assetType).toUpperCase() : 'STOCK';
+            if (type !== 'FOREX') continue;
+            const enabled = (inst.marketDataEnabled === true) || (inst.marketDataEnabled === undefined && inst.enabled === true);
+            if (!enabled) continue;
+            // ensure tradable now (respects session rules)
+            if (!isInstrumentTradableNow(inst, now)) continue;
+            const provRaw = String(inst.providerSymbol || inst.id || '').toUpperCase();
+            if (!provRaw) continue;
+            let analysisSymbol = provRaw;
+            if (provRaw.indexOf('_') !== -1) analysisSymbol = provRaw.replace('_','/');
+            else if (provRaw.indexOf('/') !== -1) analysisSymbol = provRaw;
+            else if (/^[A-Z]{6}$/.test(provRaw)) analysisSymbol = provRaw.slice(0,3) + '/' + provRaw.slice(3);
+            analysisSymbol = String(analysisSymbol).toUpperCase();
+            forexCandidates.push(analysisSymbol);
+          }catch(_){ }
+        }
+        // deterministic order, dedupe
+        const uniq = Array.from(new Set(forexCandidates)).sort((a,b)=> a.localeCompare(b));
+        // Determine slots available for forex after watchlist and core
+        const slotsAfterCore = Math.max(0, 10 - out.length);
+        if (uniq.length > 0 && slotsAfterCore > 0){
+          // rotate forex pool per cycle using hourly cycle index
+          const nowMs = (now instanceof Date) ? now.getTime() : Date.now();
+          const CYCLE_MS = 60 * 60 * 1000; // 1 hour
+          const cycleIndex = Math.floor(nowMs / CYCLE_MS);
+          const forexSlots = Math.min(slotsAfterCore, uniq.length);
+          const startIndex = (cycleIndex * forexSlots) % uniq.length;
+          for (let i = 0; i < forexSlots; i++){
+            const idx = (startIndex + i) % uniq.length;
+            const fx = uniq[idx];
+            if (!out.map(x=>String(x).toUpperCase()).includes(fx)) out.push(fx);
           }
-        }catch(_){ }
-      }
+        }
+      }catch(_){ }
     }
 
     // Fill remaining slots deterministically by rotating over candidateSymbols (excluding any core already added)
